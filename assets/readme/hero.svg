@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Peak Distance — 在原句里学会一个词</title>
+  <desc id="desc">纯矢量学习流程示意。用 She is comfortable with people 展示英文原句与词义，把原句、来源和学习状态一起保留。不是产品界面截图。</desc>
+  <rect width="1200" height="520" fill="#f7f4ec"/>
+  <g id="title-block" fill="#2f3a40">
+    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">ENGLISH IN CONTEXT</text>
+    <text x="60" y="166" font-family="Georgia,'Times New Roman',serif" font-size="86">Peak Distance</text>
+    <path d="M64 200H120" stroke="#d4a950" stroke-width="3"/>
+    <g font-family="'Noto Serif SC',SimSun,serif" font-size="42">
+      <text x="64" y="267">把英文读懂，</text>
+      <text x="64" y="327">把语境留下。</text>
+    </g>
+  </g>
+  <g id="context-specimen" transform="translate(716 98)">
+    <path d="M-44 0v284" stroke="#ddd9cf"/>
+    <text y="17" font-family="'Segoe UI','Microsoft YaHei',sans-serif" font-size="20" fill="#59636b">原句 / CONTEXT</text>
+    <rect x="-5" y="110" width="78" height="44" rx="4" fill="#e4eef6"/>
+    <g font-family="Georgia,'Times New Roman',serif" font-size="36" fill="#2f3a40">
+      <text y="87">She is comfortable</text>
+      <text y="143">with people.</text>
+    </g>
+    <path d="M4 167v29h26" fill="none" stroke="#6b8db7" stroke-width="2"/>
+    <text x="42" y="204" font-family="'Microsoft YaHei',sans-serif" font-size="24" fill="#2f3a40">和……在一起；与……一同</text>
+    <text y="273" font-family="'Microsoft YaHei',sans-serif" font-size="21" fill="#59636b">保留原句 · 记住来源 · 再次复习</text>
+  </g>
+  <g id="learning-route" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+    <text x="64" y="405" font-size="22" fill="#59636b">网页 / X / YouTube</text>
+    <g font-size="26" fill="#2f3a40">
+      <text x="64" y="457">遇见</text><text x="190" y="457">理解</text><text x="316" y="457">保存</text><text x="442" y="457">复习</text>
+    </g>
+    <g stroke="#6b8db7" stroke-width="2" fill="none">
+      <path d="M138 447h28m-6-5 6 5-6 5"/><path d="M264 447h28m-6-5 6 5-6 5"/><path d="M390 447h28m-6-5 6 5-6 5"/>
+    </g>
+  </g>
+</svg>

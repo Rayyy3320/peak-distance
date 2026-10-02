@@ -1,0 +1,27 @@
+@import './tokens.css';
+
+* {box-sizing:border-box} [hidden] {display:none!important}
+body {margin:0;font:14px/1.6 system-ui,'Segoe UI','Microsoft YaHei',sans-serif;color:var(--pd-ink);background:var(--pd-paper) url('/brand/paper-tile.png') repeat;background-size:620px}
+button,input,select,textarea {font:inherit;color:inherit}
+button {cursor:pointer;border:1px solid var(--pd-line);border-radius:6px;background:var(--pd-surface);padding:6px 10px;min-height:32px}
+button:hover {background:var(--pd-selected)} button:disabled {opacity:.6;cursor:default}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,a:focus-visible,summary:focus-visible {outline:2px solid var(--pd-blue);outline-offset:2px}
+input,textarea,select {background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:6px;padding:6px 8px;max-width:100%}
+input[type=checkbox] {accent-color:var(--pd-blue);width:17px;height:17px;flex:none}
+a {color:var(--pd-blue);overflow-wrap:anywhere}
+h1,h2 {font-family:Georgia,'Noto Serif SC',SimSun,serif;font-weight:600}
+h1 {font-size:22px;margin:0 0 16px} h2 {font-size:18px;margin:0 0 12px}
+.primary {background:var(--pd-blue);border-color:var(--pd-blue);color:white} .primary:hover {background:#154fa6}
+.hint {color:var(--pd-muted);font-size:12px}
+.settings-section {padding:20px 0;border-bottom:1px solid var(--pd-line)} .settings-section:first-child {padding-top:0}
+.settings-field {display:flex;align-items:center;justify-content:space-between;gap:12px;margin:12px 0}
+.settings-field select {max-width:58%;min-width:0} .settings-field input[type=number] {width:86px}
+.settings-actions {display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.settings-status {color:var(--pd-muted);font-size:12px;min-height:20px} .settings-status.err {color:#b3261e} .settings-status.ok {color:#24643a}
+.settings-key {width:100%} .settings-heading {display:flex;align-items:center;gap:12px;margin-bottom:16px} .settings-heading h1 {margin:0}
+#ai-fields {border:0;margin:0;padding:0;min-width:0}
+#ai-current {overflow-wrap:anywhere}
+#ai-advanced {margin-top:16px}
+#ai-advanced summary {cursor:pointer;color:var(--pd-muted);padding:6px 0}
+.ai-field {display:flex;flex-direction:column;gap:6px;margin:14px 0}
+.ai-field input,.ai-field select {width:100%;min-width:0}

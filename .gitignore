@@ -1,0 +1,15 @@
+node_modules/
+.output/
+.wxt/
+.upstream/
+.chrome-profile/
+.env
+.env.*
+.npmrc
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store
+Thumbs.db

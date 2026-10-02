@@ -1,0 +1,27 @@
+{
+  "name": "peak-distance",
+  "description": "Chrome 英语学习扩展：网页、X 与 YouTube 的查词、双语字幕、原句复习与 AI 问答",
+  "private": true,
+  "version": "0.4.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "typecheck": "wxt prepare && tsc --noEmit",
+    "regress": "tsx tools/regress.ts",
+    "check-ai": "tsx tools/ai-services-check.ts",
+    "verify-local": "npm run typecheck && npm run build && npm run regress && npm run check-ai"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "playwright-core": "^1.63.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.0",
+    "wxt": "^0.21.4"
+  },
+  "dependencies": {
+    "linkedom": "0.18.13"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0"
+}

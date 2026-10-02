@@ -1,0 +1,137 @@
+@import '../../shared/theme.css';
+html,body {height:100%;overflow:hidden}
+body {display:grid;grid-template-rows:auto minmax(0,1fr)}
+.app-header {padding:18px 16px 0;border-bottom:1px solid var(--pd-line);min-width:0}
+.brand-row {display:flex;gap:8px;align-items:center;margin-bottom:20px}
+.brand-mark {position:relative;width:48px;height:30px;overflow:hidden;flex:none}
+.brand-mark img {position:absolute;width:64px;height:64px;left:-8px;top:-21px}
+.brand-name {font:22px/1.1 Georgia,serif;flex:1;min-width:0;white-space:nowrap}
+.brand-name small {display:block;font:10px/1.6 SimSun,serif;color:var(--pd-muted);letter-spacing:1px;margin-top:6px}
+.brand-row button {padding:4px 6px;min-width:30px;background:transparent;border-color:transparent;font-size:12px;white-space:nowrap}
+.brand-row #panel-close {font-size:20px}
+#views {display:flex;gap:4px;padding:4px;background:#ebe9e2;border-radius:8px;margin-bottom:14px}
+#views button {flex:1;border:0;background:transparent;white-space:nowrap;padding:6px}
+#views button.active {background:var(--pd-surface);color:var(--pd-blue);box-shadow:0 2px 4px #2f3a400d}
+.brand-landscape {display:none}
+.app-content {min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden;background:#fffdfa99}
+#panel-feedback {padding:8px 16px;background:#fff0ce;color:#674d16;font-size:12px;flex:none}
+#library-tools {padding:20px 16px 12px;flex:none;border-bottom:1px solid var(--pd-line)}
+.section-title {display:flex;gap:8px;align-items:center;justify-content:space-between;margin-bottom:16px}
+.section-title h1 {margin:0}.section-title button {font-size:12px}
+.library-tabs {display:flex;gap:8px;margin-bottom:12px}.library-tabs button {border:0;background:transparent;color:var(--pd-muted)}.library-tabs .active {background:var(--pd-selected);color:var(--pd-blue)}
+#search {width:100%}
+main {min-height:0;min-width:0;overflow:auto;padding:20px 16px;flex:1;overscroll-behavior:contain}
+.empty {padding:28px 12px;color:var(--pd-muted);text-align:center}
+.empty-landscape {height:220px;background:url('/brand/mountain-coast.png') center 70%/cover;border-radius:8px;margin-top:16px}
+.entry {padding:16px 0;border-bottom:1px solid var(--pd-line)}.entry:first-child{padding-top:0}
+.entry-head {display:flex;align-items:center;gap:8px;flex-wrap:wrap}.expr {font:600 16px/1.5 system-ui;margin:0;flex:1;overflow-wrap:anywhere;min-width:0}
+.kind,.src-type {font-size:11px;color:var(--pd-muted)}select.status {font-size:12px;padding:3px 6px;max-width:100px}.delete {border:0;padding:3px;font-size:12px;color:#ad342e;background:transparent}
+.entry-preview {margin:8px 0;color:var(--pd-muted);font-size:13px;overflow-wrap:anywhere}
+.entry-details summary {font-size:12px;color:var(--pd-blue);cursor:pointer;margin-top:8px}
+.forms {display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.form-label,.form-chip {font-size:12px;color:var(--pd-muted)}.form-chip {background:var(--pd-paper);padding:2px 6px;border-radius:6px}.form-chip button {min-height:0;padding:0 3px;border:0;background:transparent}
+.context {margin-top:16px;border-top:1px dashed var(--pd-line);padding-top:12px}.meta,.review-meta {display:flex;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--pd-muted)}
+.source {font-size:12px}.time {font-size:11px}.sentence,.selection-text {white-space:pre-wrap;overflow-wrap:anywhere;margin:12px 0;line-height:1.7}.definition {font-size:13px;color:var(--pd-muted);white-space:pre-wrap;overflow-wrap:anywhere}
+#view-subs {display:flex;flex-direction:column;padding:12px 16px 16px;overflow:hidden}#video-workspace {flex:1;min-height:0}#web-selection {overflow:auto;min-height:0}#subs-head:empty,#subs-ctrl:empty{display:none}
+.review-progress {font-size:12px;color:var(--pd-muted);text-align:right;margin-bottom:24px}.review-card {background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:8px;padding:20px}.review-card .sentence {font:20px/1.7 Georgia,SimSun,serif;margin-top:0}.review-reveal {border-top:1px solid var(--pd-line);margin-top:20px;padding-top:16px}.review-reveal .word {font:600 20px Georgia,serif}.no-def {color:var(--pd-muted)}.review-actions {display:flex;flex-wrap:wrap;gap:8px;margin-top:24px}.review-actions button:not(.ghost){background:var(--pd-blue);color:white;border-color:var(--pd-blue)}
+#view-review {background:linear-gradient(#fffdfaf2,#fffdfae8),url('/brand/mountain-coast.png') bottom/cover}
+#view-settings {padding:24px 20px}
+#settings-back {display:grid;place-items:center;width:36px;height:36px;flex:none;padding:7px;border-radius:7px;background:var(--pd-surface);color:var(--pd-ink)}
+#settings-back:hover {background:var(--pd-selected);color:var(--pd-blue)}
+#settings-back svg {width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.selection-actions {position:fixed;z-index:10;display:flex;gap:4px;padding:4px;background:var(--pd-paper);border:1px solid var(--pd-line);border-radius:8px;box-shadow:var(--pd-shadow)}
+@media(max-width:359px){.brand-row{display:grid;grid-template-columns:44px 1fr repeat(3,40px);gap:6px;margin-bottom:12px}.brand-name{grid-column:2/-1;font-size:21px}.brand-row #panel-mode{grid-column:3}.brand-row #open-settings{grid-column:4}.brand-row #panel-close{grid-column:5}}
+@media(min-width:560px){body{grid-template-columns:184px minmax(0,1fr);grid-template-rows:minmax(0,1fr)}.app-header{padding:24px 12px 0;border-right:1px solid var(--pd-line);border-bottom:0;position:relative;overflow:hidden;display:flex;flex-direction:column}.brand-row{flex-wrap:wrap;gap:4px;position:relative;z-index:1}.brand-name{font-size:17px;flex-basis:112px}.brand-mark{width:38px}.brand-name small{font-size:9px;letter-spacing:0}.brand-row button{margin-top:8px}#views{flex-direction:column;background:transparent;padding:0;position:relative;z-index:1}#views button{text-align:left;padding:8px 12px}#views button.active{background:var(--pd-selected);box-shadow:none}.brand-landscape{display:block;flex:1;min-height:100px;margin:24px -12px 0;background:url('/brand/mountain-coast.png') center bottom/auto 100%;opacity:.85}.app-content{background:#fffdfaab}main{padding:24px}#library-tools{padding:24px}.entry-head{flex-wrap:nowrap}}
+@media(prefers-reduced-motion:no-preference){button{transition:background .12s,color .12s}}
+/* 问答：限宽阅读区与纸面输入框 */
+#view-chat {display:flex;flex-direction:column;min-height:0;overflow:hidden;padding:20px 24px 16px;gap:0;background:var(--pd-paper);font-size:15px;line-height:1.75;container-type:inline-size}
+#view-chat > * {width:100%;max-width:720px;margin-inline:auto;min-width:0}
+#view-chat ::selection {background:var(--pd-selected);color:var(--pd-ink)}
+#view-chat svg {width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
+#view-chat button,#view-chat summary {font-size:13px;min-height:34px}
+#view-chat button:disabled {cursor:default}
+#view-chat .chat-tool {padding:5px 10px;background:transparent;border:1px solid transparent;color:var(--pd-muted);border-radius:7px}
+#view-chat .chat-tool:hover,#view-chat .chat-tool[aria-pressed=true],#view-chat .chat-tool[aria-expanded=true] {background:#eae6dd;color:var(--pd-ink)}
+#chat-head {flex:none;max-height:32%;overflow:auto;padding-bottom:12px;border-bottom:1px solid var(--pd-line);scrollbar-width:thin}
+#chat-head .chat-meta {display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+#chat-head .chat-title {flex:1;min-width:100px;font-size:16px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#chat-head .chat-scope {font-size:12px;color:var(--pd-muted);margin-top:4px}
+#chat-head .chat-danger {color:#a3352c}
+.quote-row {display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:13px;overflow-wrap:anywhere;margin-top:8px;padding:8px 12px;background:#eeeae0;border-radius:8px}
+#chat-segments:not(:empty) {padding-top:12px;flex:none}
+#chat-segments .seg-label {font-size:12px;color:var(--pd-muted)}
+#chat-segments .seg-row {display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+#chat-segments .seg {font-size:12px;padding:4px 8px;background:transparent}
+#chat-segments .seg.on {background:var(--pd-selected);border-color:var(--pd-blue);color:var(--pd-blue)}
+#chat-cite-panel {flex:none;margin-top:12px;padding:12px 16px;background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:10px}
+#chat-cite-panel .cite-head {display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px;font-weight:600}
+#chat-cite-panel .cite-state {font-size:12px;font-weight:400;color:var(--pd-muted);flex:1}
+#chat-cite-panel .cite-close {border:0;background:transparent;margin-left:auto}
+#chat-cite-panel .cite-text {font-size:14px;margin-top:8px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:120px;overflow:auto}
+#chat-cite-panel .cite-link {display:inline-block;font-size:13px;margin-top:8px;text-underline-offset:4px}
+#chat-list {flex:1;overflow-y:auto;min-height:0;padding:24px 8px 8px;scrollbar-width:thin;scrollbar-color:var(--pd-line) transparent;overscroll-behavior:contain}
+#chat-list .chat-hint {color:var(--pd-muted);font-size:14px;padding:24px 0;text-align:center}
+#chat-list .msg {margin-bottom:28px;overflow-wrap:anywhere}
+#chat-list .msg.user {width:fit-content;max-width:90%;margin-left:auto}
+#chat-list .msg .scope {font-size:12px;color:var(--pd-muted);margin-bottom:6px}
+#chat-list .msg.user .q {background:#eae6dd;border-radius:14px;padding:12px 16px;white-space:pre-wrap}
+#chat-list .msg.user .quote-ref {font-size:12px;color:var(--pd-muted);margin-top:6px}
+#chat-list .msg.assistant .a-head {display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+#chat-list .msg.assistant .state {font-size:12px;color:var(--pd-muted)}
+#chat-list .msg.assistant .state.streaming {color:var(--pd-blue)}
+#chat-list .msg.assistant .state.error {color:#a3352c}
+#chat-list .msg.assistant .a-text {white-space:pre-wrap;line-height:1.85}
+#chat-list .msg.assistant .pending {color:var(--pd-muted)}
+#chat-list .msg.assistant .mini {background:transparent;border:0;color:var(--pd-muted);padding:4px 8px;font-size:12px}
+#chat-list .msg.assistant .mini:hover {background:#eae6dd;color:var(--pd-ink)}
+#chat-list .msg.assistant .mini.on {color:var(--pd-blue);background:var(--pd-selected)}
+#chat-list .cite {color:var(--pd-blue);font-size:12px;padding:0 4px;min-height:24px;background:var(--pd-selected);border:0}
+#chat-latest {width:auto;flex:none;border-radius:16px;font-size:12px;margin-bottom:8px;padding:4px 12px;align-self:center}
+#chat-input-row {flex:none;background:var(--pd-surface);border:1px solid #b9b4a8;border-radius:16px;padding:12px 16px 8px;position:relative}
+#chat-input-row:focus-within {border-color:var(--pd-mist)}
+#chat-input-row:has(#chat-input:focus-visible) {outline:2px solid var(--pd-blue);outline-offset:2px}
+#chat-input {display:block;width:100%;min-height:80px;max-height:180px;border:0;background:transparent;border-radius:6px;resize:vertical;padding:8px 0;font:15px/1.7 system-ui,'Segoe UI','Microsoft YaHei',sans-serif;caret-color:var(--pd-blue)}
+#chat-input::placeholder {color:var(--pd-muted)}
+#chat-input:focus-visible {outline:none}
+.chat-composer-tools {display:flex;align-items:center;gap:4px;margin-top:8px}
+#chat-attachments {position:relative}
+#chat-attachments summary {display:flex;align-items:center;gap:5px;padding:4px 8px;cursor:pointer;list-style:none;border-radius:7px;color:var(--pd-muted)}
+#chat-attachments summary::-webkit-details-marker {display:none}
+#chat-attachments summary:hover,#chat-attachments[open] summary {background:var(--pd-paper);color:var(--pd-ink)}
+.chat-attachment-menu {position:absolute;bottom:calc(100% + 8px);left:0;z-index:2;min-width:170px;display:flex;flex-direction:column;padding:6px;background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:10px}
+#view-chat .chat-attachment-menu button {text-align:left;min-height:38px}
+#chat-send,#chat-stop {margin-left:auto;display:flex;align-items:center;justify-content:center;flex:none;min-width:36px;height:36px;padding:6px;border-radius:9px;background:var(--pd-blue);color:white;border:0}
+#chat-send:hover {background:#154fa6}
+#chat-stop {background:var(--pd-ink)}
+#chat-input-meta {display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;min-height:18px;font-size:11px;line-height:1.5;color:var(--pd-muted)}
+#chat-count {margin-left:auto}
+#chat-count.over,#chat-meta-error {color:#a3352c}
+#chat-starters {display:flex;gap:6px;flex-wrap:wrap}
+#chat-starters:empty {display:none}
+#chat-starters .starter {background:var(--pd-paper);border:0;font-size:12px;padding:4px 8px}
+.chat-welcome {text-align:center;padding:24px 0 8px}
+.chat-welcome h1 {font-size:clamp(24px,4cqi,34px);line-height:1.5;font-weight:400;letter-spacing:0;margin:0 0 12px;text-wrap:balance}
+.chat-welcome-title {display:flex;align-items:center;justify-content:center;gap:12px}
+.chat-welcome-title > span:last-child {min-width:0}
+.chat-welcome p {font-size:14px;line-height:1.7;color:var(--pd-muted);margin:0;text-wrap:balance}
+#view-chat.is-empty #chat-list {display:flex;flex-direction:column;justify-content:center;padding-block:24px}
+.chat-recent-list {display:flex;flex-direction:column;gap:4px;margin-top:12px;font-size:13px;color:var(--pd-muted)}
+.chat-recent-row {display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid var(--pd-line)}
+#view-chat .chat-recent-row .chat-tool:first-child {flex:1;min-width:0;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--pd-ink)}
+@media(max-width:559px) {
+  #view-chat {padding:12px}
+  #chat-head .chat-title {flex-basis:100%;font-size:15px}
+  #chat-head .chat-tool {padding:4px 8px}
+  #chat-input-row {padding:8px 10px}
+  #chat-list {padding-inline:2px}
+  .chat-welcome {padding-top:16px}
+  .chat-welcome-title {gap:8px}
+  .chat-welcome-title .brand-mark {width:36px}
+  .chat-welcome h1 {font-size:22px}
+  .chat-welcome p {font-size:13px}
+}
+@media(max-height:700px) {
+  #view-chat.is-empty #chat-list {padding-block:8px}
+  .chat-welcome {padding:8px 0}
+  .chat-welcome h1 {font-size:clamp(22px,4cqi,28px);margin-bottom:4px}
+  #chat-input {min-height:64px;max-height:120px}
+}

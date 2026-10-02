@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Peak Distance — 把英文读懂，把语境留下</title>
+  <desc id="desc">米白纸感与项目原有山海插画，配合网页、X、YouTube 的遇见、理解、保存、复习流程。此图为品牌与学习流程展示，不是界面截图。</desc>
+  <defs>
+    <linearGradient id="coast-fade"><stop offset="0" stop-color="white" stop-opacity="0"/><stop offset="0.34" stop-color="white"/></linearGradient>
+    <mask id="coast-mask"><rect x="640" width="560" height="520" fill="url(#coast-fade)"/></mask>
+  </defs>
+  <rect width="1200" height="520" fill="#f7f4ec"/>
+  <image href="../../../public/brand/paper-tile.png" width="1200" height="1200" opacity="0.2"/>
+  <g id="project-art" mask="url(#coast-mask)">
+    <image href="../../../public/brand/mountain-coast.png" x="640" y="-250" width="560" height="840"/>
+  </g>
+  <g id="title-block" fill="#2f3a40">
+    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">ENGLISH IN CONTEXT</text>
+    <text x="60" y="166" font-family="Georgia,'Times New Roman',serif" font-size="86">Peak Distance</text>
+    <path d="M64 200H120" stroke="#d4a950" stroke-width="3"/>
+    <g font-family="'Noto Serif SC',SimSun,serif" font-size="42">
+      <text x="64" y="267">把英文读懂，</text>
+      <text x="64" y="327">把语境留下。</text>
+    </g>
+  </g>
+  <g id="learning-route" font-family="'Segoe UI','Microsoft YaHei',sans-serif">
+    <text x="64" y="405" font-size="22" fill="#59636b">网页 / X / YouTube</text>
+    <g font-size="26" fill="#2f3a40">
+      <text x="64" y="457">遇见</text><text x="190" y="457">理解</text><text x="316" y="457">保存</text><text x="442" y="457">复习</text>
+    </g>
+    <g stroke="#6b8db7" stroke-width="2" fill="none">
+      <path d="M138 447h28m-6-5 6 5-6 5"/><path d="M264 447h28m-6-5 6 5-6 5"/><path d="M390 447h28m-6-5 6 5-6 5"/>
+    </g>
+  </g>
+</svg>
