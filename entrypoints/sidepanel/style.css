@@ -4,8 +4,8 @@ body {display:grid;grid-template-rows:auto minmax(0,1fr)}
 .app-header {padding:18px 16px 0;border-bottom:1px solid var(--pd-line);min-width:0}
 .brand-row {display:flex;gap:8px;align-items:center;margin-bottom:20px}
 .brand-mark {position:relative;width:48px;height:30px;overflow:hidden;flex:none}
-.brand-mark img {position:absolute;width:64px;height:64px;left:-8px;top:-21px}
-.brand-name {font:22px/1.1 Georgia,serif;flex:1;min-width:0;white-space:nowrap}
+.brand-mark img {position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.brand-name {font:24px/1.1 Georgia,serif;flex:1;min-width:0;white-space:nowrap}
 .brand-name small {display:block;font:10px/1.6 SimSun,serif;color:var(--pd-muted);letter-spacing:1px;margin-top:6px}
 .brand-row button {padding:4px 6px;min-width:30px;background:transparent;border-color:transparent;font-size:12px;white-space:nowrap}
 .brand-row #panel-close {font-size:20px}
@@ -39,8 +39,8 @@ main {min-height:0;min-width:0;overflow:auto;padding:20px 16px;flex:1;overscroll
 #settings-back:hover {background:var(--pd-selected);color:var(--pd-blue)}
 #settings-back svg {width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 .selection-actions {position:fixed;z-index:10;display:flex;gap:4px;padding:4px;background:var(--pd-paper);border:1px solid var(--pd-line);border-radius:8px;box-shadow:var(--pd-shadow)}
-@media(max-width:359px){.brand-row{display:grid;grid-template-columns:44px 1fr repeat(3,40px);gap:6px;margin-bottom:12px}.brand-name{grid-column:2/-1;font-size:21px}.brand-row #panel-mode{grid-column:3}.brand-row #open-settings{grid-column:4}.brand-row #panel-close{grid-column:5}}
-@media(min-width:560px){body{grid-template-columns:184px minmax(0,1fr);grid-template-rows:minmax(0,1fr)}.app-header{padding:24px 12px 0;border-right:1px solid var(--pd-line);border-bottom:0;position:relative;overflow:hidden;display:flex;flex-direction:column}.brand-row{flex-wrap:wrap;gap:4px;position:relative;z-index:1}.brand-name{font-size:17px;flex-basis:112px}.brand-mark{width:38px}.brand-name small{font-size:9px;letter-spacing:0}.brand-row button{margin-top:8px}#views{flex-direction:column;background:transparent;padding:0;position:relative;z-index:1}#views button{text-align:left;padding:8px 12px}#views button.active{background:var(--pd-selected);box-shadow:none}.brand-landscape{display:block;flex:1;min-height:100px;margin:24px -12px 0;background:url('/brand/mountain-coast.png') center bottom/auto 100%;opacity:.85}.app-content{background:#fffdfaab}main{padding:24px}#library-tools{padding:24px}.entry-head{flex-wrap:nowrap}}
+@media(max-width:359px){.brand-row{display:grid;grid-template-columns:1fr repeat(3,40px);gap:6px;margin-bottom:12px}.brand-name{grid-column:1;font-size:22px}.brand-row #panel-mode{grid-column:2}.brand-row #open-settings{grid-column:3}.brand-row #panel-close{grid-column:4}}
+@media(min-width:560px){body{grid-template-columns:184px minmax(0,1fr);grid-template-rows:minmax(0,1fr)}.app-header{padding:24px 12px 0;border-right:1px solid var(--pd-line);border-bottom:0;position:relative;overflow:hidden;display:flex;flex-direction:column}.brand-row{flex-wrap:wrap;gap:4px;position:relative;z-index:1}.brand-name{font-size:20px;flex:1 1 100%}.brand-name small{font-size:9px;letter-spacing:0}.brand-row button{margin-top:8px}#views{flex-direction:column;background:transparent;padding:0;position:relative;z-index:1}#views button{text-align:left;padding:8px 12px}#views button.active{background:var(--pd-selected);box-shadow:none}.brand-landscape{display:block;flex:1;min-height:100px;margin:24px -12px 0;background:url('/brand/mountain-coast.png') center bottom/auto 100%;opacity:.85}.app-content{background:#fffdfaab}main{padding:24px}#library-tools{padding:24px}.entry-head{flex-wrap:nowrap}}
 @media(prefers-reduced-motion:no-preference){button{transition:background .12s,color .12s}}
 /* 问答：限宽阅读区与纸面输入框 */
 #view-chat {display:flex;flex-direction:column;min-height:0;overflow:hidden;padding:20px 24px 16px;gap:0;background:var(--pd-paper);font-size:15px;line-height:1.75;container-type:inline-size}

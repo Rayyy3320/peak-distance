@@ -663,7 +663,7 @@ function renderMessages(): void {
     const welcome = el('div', 'chat-welcome');
     const title = el('h1', 'chat-welcome-title');
     const mark = el('span', 'brand-mark');
-    const image = el('img'); image.src = '/brand/peak-mark.png'; image.alt = '';
+    const image = el('img'); image.src = '/brand/peak-mark-crop.png'; image.alt = '';
     mark.setAttribute('aria-hidden', 'true'); mark.appendChild(image);
     title.append(mark, el('span', undefined, '从一句话，读懂更多。'));
     welcome.append(title, el('p', undefined, '聊聊刚读到的内容，或从一个问题开始。'));

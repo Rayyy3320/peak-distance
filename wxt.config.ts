@@ -12,7 +12,7 @@ export default defineConfig({
     action: {
       default_title: '打开 Peak Distance',
     },
-    icons: { 16:'brand/peak-mark.png',32:'brand/peak-mark.png',48:'brand/peak-mark.png',128:'brand/peak-mark.png' },
+    icons: { 16:'brand/peak-icon.png',32:'brand/peak-icon.png',48:'brand/peak-icon.png',128:'brand/peak-icon.png' },
     web_accessible_resources: [{resources:['sidepanel.html','assets/*','chunks/*','brand/*'],matches:['https://*/*']}],
     // side_panel.default_path 由 entrypoints/sidepanel 自动生成。
   },
