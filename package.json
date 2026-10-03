@@ -1,0 +1,30 @@
+{
+  "name": "browser-language-companion",
+  "description": "个人自用的英语学习扩展：网页 / X 与 YouTube 共用词汇与上下文",
+  "private": true,
+  "version": "0.4.2",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "typecheck": "wxt prepare && tsc --noEmit",
+    "regress": "tsx tools/regress.ts && tsx tools/chat-lifecycle-check.ts",
+    "verify-local": "npm run typecheck && npm run build && npm run regress",
+    "verify": "node tools/verify.mjs",
+    "render-check": "node tools/render-check.mjs",
+    "e2e-check": "node tools/e2e-check.mjs",
+    "check-m7": "node tools/check-m7.mjs",
+    "check-m8": "node tools/check-m8.mjs",
+    "check-ai": "tsx tools/ai-services-check.ts && node tools/check-ai-services.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "playwright-core": "^1.63.0",
+    "tsx": "^4.20.0",
+    "typescript": "~5.9.0",
+    "wxt": "^0.21.4"
+  },
+  "dependencies": {
+    "linkedom": "0.18.13"
+  }
+}
