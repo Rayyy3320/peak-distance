@@ -1,0 +1,14 @@
+.native-delete {position:relative;display:inline-flex;align-items:center;gap:8px;flex:none;min-height:40px}
+.native-delete button {box-sizing:border-box;height:40px;border-radius:8px;font:500 14px/20px system-ui,'Segoe UI',sans-serif;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;cursor:pointer;flex:none;transition:scale 350ms var(--native-delete-spring),box-shadow 150ms}
+.native-delete .native-delete-main {border:0;padding:8px 16px;color:#fff;background:linear-gradient(#a93b32f5,#a93b32f5),url('/brand/paper-tile.png') center/256px;min-height:40px}
+.native-delete .native-delete-main:hover {background-color:#933129;scale:1.02;background-image:linear-gradient(#933129f5,#933129f5),url('/brand/paper-tile.png')}
+.native-delete .native-delete-main:active {scale:.98}
+.native-delete .native-delete-main:disabled {opacity:.5;cursor:not-allowed;scale:1}
+.native-delete-icon {display:flex;align-items:center;margin-right:8px}
+.native-delete .native-delete-cancel {width:40px;padding:0;border:1px solid var(--pd-line);background:linear-gradient(#f7f4ecf5,#f7f4ecf5),url('/brand/paper-tile.png') center/256px;color:var(--pd-ink)}
+.native-delete .native-delete-cancel:hover {scale:1.05;background-color:var(--pd-selected)}
+.native-delete .native-delete-cancel:active {scale:.95}
+.native-delete-cancel.exiting {position:absolute;left:calc(100% + 8px);top:0;pointer-events:none}
+.native-delete button:focus-visible {outline:3px solid #a93b3280;outline-offset:2px}
+.native-delete [hidden] {display:none!important}
+@media(prefers-reduced-motion:reduce) {.native-delete button{transition:none}.native-delete button:hover,.native-delete button:active{scale:1}}

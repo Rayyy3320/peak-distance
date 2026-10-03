@@ -20,7 +20,7 @@ import type { Settings } from '@/shared/settings';
 //   6. 诊断徽标默认隐藏（页面事件 blc-debug-toggle 切换），宿主属性
 //      data-blc-* 持续更新供程序化断言。
 //
-// 沿用 Gythiro yt-dual-subs（MIT）的获取链路思路，见 public/THIRD_PARTY_NOTICES.txt。
+// 沿用 Gythiro yt-dual-subs（MIT）的获取链路思路，见 docs/REFERENCES.md。
 
 import { videoIdFromLocation } from '@/shared/youtube';
 import {

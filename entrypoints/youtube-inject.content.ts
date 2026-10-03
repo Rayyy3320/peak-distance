@@ -2,7 +2,7 @@ import { alignTranslatedCues, normalizeAsrCues } from '@/shared/cues';
 // MAIN world、document_start 的字幕嗅探脚本。
 //
 // 移植自 yt-dual-subs 的 inject.js（MIT，Gythiro，commit 5657c8a，2026-09-12，
-// v3.7.0），见 public/THIRD_PARTY_NOTICES.txt。核心链路：
+// v3.7.0），见 docs/REFERENCES.md。核心链路：
 //   1. 钩住 fetch / XMLHttpRequest，并以 PerformanceObserver（Resource Timing）
 //      兜底，捕获播放器自己发出的 /api/timedtext 请求 URL —— 它携带当前有效
 //      的 pot（proof-of-origin）令牌与签名，2025 年后不带 pot 直接请求

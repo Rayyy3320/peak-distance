@@ -4,7 +4,7 @@ export default defineConfig({
   // 桌面 Chrome，Manifest V3 是 WXT 的默认目标。
   manifest: {
     name: 'Peak Distance',
-    minimum_chrome_version: '141',
+    minimum_chrome_version: '142',
     description: '网页 / X 与 YouTube 英语学习扩展',
     permissions: ['storage', 'sidePanel'],
     host_permissions: ['https://api.deepseek.com/*', 'https://dict.youdao.com/*', 'https://dictionary.cambridge.org/*', 'https://translate.googleapis.com/*'],

@@ -187,7 +187,7 @@ export interface SubViewState {
 // ---- M5 上下文问答 -------------------------------------------------------------
 
 /** 侧栏 / 内容脚本 → background 的问答 CRUD 请求（runtime.sendMessage）。 */
-export type ChatRequest =
+export type ChatRequest = (
   | { type: 'chatActive' | 'chatNew'; windowId: number }
   | { type: 'chatSelect'; chatId: string; windowId: number }
   | { type: 'chatRemoveMaterial' | 'chatDelete'; chatId: string }
@@ -206,7 +206,8 @@ export type ChatRequest =
   | { type: 'chatSetDraft'; chatId: string; draft: string }
   | { type: 'chatTakeQuote'; chatId: string }
   | { type: 'chatRetain'; chatId: string; messageId: string; retained: boolean }
-  | { type: 'chatClear'; chatId: string };
+  | { type: 'chatClear'; chatId: string }
+) & { windowId?: number; editId?: string };
 
 export interface ChatRecentItem {
   chatId: string;
@@ -236,6 +237,8 @@ export type ChatPortMessage =
       quote: QuoteRef | null;
       snapshotVersion: number;
       segmentIndex: number;
+      windowId?: number;
+      editId?: string;
     }
   | { type: 'chat-stop'; chatId: string }
   | { type: 'chat-retry'; chatId: string; turnId: string };
@@ -264,6 +267,8 @@ export type ChatPortEvent =
       turnId?: string;
       requestId?: string;
       error?: string;
+      submittedChatId?: string;
+      editId?: string;
     };
 
 /** 标签页直达：侧栏 ↔ 内容脚本的问答材料消息。 */

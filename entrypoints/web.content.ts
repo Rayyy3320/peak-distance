@@ -37,6 +37,22 @@ export default defineContentScript({
     const PILL_ID = 'blc-lookup-pill';
     const POPUP_ID = 'blc-lookup-popup';
 
+    let dismissedRange: Range | null = null;
+    let dismissedText = '';
+    const sameDismissedSelection = () => {
+      const s = document.getSelection();
+      if (!s?.rangeCount || !dismissedRange) return false;
+      const r = s.getRangeAt(0);
+      return s.toString() === dismissedText && r.startContainer === dismissedRange.startContainer &&
+        r.endContainer === dismissedRange.endContainer && r.startOffset === dismissedRange.startOffset && r.endOffset === dismissedRange.endOffset;
+    };
+    const dismissSelection = () => {
+      const s = document.getSelection();
+      dismissedRange = s?.rangeCount ? s.getRangeAt(0).cloneRange() : null;
+      dismissedText = s?.toString() ?? '';
+      if (selectionTimer) clearTimeout(selectionTimer);
+      removePill();
+    };
     let selectionTimer: ReturnType<typeof setTimeout> | null = null;
 
     function send<T>(msg: unknown): Promise<T> {
@@ -105,6 +121,8 @@ export default defineContentScript({
 
     function refreshPill(): void {
       const info = evaluateSelection();
+      if (document.getSelection()?.isCollapsed) dismissedRange = null;
+      if (sameDismissedSelection()) { removePill(); return; }
       if (!info) {
         removePill();
         return;
@@ -131,7 +149,7 @@ export default defineContentScript({
         style.textContent = `
           ${brandTokens}:host { font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif; display:flex; gap:4px; padding:4px; background:var(--pd-paper); border:1px solid var(--pd-line);border-radius:8px;box-shadow:var(--pd-shadow) }
           ${brandControls}
-          button { min-height:32px; } [hidden] { display:none!important; }
+          button { min-height:32px;border:0;background:transparent; } button:hover {background:var(--pd-selected)} [hidden] { display:none!important; }
         `;
         root.appendChild(style);
         const btn = document.createElement('button');
@@ -143,6 +161,7 @@ export default defineContentScript({
         translate.addEventListener('click', () => {
           const info = evaluateSelection() ?? currentPillInfo;
           if(!info) return;
+          dismissSelection();
           popup.close();
           translation.open({text:info.expression,url:location.href,title:document.title},info.rect);
           removePill();
@@ -183,6 +202,7 @@ export default defineContentScript({
     }
 
     function openPopup(info: SelectionInfo): void {
+      dismissSelection();
       translation.close();
       void send({type:'selectionSnapshot',snapshot:{text:info.expression,url:location.href,title:document.title}});
       popup.open({

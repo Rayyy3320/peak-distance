@@ -1,7 +1,7 @@
 import '@/shared/theme.css';
 import { mountSettings } from '@/shared/settingsView';
 import { createYoutubeWorkspace, type WorkspaceState } from '@/shared/youtubeWorkspace';
-import { isPanelView, panelStateKey, type SelectionSnapshot } from '@/shared/panel';
+import { isPanelView, panelStateKey, panelTransportFailure, type SelectionSnapshot, type PanelFrameState } from '@/shared/panel';
 import { createTranslationPopup } from '@/shared/translationPopup';
 import { createLookupPopup } from '@/shared/lookupPopup';
 import { shadowSelection } from '@/shared/selection';
@@ -32,10 +32,17 @@ const STATUS_LABEL: Record<VocabStatus, string> = {
 
 function send<T>(msg: unknown): Promise<T> {
   return new Promise((resolve) => {
-    browser.runtime.sendMessage(msg, (r: unknown) => {
-      void browser.runtime.lastError;
-      resolve(r as T);
-    });
+    const failed = (error: unknown) => {
+      console.warn('[pd] panel transport failed', { type: (msg as {type?:string}).type, reason: panelTransportFailure(error) });
+      resolve(undefined as T);
+    };
+    try {
+      const pending = browser.runtime.sendMessage(msg, (r: unknown) => {
+        const error = browser.runtime.lastError;
+        if (error) failed(error.message); else resolve(r as T);
+      }) as unknown as Promise<unknown> | undefined;
+      void pending?.catch(failed);
+    } catch (error) { failed(error); }
   });
 }
 
@@ -83,6 +90,21 @@ let panelTabId=-1;
 let activePanel=true;
 let inVideoFullscreen=false;
 let ready = false;
+let panelDocumentId = '';
+let workspaceInitialized = false;
+let workspaceFailureStage = '';
+const workspaceVersion = browser.runtime.getManifest().version;
+function workspaceFailed(stage: string, error: unknown) {
+  workspaceFailureStage = stage; ready = false;
+  console.warn('[pd] workspace initialization failed', { stage, documentId: panelDocumentId, version: workspaceVersion, reason: error instanceof Error ? error.name : 'unknown-error' });
+  feedback('工作区暂不可用，请使用浮动外壳的重试入口');
+}
+browser.runtime.onMessage.addListener((m: unknown, _sender, reply) => {
+  if ((m as {type?:string}).type !== 'pd-workspace-status') return;
+  const phase: PanelFrameState['phase'] = !document.getElementById('views') ? 'document-empty'
+    : workspaceFailureStage ? 'failed' : !workspaceInitialized ? 'loading' : ready ? 'ready' : 'standby';
+  reply({ ok: phase === 'ready' || phase === 'standby', phase, documentId: panelDocumentId, version: workspaceVersion, reason: workspaceFailureStage || undefined } satisfies PanelFrameState);
+});
 let savedScroll: Record<string,number> = {};
 interface PanelSnapshot {view?:string;previousView?:string;search?:string;reviewQueue?:ReviewItem[];reviewIdx?:number;revealed?:boolean;scroll?:Record<string,number>;video?:{tab?:string;follow?:boolean;top?:number};chat?:ChatViewSnapshot}
 const settingsView=mountSettings(document.getElementById('settings-body')!);
@@ -148,8 +170,8 @@ document.getElementById('panel-mode')!.addEventListener('click',async()=>{
   const r=await send<{ok:boolean;error?:string}>({type:'panelSwitch',mode:floating?'fixed':'floating',nativeOpened:await nativeOpen});
   if(!r?.ok)feedback(r?.error??'切换失败，请重试');
 });
-document.getElementById('panel-close')!.addEventListener('click',async()=>{lookupPopup.close();await saveDraft();await persistPanel();await send({type:'panelClose'});});
-window.addEventListener('pagehide',()=>void persistPanel());
+document.getElementById('panel-close')!.addEventListener('click',async()=>{lookupPopup.close();await persistPanel();setChatActive(false);activePanel=false;ready=false;const r=await send<{ok:boolean}>({type:'panelClose'});if(!r?.ok){activePanel=true;ready=true;setChatActive(true);feedback('关闭失败，请重试');}});
+document.addEventListener('pointerdown',()=>void send({type:'panelOutsideClick',at:performance.timeOrigin+performance.now()}),true);
 document.addEventListener('click',()=>setTimeout(()=>void persistPanel(),0));
 document.addEventListener('scroll',()=>void persistPanel(),true);
 
@@ -575,17 +597,20 @@ browser.runtime.onMessage.addListener((msg: unknown) => {
 initChatView({ getActiveView: () => currentView, switchView });
 
 async function boot(){
- const ctx=await send<{ok:boolean;windowId:number;tabId:number;floating:boolean;fullscreen:boolean}>({type:'panelContext'});
- if(!ctx?.ok){feedback('无法连接扩展，请重新加载后打开');return;}
+ const ctx=await send<{ok:boolean;windowId:number;tabId:number;documentId:string;floating:boolean;fullscreen:boolean;active:boolean}>({type:'panelContext'});
+ if(!ctx?.ok){workspaceFailed('context',new Error('panel-context-unavailable'));return;}
+ panelDocumentId=ctx.documentId;
  panelWindow=ctx.windowId;panelTabId=ctx.tabId;floating=ctx.floating;inVideoFullscreen=ctx.fullscreen;
+ activePanel=ctx.active;setChatActive(activePanel);
  const mode=document.getElementById('panel-mode')!;mode.textContent=floating?'固定':'浮动';mode.setAttribute('aria-label',floating?'切换为固定侧栏':'切换为浮动面板');
  const stored=(await browser.storage.session.get(panelStateKey(panelWindow)))[panelStateKey(panelWindow)] as PanelSnapshot|undefined;
  if(stored){savedScroll=stored.scroll??{};reviewQueue=stored.reviewQueue??[];reviewIdx=stored.reviewIdx??0;revealed=!!stored.revealed;previousView=stored.previousView??'list';(document.getElementById('search') as HTMLInputElement).value=stored.search??'';}
  const hash=location.hash.slice(1);switchView(isPanelView(hash)?hash:isPanelView(stored?.view)?stored.view:'subs');
  await restoreChat(stored?.chat);
  if(stored?.video){await pollSubs();videoWorkspace.restore(stored.video);}
- ready=true;document.body.inert=false;
- browser.runtime.onMessage.addListener((m:unknown)=>{const v=m as {type?:string;windowId?:number;tabId?:number;mode?:string;view?:unknown};if(v.type==='pd-panel-view'&&v.windowId===panelWindow){activePanel=v.mode===(floating?'floating':'fixed')&&(!floating||v.tabId===panelTabId);setChatActive(false);restoreVersion++;ready=false;document.body.inert=true;if(activePanel)void restorePanel(v.view);}});
+ ready=activePanel;document.body.inert=!activePanel;
+ workspaceInitialized=true;
+ browser.runtime.onMessage.addListener((m:unknown)=>{const v=m as {type?:string;windowId?:number;tabId?:number;mode?:string;view?:unknown;origin?:string;at?:number};if(v.type==='pd-popup-outside'&&v.windowId===panelWindow&&v.origin==='page'){document.dispatchEvent(new CustomEvent('pd-popup-outside',{detail:{at:v.at}}));return;}if(v.type==='pd-panel-closed'&&v.windowId===panelWindow){void restoreChat();return;}if(v.type==='pd-panel-view'&&v.windowId===panelWindow){activePanel=v.mode===(floating?'floating':'fixed')&&(!floating||v.tabId===panelTabId);setChatActive(false);restoreVersion++;ready=false;document.body.inert=true;if(activePanel)void restorePanel(v.view).catch(error=>workspaceFailed('restore',error));}});
  if(floating)void send({type:'panelReady'});
  browser.runtime.onMessage.addListener((m:unknown)=>{const v=m as {type?:string;tabId?:number;fullscreen?:boolean};if(v.type==='pd-panel-fullscreen'&&v.tabId===panelTabId)inVideoFullscreen=!!v.fullscreen;});
 }
@@ -607,7 +632,7 @@ async function restorePanel(view?:unknown) {
     currentMain()?.scrollTo(0,savedScroll[currentView]??0);
   }
   if(version!==restoreVersion)return;
-  setChatActive(activePanel);ready=true;document.body.inert=false;
+  workspaceFailureStage='';setChatActive(activePanel);ready=true;document.body.inert=false;
 }
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){void saveDraft();void persistPanel();setChatActive(false);}else setChatActive(activePanel&&ready);});
-void boot();
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){void persistPanel();setChatActive(false);}else setChatActive(activePanel&&ready);});
+void boot().catch(error=>workspaceFailed('boot',error));

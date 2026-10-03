@@ -1,20 +1,19 @@
 import {
   appendChatTurn,
   clearChat,
-  ensureChat,
   getChat,
   listChats,
   resetChatTurn,
   saveAssistantProgress,
-  setChatDraft,
   setChatRetained,
-  takePendingQuote,
 } from './db';
 import { chatCompletionStream } from './aiClient';
 import { getAiConfig } from './aiTransport';
 import { validateAiProfile, type AiConfig } from '@/shared/aiConfig';
 import { openPanel } from './panelService';
+import { readChatEdit, writeChatEdit, replaceChatEdit, activateChatEdit, beginChatOperation, chatOperation, ownsChatEdit } from './chatWorkspace';
 import {
+  editChatMaterial,
   CHAT_QUESTION_MAX_CHARS,
   buildChatMessages,
   buildSegments,
@@ -61,6 +60,7 @@ interface ActiveChat {
 }
 
 const activeChats = new Map<string, ActiveChat>();
+const submittingEdits = new Set<string>();
 type ChatPort = Parameters<Parameters<typeof browser.runtime.onConnect.addListener>[0]>[0];
 const portSubs = new Map<ChatPort, Set<string>>();
 
@@ -362,7 +362,7 @@ async function stopChat(chatId: string, reason: string): Promise<void> {
 function ack(
   port: ChatPort,
   chatId: string,
-  payload: { ok: true; turnId: string; requestId: string } | { ok: false; error: string },
+  payload: { ok: true; turnId: string; requestId: string; submittedChatId?: string; editId?: string } | { ok: false; error: string; editId?: string },
 ): void {
   try {
     post(port, {
@@ -404,15 +404,17 @@ async function onPortMessage(port: ChatPort, msg: unknown): Promise<void> {
         ack(port, m.chatId, { ok: false, error: 'busy' });
         return;
       }
-      const record = await getChat(m.chatId, isLiveRequest(m.chatId));
-      if (!record) {
-        ack(port, m.chatId, { ok: false, error: 'no-chat' });
-        return;
-      }
-      if (activeChats.has(m.chatId)) { ack(port, m.chatId, { ok: false, error: 'busy' }); return; }
+      const windowId = port.sender?.tab?.windowId ?? m.windowId ?? -1;
+      const edit = await readChatEdit(windowId);
+      const fail = (error: string) => ack(port, m.chatId!, { ok: false, error, editId: m.editId });
+      if (edit.id !== m.chatId || (m.editId && edit.editId !== m.editId)) { fail('material-changed'); return; }
+      const record = structuredClone(edit);
+      const submittedDraft = edit.draft;
+      const submittedQuote = JSON.stringify(edit.pendingQuote);
       const config = await getAiConfig();
-      if (!config.apiKey) { ack(port, m.chatId, { ok: false, error: 'no-key' }); return; }
-      if (validateAiProfile(config)) { ack(port, m.chatId, { ok: false, error: 'invalid-config' }); return; }
+      if (!config.apiKey) { fail('no-key'); return; }
+      if (validateAiProfile(config)) { fail('invalid-config'); return; }
+      if (!ownsChatEdit(windowId, edit)) { fail('material-changed'); return; }
       const version = record.activeSnapshotVersion ?? 0;
       if ((m.snapshotVersion ?? 0) !== version) { ack(port, m.chatId, { ok: false, error: 'material-changed' }); return; }
       const snapshot = record.snapshots.find(s => s.version === version);
@@ -421,14 +423,16 @@ async function onPortMessage(port: ChatPort, msg: unknown): Promise<void> {
         : buildSegments(snapshot.blocks, snapshot.source.sourceType)) : [];
       const segIndex = Math.min(Math.max(m.segmentIndex ?? 0, 0), Math.max(segments.length - 1, 0));
       const scopeLabel = segments[segIndex]?.label ?? '普通问答';
-      if (activeChats.has(m.chatId)) { ack(port, m.chatId, { ok: false, error: 'busy' }); return; }
+      if (activeChats.has(m.chatId) || submittingEdits.has(edit.editId!)) { fail('busy'); return; }
+      submittingEdits.add(edit.editId!);
+      const committedId = m.chatId || crypto.randomUUID();
       const turnId = crypto.randomUUID();
       const requestId = crypto.randomUUID();
       // 先登记生成中状态再落库：发送回执触发的读路径（chatGet）会把
       // streaming 占位误判为陈旧状态打成“已中断”——activeChats 在场即可免误杀
       const active: ActiveChat = {
         config,
-        chatId: m.chatId,
+        chatId: committedId,
         turnId,
         requestId,
         controller: new AbortController(),
@@ -439,9 +443,9 @@ async function onPortMessage(port: ChatPort, msg: unknown): Promise<void> {
         totalTimer: null,
         checkpointTimer: null,
       };
-      activeChats.set(m.chatId, active);
+      activeChats.set(committedId, active);
       const saved = await appendChatTurn({
-        chatId: m.chatId,
+        chatId: committedId,
         turnId,
         requestId,
         question,
@@ -449,13 +453,25 @@ async function onPortMessage(port: ChatPort, msg: unknown): Promise<void> {
         snapshotVersion: version,
         segmentIndex: segIndex,
         scopeLabel,
-      });
+        context: record, create: !m.chatId,
+      }).catch(() => null);
+      submittingEdits.delete(edit.editId!);
       if (!saved) {
-        activeChats.delete(m.chatId);
-        ack(port, m.chatId, { ok: false, error: 'no-chat' });
+        activeChats.delete(committedId);
+        fail('commit-failed');
         return;
       }
-      ack(port, m.chatId, { ok: true, turnId, requestId });
+      portSubs.get(port)?.add(committedId);
+      // 已提交的问题保留，即使用户此时离开；旧回执不覆盖新的编辑工作区。
+      if (ownsChatEdit(windowId, edit)) {
+        const committed = await getChat(committedId, isLiveRequest(committedId));
+        if (committed && ownsChatEdit(windowId, edit)) {
+          await activateChatEdit(windowId, { ...edit, id: committedId, title: committed.title, messages: committed.messages,
+            draft: edit.draft === submittedDraft ? '' : edit.draft,
+            pendingQuote: JSON.stringify(edit.pendingQuote) === submittedQuote ? null : edit.pendingQuote });
+        }
+      }
+      ack(port, m.chatId, { ok: true, turnId, requestId, submittedChatId: committedId, editId: m.editId });
       await runTurn(active);
       return;
     }
@@ -517,27 +533,46 @@ export async function handleChatRequest(
   const m = msg as Record<string, unknown>;
   const windowId = sender.tab?.windowId ?? (typeof m.windowId === 'number' ? m.windowId : -1);
   const activeKey = `chat-active:${windowId}`;
-  const setActive = async (id: string) => browser.storage.session.set({ [activeKey]: id });
   const currentId = async () => (await browser.storage.session.get(activeKey))[activeKey] as string | undefined;
+  const operation = ['chatNew', 'chatSelect', 'chatClear'].includes(String(m.type)) ? beginChatOperation(windowId) : chatOperation(windowId);
+  const currentOperation = () => chatOperation(windowId) === operation;
   switch (m.type) {
-    case 'chatNew':
+    case 'chatNew': {
+      await activateChatEdit(windowId, null);
+      return { ok: true, chat: await readChatEdit(windowId) };
+    }
     case 'chatActive': {
-      const id = m.type === 'chatNew' ? undefined : await currentId();
-      const existing = id ? await getChat(id, isLiveRequest(id)) : null;
-      const chat = existing ?? await ensureChat({});
-      if (!existing) await setActive(chat.id);
-      return { ok: true, chat };
+      const edit = await readChatEdit(windowId);
+      const id = await currentId();
+      if (edit.id && edit.id === id) {
+        const record = await getChat(edit.id, isLiveRequest(edit.id));
+        if (!currentOperation()) return { ok: true, chat: await readChatEdit(windowId) };
+        if (!record) {
+          if (ownsChatEdit(windowId, edit)) await activateChatEdit(windowId, null);
+        } else if (ownsChatEdit(windowId, edit)) {
+          edit.messages = record.messages;
+          edit.updatedAt = Math.max(edit.updatedAt, record.updatedAt);
+        }
+      } else if (!edit.id && id) {
+        const record = await getChat(id, isLiveRequest(id));
+        if (record && currentOperation() && ownsChatEdit(windowId, edit)) await replaceChatEdit(windowId, record);
+      }
+      return { ok: true, chat: await readChatEdit(windowId) };
     }
     case 'chatSelect': {
       if (typeof m.chatId !== 'string') return bad('bad-payload');
       const chat = await getChat(m.chatId, isLiveRequest(m.chatId));
       if (!chat) return bad('not-found');
-      await setActive(chat.id);
-      return { ok: true, chat };
+      if (!currentOperation()) return bad('stale-edit');
+      await activateChatEdit(windowId, { ...chat, draft: '', pendingQuote: null, editId: crypto.randomUUID() });
+      return { ok: true, chat: await readChatEdit(windowId) };
     }
     case 'chatRemoveMaterial': {
-      if (typeof m.chatId !== 'string' || !await getChat(m.chatId, isLiveRequest(m.chatId))) return bad('not-found');
-      return { ok: true, chat: await ensureChat({ id: m.chatId, removeMaterial: true }) };
+      const edit = await readChatEdit(windowId);
+      if (edit.id !== m.chatId || (m.editId && m.editId !== edit.editId)) return bad('stale-edit');
+      editChatMaterial(edit, { removeMaterial: true });
+      await writeChatEdit(windowId, edit);
+      return { ok: true, chat: edit };
     }
     case 'chatGet': {
       if (typeof m.chatId !== 'string' || !m.chatId) return bad('bad-payload', 'chatId');
@@ -564,31 +599,37 @@ export async function handleChatRequest(
           panelOpened = (await openPanel(tabId,windowId,'chat',undefined,sender.nativeOpen)).ok;
         }
       }
-      const id = typeof m.chatId === 'string' ? m.chatId : await currentId();
-      const chat = await ensureChat({ id, source, material, quote });
-      await setActive(chat.id);
-      const r: ChatEnsureResult = { ok: true, chat, panelOpened };
+      const edit = await readChatEdit(windowId);
+      if (!currentOperation()) return bad('stale-edit');
+      if (typeof m.chatId === 'string' && m.chatId !== edit.id || m.editId && m.editId !== edit.editId) return bad('stale-edit');
+      editChatMaterial(edit, { source, material, quote });
+      await writeChatEdit(windowId, edit);
+      const r: ChatEnsureResult = { ok: true, chat: edit, panelOpened };
       return r;
     }
     case 'chatUpdateMaterial': {
-      if (typeof m.chatId !== 'string' || !m.chatId) return bad('bad-payload', 'chatId');
       const material = parseMaterial(m.material);
       if (!material) return bad('bad-payload', 'material');
-      const existing = await getChat(m.chatId, isLiveRequest(m.chatId));
-      if (!existing) return bad('not-found');
-      const chat = await ensureChat({ id: existing.id, source: existing.source, material, quote: null });
-      return { ok: true, chat };
+      const edit = await readChatEdit(windowId);
+      if (edit.id !== m.chatId || m.editId && m.editId !== edit.editId) return bad('stale-edit');
+      editChatMaterial(edit, { source: edit.source, material });
+      await writeChatEdit(windowId, edit);
+      return { ok: true, chat: edit };
     }
     case 'chatSetDraft': {
-      if (typeof m.chatId !== 'string' || typeof m.draft !== 'string') {
-        return bad('bad-payload');
-      }
-      await setChatDraft(m.chatId, m.draft);
+      if (typeof m.chatId !== 'string' || typeof m.draft !== 'string') return bad('bad-payload');
+      const edit = await readChatEdit(windowId);
+      if (edit.id !== m.chatId || m.editId !== edit.editId) return bad('stale-edit');
+      edit.draft = m.draft.slice(0, 8000);
+      await writeChatEdit(windowId, edit);
       return { ok: true };
     }
     case 'chatTakeQuote': {
-      if (typeof m.chatId !== 'string' || !m.chatId) return bad('bad-payload', 'chatId');
-      return { ok: true, quote: await takePendingQuote(m.chatId) };
+      const edit = await readChatEdit(windowId);
+      if (edit.id !== m.chatId || m.editId && m.editId !== edit.editId) return bad('stale-edit');
+      const quote = edit.pendingQuote; edit.pendingQuote = null;
+      await writeChatEdit(windowId, edit);
+      return { ok: true, quote };
     }
     case 'chatRetain': {
       if (
@@ -606,7 +647,9 @@ export async function handleChatRequest(
     case 'chatClear': {
       if (typeof m.chatId !== 'string' || !m.chatId) return bad('bad-payload', 'chatId');
       await stopChat(m.chatId, 'cleared');
-      await clearChat(m.chatId, m.type === 'chatDelete');
+      const removed = await clearChat(m.chatId);
+      if (!removed) return bad('not-found');
+      if (await currentId() === m.chatId && currentOperation()) await activateChatEdit(windowId, null);
       broadcastActive(m.chatId);
       return { ok: true };
     }

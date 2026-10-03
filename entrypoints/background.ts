@@ -1,5 +1,5 @@
 import { lookupOnline } from '@/lib/lookupService';
-import { handlePanelMessage, openPanel, startNativePanel } from '@/lib/panelService';
+import { handlePanelMessage, openPanel, startNativePanel, initPanelLifecycle } from '@/lib/panelService';
 import { selectionError } from '@/shared/panel';
 import { translateRegularText } from '@/lib/regularTranslation';
 import { cached, cacheGet, cachePut, trimCache } from '@/lib/onlineCache';
@@ -414,6 +414,7 @@ export default defineBackground(() => {
 
   // M5 问答：侧栏长连接（发送 / 停止 / 重试 / 流事件广播）
   initChatService();
+  initPanelLifecycle();
 
   // 设置页直接写 storage 时经 onChanged 广播给页面与各标签页。
   browser.storage.onChanged.addListener((changes, area) => {

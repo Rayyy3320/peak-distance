@@ -1,6 +1,6 @@
 // yt-dual-subs background.js (commit 5657c8a18ca30c84b5d4662bca58e3e9214ffdff):
 // 使用同一免 key Google 端点及 json[0][i][0] 结构。
-// Copyright (c) 2026 Gythiro. MIT 许可全文见 public/THIRD_PARTY_NOTICES.txt。
+// Copyright (c) 2026 Gythiro. MIT 许可全文见 docs/REFERENCES.md。
 
 export type RegularTranslationResult =
   | { ok: true; source: 'google-gtx'; text: string }

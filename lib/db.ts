@@ -22,13 +22,10 @@ import {
   type SavedSentence,
 } from '@/shared/vocab';
 import {
-  materialFingerprint,
   migrateLegacyChat,
   type ChatMessageRecord,
   type ChatRecord,
-  type MaterialPayload,
   type QuoteRef,
-  type SourceDescriptor,
 } from '@/shared/chat';
 import type { EntryView, SaveResult } from '@/shared/messages';
 
@@ -322,45 +319,6 @@ export async function removeForm(key: string, form: string): Promise<boolean> {
 
 // ---- 独立问答会话（conversations store） ---------------------------------------------------
 
-export async function ensureChat(input: {
-  id?: string;
-  source?: SourceDescriptor | null;
-  material?: MaterialPayload | null;
-  quote?: QuoteRef | null;
-  removeMaterial?: boolean;
-}): Promise<ChatRecord> {
-  return withDb(async (db) => {
-    const tx = db.transaction([CHATS], 'readwrite');
-    const store = tx.objectStore(CHATS);
-    const existing = input.id ? await px(store.get(input.id)) as ChatRecord | undefined : undefined;
-    const record: ChatRecord = existing ?? {
-      id: input.id ?? crypto.randomUUID(), title: '新对话', sourceKey: null, source: null,
-      activeSnapshotVersion: null, snapshots: [], messages: [], pendingQuote: null, draft: '', updatedAt: Date.now(),
-    };
-    if (input.material && input.source) {
-      const latest = record.snapshots.at(-1);
-      const same = latest?.source.sourceKey === input.source.sourceKey &&
-        JSON.stringify(latest.source.video) === JSON.stringify(input.source.video) &&
-        materialFingerprint(latest.blocks) === materialFingerprint(input.material.blocks);
-      if (!same) record.snapshots.push({ ...input.material, source: input.source, version: (latest?.version ?? 0) + 1, createdAt: Date.now() });
-      record.activeSnapshotVersion = record.snapshots.at(-1)!.version;
-      record.source = input.source;
-      record.sourceKey = input.source.sourceKey;
-      record.pendingQuote = input.quote ?? null;
-    }
-    if (input.removeMaterial) {
-      record.source = null;
-      record.sourceKey = null;
-      record.activeSnapshotVersion = null;
-      record.pendingQuote = null;
-    }
-    record.updatedAt = Date.now();
-    store.put(record);
-    await txDone(tx);
-    return record;
-  });
-}
-
 export async function getChat(
   chatId: string,
   isLive?: (requestId: string) => boolean,
@@ -433,16 +391,24 @@ export async function appendChatTurn(input: {
   snapshotVersion: number;
   segmentIndex: number;
   scopeLabel: string;
+  context?: ChatRecord;
+  create?: boolean;
 }): Promise<ChatMessageRecord | null> {
   return withDb(async (db) => {
     const tx = db.transaction([CHATS], 'readwrite');
     const store = tx.objectStore(CHATS);
-    const record = (await px(store.get(input.chatId))) as ChatRecord | undefined;
+    let record = (await px(store.get(input.chatId))) as ChatRecord | undefined;
+    if (!record && input.create && input.context) record = { ...input.context, id: input.chatId };
     if (!record) {
       await txDone(tx);
       return null;
     }
     const now = Date.now();
+    if (input.context) {
+      record.source = input.context.source; record.sourceKey = input.context.sourceKey;
+      record.snapshots = input.context.snapshots;
+      record.activeSnapshotVersion = input.context.activeSnapshotVersion;
+    }
     const userMsg: ChatMessageRecord = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -554,41 +520,6 @@ export async function resetChatTurn(
   });
 }
 
-export async function setChatDraft(chatId: string, draft: string): Promise<void> {
-  return withDb(async (db) => {
-    const tx = db.transaction([CHATS], 'readwrite');
-    const store = tx.objectStore(CHATS);
-    const record = (await px(store.get(chatId))) as ChatRecord | undefined;
-    if (!record) {
-      await txDone(tx);
-      return;
-    }
-    record.draft = draft.slice(0, 8000);
-    record.updatedAt = Date.now();
-    store.put(record);
-    await txDone(tx);
-  });
-}
-
-/** 取走冷启动 / 入口带入的引用（取后即清）。 */
-export async function takePendingQuote(chatId: string): Promise<QuoteRef | null> {
-  return withDb(async (db) => {
-    const tx = db.transaction([CHATS], 'readwrite');
-    const store = tx.objectStore(CHATS);
-    const record = (await px(store.get(chatId))) as ChatRecord | undefined;
-    if (!record || !record.pendingQuote) {
-      await txDone(tx);
-      return null;
-    }
-    const quote = record.pendingQuote;
-    record.pendingQuote = null;
-    record.updatedAt = Date.now();
-    store.put(record);
-    await txDone(tx);
-    return quote;
-  });
-}
-
 export async function setChatRetained(
   chatId: string,
   messageId: string,
@@ -616,13 +547,13 @@ export async function setChatRetained(
 }
 
 /** 清空当前对话：连同材料快照、引用与保留标记（不动生词本与原有上下文）。 */
-export async function clearChat(chatId: string, remove = false): Promise<boolean> {
+export async function clearChat(chatId: string): Promise<boolean> {
   return withDb(async (db) => {
     const tx = db.transaction([CHATS], 'readwrite');
     const store = tx.objectStore(CHATS);
     const record = await px(store.get(chatId)) as ChatRecord | undefined;
-    if (remove) store.delete(chatId);
-    else if (record) store.put({ ...record, title: '新对话', source: null, sourceKey: null, activeSnapshotVersion: null, snapshots: [], messages: [], pendingQuote: null, draft: '', updatedAt: Date.now() });
+    if (!record) { await txDone(tx); return false; }
+    store.delete(chatId);
     await txDone(tx);
     return true;
   });

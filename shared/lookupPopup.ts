@@ -99,6 +99,7 @@ export function createLookupPopup(opts: {
   let requestCounter = 0;
   // 拖动后的卡片位置（null = 仍锚定右上角），跨渲染保留
   let anchorRect: DOMRect | null = null;
+  let openedAt = 0;
   let dragPos: { x: number; y: number } | null = null;
 
   function applyDragPos(card: HTMLDivElement): void {
@@ -530,11 +531,15 @@ export function createLookupPopup(opts: {
   }
 
   document.addEventListener('pointerdown', e => {
-    if (!pinned?.anchor) return;
+    if (!pinned) return;
     const path = e.composedPath();
     const switchingWord = path.some(n => n instanceof Element && n.matches('.w,[data-word]'));
-    if (!switchingWord && !path.includes(pinned.anchor) && !path.includes(document.getElementById(POPUP_ID)!)) closePopup();
+    if (!switchingWord && !(pinned.anchor && path.includes(pinned.anchor)) && !path.includes(document.getElementById(POPUP_ID)!)) closePopup();
   }, true);
+  document.addEventListener('pd-popup-outside', e => {
+    const at = (e as CustomEvent<{at?:number}>).detail?.at;
+    if (at === undefined || at >= openedAt) closePopup();
+  });
   window.addEventListener('resize', () => { const card = document.getElementById(POPUP_ID)?.shadowRoot?.querySelector<HTMLDivElement>('.card'); if (card) applyDragPos(card); });
   document.addEventListener('scroll', () => {
     if (!pinned?.anchor) return;
@@ -552,6 +557,7 @@ export function createLookupPopup(opts: {
 
   return {
     open(args: PopupOpenArgs): void {
+      openedAt = performance.timeOrigin + performance.now();
       if (pinned) closePopup(true);
       nonce++; anchorRect = null;
       pinned = {

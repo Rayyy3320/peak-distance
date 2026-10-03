@@ -278,7 +278,34 @@ export interface ChatRecord {
 }
 
 /** 侧栏读到的会话视图（与记录同形）。 */
-export type ChatRecordView = ChatRecord;
+export type ChatRecordView = ChatRecord & { editId?: string };
+
+/** 未发送的材料只修改临时副本；发送事务才提交。历史快照不可变。 */
+export function editChatMaterial(record: ChatRecord, input: {
+  source?: SourceDescriptor | null; material?: MaterialPayload | null;
+  quote?: QuoteRef | null; removeMaterial?: boolean;
+}): void {
+  if (input.material && input.source) {
+    const latest = record.snapshots.at(-1);
+    const same = latest?.source.sourceKey === input.source.sourceKey &&
+      JSON.stringify(latest.source.video) === JSON.stringify(input.source.video) &&
+      materialFingerprint(latest.blocks) === materialFingerprint(input.material.blocks);
+    if (!same) record.snapshots.push({ ...input.material, source: input.source, version: (latest?.version ?? 0) + 1, createdAt: Date.now() });
+    record.activeSnapshotVersion = record.snapshots.at(-1)!.version;
+    record.source = input.source; record.sourceKey = input.source.sourceKey;
+    record.pendingQuote = input.quote ?? null;
+  }
+  if (input.removeMaterial) {
+    record.source = null; record.sourceKey = null;
+    record.activeSnapshotVersion = null; record.pendingQuote = null;
+  }
+  record.updatedAt = Date.now();
+}
+
+export function emptyChat(): ChatRecord {
+  return { id: '', title: '新对话', sourceKey: null, source: null, activeSnapshotVersion: null,
+    snapshots: [], messages: [], pendingQuote: null, draft: '', updatedAt: Date.now() };
+}
 
 // ---- 历史裁剪 -----------------------------------------------------------------
 

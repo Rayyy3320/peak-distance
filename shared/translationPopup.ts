@@ -6,13 +6,17 @@ export function createTranslationPopup(send: <T>(msg: unknown) => Promise<T>) {
   let requestId = '';
   let focus: HTMLElement | null = null;
   let sourcePage='';
+  let openedAt = 0;
   const navigationTimer=setInterval(()=>{if(host&&location.href!==sourcePage)close();},250);
-  function close() {
+  function close(restoreFocus = true) {
     if (requestId) void send({ type: 'cancelOnline', requestId });
-    requestId = ''; host?.remove(); host = null; focus?.focus();
+    requestId = ''; host?.remove(); host = null;
+    if (restoreFocus) focus?.focus();
+    focus = null;
   }
   function open(snapshot: SelectionSnapshot, rect?: DOMRect | null) {
-    close(); focus = document.activeElement as HTMLElement;
+    openedAt = performance.timeOrigin + performance.now();
+    close(false); focus = document.activeElement as HTMLElement;
     sourcePage=location.href;
     host = document.createElement('div'); host.id = 'pd-translation';
     host.style.cssText = 'position:fixed;inset:0;z-index:2147483647;pointer-events:none';
@@ -47,7 +51,7 @@ export function createTranslationPopup(send: <T>(msg: unknown) => Promise<T>) {
       translated = r?.ok ? r.text ?? '' : '';
       result.textContent = translated || (r?.error==='restricted'?'翻译服务限制访问，请稍后重试。原文已保留。':r?.error==='network'?'网络连接失败，请检查连接后重试。原文已保留。':'翻译暂不可用，请重试。原文已保留。'); copy.disabled = !translated;
     };
-    root.querySelector('#close')!.addEventListener('click', close);
+    root.querySelector('#close')!.addEventListener('click', () => close());
     retry.addEventListener('click', () => void run());
     copy.addEventListener('click', async () => { try { await navigator.clipboard.writeText(translated); copy.textContent = '已复制'; } catch { copy.textContent = '复制失败，请重试'; } });
     host.addEventListener('keydown', e => { e.stopPropagation(); if(e.key === 'Escape') { e.preventDefault(); close(); } });
@@ -56,6 +60,11 @@ export function createTranslationPopup(send: <T>(msg: unknown) => Promise<T>) {
     void send({type:'selectionSnapshot', snapshot});
     void run();
   }
-  window.addEventListener('pagehide', () => {close();clearInterval(navigationTimer);});
+  document.addEventListener('pointerdown', e => { if (host && !e.composedPath().includes(host)) close(false); }, true);
+  document.addEventListener('pd-popup-outside', e => {
+    const at = (e as CustomEvent<{at?:number}>).detail?.at;
+    if (at === undefined || at >= openedAt) close(false);
+  });
+  window.addEventListener('pagehide', () => {close(false);clearInterval(navigationTimer);});
   return { open, close };
 }
