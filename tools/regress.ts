@@ -53,6 +53,7 @@ import {
   buildSurfaceStatusMap,
   isDuplicateContext,
   isDuplicateVideoContext,
+  lookupKeyCandidates,
   normalizeExpression,
   parseFormsLine,
   planForms,
@@ -701,6 +702,9 @@ console.log('M11 planSave 语言身份');
   check('待确认语言仍可收藏', undSaved?.entry.key === 'und::pain' && undSaved?.entry.language === 'und');
   const noLang = planSave(undefined, [], { source: 'web' as const, expression: 'pain', sentence: 's', url: 'https://a.com', title: 't' }, {});
   check('无语言快照沿用旧键（迁移前兼容）', noLang?.entry.key === 'pain');
+  check('查询候选：无语言只有裸键', JSON.stringify(lookupKeyCandidates('Late')) === '["late"]');
+  check('查询候选：裸键优先于作用域键', JSON.stringify(lookupKeyCandidates('Late', 'en')) === '["late","en::late"]');
+  check('查询候选：作用域键按语言规范化', lookupKeyCandidates('DIŞARI', 'tr')[1] === 'tr::dışarı');
 }
 
 console.log('M11 查询路由：语言对、词典门控与 AI 兜底');

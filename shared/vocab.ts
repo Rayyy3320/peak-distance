@@ -384,6 +384,17 @@ export function buildFormIndex(items: FormIndexInput[]): Map<string, string> {
 }
 
 /**
+ * 查询候选键（顺序即优先级）：裸键在前（迁移前记录直连）；带语言时
+ * 再加语言作用域键。db 的保存 / 查询解析与词卡查询共用，保证同一
+ * 表达在两侧落到同一条目（entryKeyOf 内部做语言感知规范化）。
+ */
+export function lookupKeyCandidates(expression: string, lang?: LanguageTag): string[] {
+  const bare = normalizeExpression(expression);
+  const scoped = lang ? entryKeyOf(lang, expression) : '';
+  return [...new Set([bare, scoped].filter(Boolean))];
+}
+
+/**
  * 表面词形 → 词条键：精确词条优先；否则查唯一的词形关联；
  * 冲突或无关联返回 null（保留独立表达）。
  * lang 提供时按该语言规范化（如土耳其语大小写）；缺省沿用旧规范化

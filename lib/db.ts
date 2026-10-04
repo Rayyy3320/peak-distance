@@ -9,6 +9,7 @@
 
 import {
   buildFormIndex,
+  lookupKeyCandidates,
   normalizeExpression,
   planSave,
   shouldBackfill,
@@ -130,21 +131,39 @@ function toEntryView(e: VocabEntryRecord, contexts: ContextRecord[]): EntryView 
 }
 
 /**
- * 表面词形 → 实际词条：精确键优先；否则取唯一词形关联；
- * 冲突或无关联返回 undefined（保留独立表达）。
+ * 表面词形 / 已知键 → 实际词条：候选键直接命中（裸键 → 唯一匹配的
+ * `*::裸键` 作用域词条；查询方不掌握语言时的兜底，跨语言同形不猜）；
+ * 否则取唯一词形关联；冲突或无关联返回 undefined（保留独立表达）。
  */
 export async function resolveEntry(key: string): Promise<VocabEntryRecord | undefined> {
   return withDb(async (db) => {
     const tx = db.transaction([ENTRIES], 'readonly');
-    const direct = (await px(tx.objectStore(ENTRIES).get(key))) as
-      | VocabEntryRecord
-      | undefined;
-    if (direct) return direct;
-    const all = (await px(tx.objectStore(ENTRIES).getAll())) as VocabEntryRecord[];
+    const entry = await findEntry(tx, key);
     await txDone(tx);
-    const owner = buildFormIndex(all).get(key);
-    return owner ? all.find((e) => e.key === owner) : undefined;
+    return entry;
   });
+}
+
+/** resolveEntry 的只读事务内实现（getEntry 复用）。 */
+async function findEntry(
+  tx: IDBTransaction,
+  key: string,
+): Promise<VocabEntryRecord | undefined> {
+  const store = tx.objectStore(ENTRIES);
+  for (const candidate of lookupKeyCandidates(key)) {
+    const direct = (await px(store.get(candidate))) as VocabEntryRecord | undefined;
+    if (direct) return direct;
+  }
+  const all = (await px(store.getAll())) as VocabEntryRecord[];
+  const bare = normalizeExpression(key);
+  if (!parseEntryKey(bare)) {
+    // 裸键查询（getEntry 消息只传一个键，无语言）：唯一匹配的作用域词条兜底；
+    // 多语言同形词条并存时不猜，保持跨语言分离。
+    const scoped = all.filter((e) => e.key.endsWith(`::${bare}`));
+    if (scoped.length === 1) return scoped[0];
+  }
+  const owner = buildFormIndex(all).get(bare);
+  return owner ? all.find((e) => e.key === owner) : undefined;
 }
 
 /** 保存词条 + 上下文（单一事务）。返回生效状态与上下文 id。
@@ -159,21 +178,28 @@ export async function saveSnapshot(
     const contexts = tx.objectStore(CONTEXTS);
 
     // 先做纯决策，再在同一事务内落地。键与 planSave 共用同一规范化函数。
-    const key = normalizeExpression(snapshot.expression);
-    // 词形关联：查词 'constrained' 落到词条 'constrain' 时，上下文键用目标键。
-    const direct = (await px(entries.get(key))) as VocabEntryRecord | undefined;
-    let existingEntry = direct;
-    let entryKey = key;
-    if (!existingEntry) {
-      const allPre = (await px(entries.getAll())) as VocabEntryRecord[];
-      const owner = buildFormIndex(allPre).get(key);
-      if (owner) {
-        entryKey = owner;
-        existingEntry = (await px(entries.get(owner))) as VocabEntryRecord | undefined;
+    // 已存在词条按候选键解析：裸键（迁移前记录直连）→ 快照语言的作用域键
+    //（entryKeyOf 做语言感知规范化）→ 词形索引（键无语言前缀，跨语言靠
+    // 作用域键分离）。saveSnapshot 掌握快照语言，不做无语言的兜底扫描。
+    let existingEntry: VocabEntryRecord | undefined;
+    for (const key of lookupKeyCandidates(snapshot.expression, snapshot.lang)) {
+      const direct = (await px(entries.get(key))) as VocabEntryRecord | undefined;
+      if (direct) {
+        existingEntry = direct;
+        break;
       }
     }
+    if (!existingEntry) {
+      const allPre = (await px(entries.getAll())) as VocabEntryRecord[];
+      // 词形关联：查词 'constrained' 落到词条 'constrain' 时，上下文键用目标键。
+      const owner = buildFormIndex(allPre).get(normalizeExpression(snapshot.expression));
+      if (owner) existingEntry = allPre.find((e) => e.key === owner);
+    }
+    // 上下文查重用解析后的键：已存在词条用其键；否则用 planSave 将生成的键。
+    const contextKey = existingEntry?.key
+      ?? (snapshot.lang ? entryKeyOf(snapshot.lang, snapshot.expression) : normalizeExpression(snapshot.expression));
     const allContexts = (await px(
-      contexts.index('entryKey').getAll(entryKey),
+      contexts.index('entryKey').getAll(contextKey),
     )) as ContextRecord[];
     const plan = planSave(existingEntry, allContexts, snapshot, opts);
     if (!plan) return null;
@@ -203,16 +229,11 @@ export async function saveSnapshot(
 export async function getEntry(key: string): Promise<EntryView | null> {
   return withDb(async (db) => {
     const tx = db.transaction([ENTRIES, CONTEXTS], 'readonly');
-    const direct = (await px(tx.objectStore(ENTRIES).get(key))) as
-      | VocabEntryRecord
-      | undefined;
-    let entry = direct;
+    const entry = await findEntry(tx, key);
     if (!entry) {
-      const all = (await px(tx.objectStore(ENTRIES).getAll())) as VocabEntryRecord[];
-      const owner = buildFormIndex(all).get(key);
-      entry = owner ? all.find((e) => e.key === owner) : undefined;
+      await txDone(tx);
+      return null;
     }
-    if (!entry) return null;
     const contexts = (await px(
       tx.objectStore(CONTEXTS).index('entryKey').getAll(entry.key),
     )) as ContextRecord[];
