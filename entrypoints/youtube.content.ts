@@ -1193,7 +1193,17 @@ export default defineContentScript({
       });
     }
 
-    setInterval(tick, 50);
+    // 后台标签页降频轮询：隐藏 500ms / 可见 50ms，恢复可见立即对齐一次
+    let tickTimer: ReturnType<typeof setInterval> | null = null;
+    function restartTickTimer(): void {
+      if (tickTimer !== null) clearInterval(tickTimer);
+      tickTimer = setInterval(tick, document.hidden ? 500 : 50);
+    }
+    document.addEventListener('visibilitychange', () => {
+      restartTickTimer();
+      if (!document.hidden) tick();
+    });
+    restartTickTimer();
 
     // ---- 全屏：把字幕栏与弹窗宿主放进全屏元素（不靠堆 z-index） -------------------
 
