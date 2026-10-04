@@ -60,6 +60,8 @@ const SUBS_ID = 'blc-subs';
 const SWITCH_ID = 'blc-subs-switch';
 const BADGE_ID = 'blc-debug';
 const NATIVE_CAPTIONS_HIDE_STYLE_ID = 'blc-hide-native-captions';
+// 全屏字幕栏定位（整体赋值，防止随字幕重绘追加增长；--blc-font 单独 setProperty）
+const SUBS_FULLSCREEN_CSS = 'position:absolute;left:4%;right:4%;bottom:76px;z-index:60;';
 
 interface TrackInfo {
   lang: string; // 基础语言码（en / zh …）
@@ -534,10 +536,9 @@ export default defineContentScript({
       }
       const fs = document.fullscreenElement;
       host.toggleAttribute('data-fullscreen', !!fs);
-      host.style.setProperty('--blc-font', `${subtitleFontSize(settings.subtitleSize)}px`);
       if (fs) {
         if (host.parentElement !== fs) fs.append(host);
-        host.style.cssText += ';position:absolute;left:4%;right:4%;bottom:76px;z-index:60;';
+        host.style.cssText = SUBS_FULLSCREEN_CSS;
       } else {
         host.style.position = 'relative'; host.style.left = ''; host.style.right = ''; host.style.bottom = ''; host.style.zIndex = '';
         const target = document.querySelector<HTMLElement>('ytd-watch-flexy[theater] #full-bleed-container') ?? document.getElementById('player-container-outer') ?? playerRoot();
@@ -545,6 +546,7 @@ export default defineContentScript({
         // 独立字幕行占播放器一列，侧栏跨两行。
         if (target.parentElement?.id === 'blc-learning-layout') { host.style.gridColumn = '1'; host.style.gridRow = '2'; } else { host.style.gridColumn = ''; host.style.gridRow = ''; }
       }
+      host.style.setProperty('--blc-font', `${subtitleFontSize(settings.subtitleSize)}px`);
       return { host, body:host.shadowRoot!.querySelector<HTMLDivElement>('.wrap')! };
     }
 
