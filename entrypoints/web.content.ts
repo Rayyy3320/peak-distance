@@ -147,8 +147,9 @@ export default defineContentScript({
       // 3) main / role=main
       const main = document.querySelector('main, [role="main"]');
       if (main && (main.textContent?.length ?? 0) > 500) return main;
-      // 4) 无语义标签的普通页面：正文块聚集在 body 下也可识别
-      //   （阈值比语义根更严：≥5 段且 >500 字符，避免把菜单当正文）
+      // 4) 无语义标签的普通页面：返回 body 作候选根（此处不设阈值；
+      //   正文块阈值——比语义根更严的 ≥5 段且 >500 字符——在
+      //   extractArticleMaterial 应用，避免把菜单当正文）
       return document.body ?? null;
     }
 
