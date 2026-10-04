@@ -9,6 +9,7 @@
 import {
   ensurePermission,
   ensureVault,
+  readVocabRecordById,
   scanVault,
   writePreferenceToVault,
   writeSentenceToVault,
@@ -153,9 +154,35 @@ export async function flushVaultWrites(): Promise<FlushResult> {
     try {
       if (w.kind === 'vocab') {
         const record = w.payload as VaultVocabRecord;
-        await writeVocabToVault(handle, record);
+        // 提交前检查文件变化（spec 4.4）：库中版本相对上次同步快照有外部改动时
+        // 先做三方合并；同字段双方修改判冲突 → 不覆盖文件，记录详情并保留待办。
+        const prev = await readVocabRecordById(handle, record.id);
+        let toWrite: VaultVocabRecord = record;
+        if (prev) {
+          const baseRaw = await getSyncSnapshot(record.id);
+          const base = baseRaw ? (JSON.parse(baseRaw) as VaultVocabRecord) : null;
+          const outcome = mergeVocabRecord(base ?? prev.record, record, {
+            ...prev.record,
+            note: prev.note,
+          });
+          if (outcome.kind === 'conflict') {
+            const conflict: VaultConflictRecord = {
+              kind: 'vocab',
+              recordId: record.id,
+              fields: outcome.fields.map((f) => ({ field: f.field, local: f.local, remote: f.file })),
+              local: record,
+              remote: prev.record,
+            };
+            await putVaultRaw(`conflict:${record.id}`, conflict);
+            await markVaultWriteAttempt(w.id, 'conflict');
+            failed++;
+            continue; // 待办保留；解决后下次提交
+          }
+          toWrite = outcome.value;
+        }
+        await writeVocabToVault(handle, toWrite);
         // 我们刚写的内容即“上次共同内容”（下次读回的三方合并 base）
-        await setSyncSnapshot(record.id, JSON.stringify(record));
+        await setSyncSnapshot(record.id, JSON.stringify(toWrite));
       } else if (w.kind === 'sentence') {
         await writeSentenceToVault(handle, w.payload as VaultSentenceRecord);
       } else if (w.kind === 'preference') {

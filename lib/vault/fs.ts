@@ -270,6 +270,42 @@ export async function scanVault(dir: DirHandle): Promise<VaultFileScan> {
   return scan;
 }
 
+/** 按 ID 读取库中现有词条（写前检查用）：索引命中或受管目录内扫描。 */
+export async function readVocabRecordById(
+  dir: DirHandle,
+  recordId: string,
+): Promise<{ record: VaultVocabRecord; note: string; text: string } | null> {
+  const index = await readIndex(dir);
+  let paths: string[] = [];
+  if (index[recordId]) paths.push(index[recordId]);
+  else {
+    const targetDir = vocabDirOf(recordId);
+    paths = (await listFilesRecursive(dir)).filter((f) => f.startsWith(`${targetDir}/`));
+  }
+  for (const p of paths) {
+    const text = await readTextFile(dir, p.split('/'));
+    if (text === null) continue;
+    const parsed = parseVocabDocument(text);
+    if ('error' in parsed) continue;
+    if (parsed.id !== recordId) continue;
+    return {
+      text,
+      note: parsed.note,
+      record: {
+        id: parsed.id!,
+        language: parsed.language ?? 'und',
+        expression: parsed.expression!,
+        status: parsed.status ?? 'saved',
+        forms: [],
+        createdAt: 0,
+        updatedAt: 0,
+        contexts: parsed.managed.contexts,
+      },
+    };
+  }
+  return null;
+}
+
 // ---- 权限与页面侧选目录 -----------------------------------------------------------
 
 export async function ensurePermission(

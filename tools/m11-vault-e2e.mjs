@@ -137,11 +137,19 @@ try {
   const entry1 = await send({ type: 'getEntry', key: 'ja::学ぶ' });
   check('外部状态与笔记合并进本地（不同字段合并）', entry1?.entry?.status === 'learning' && /复习时结合原句记忆/.test(entry1?.entry?.note ?? ''), JSON.stringify(entry1?.entry?.status) + ' note=' + JSON.stringify(entry1?.entry?.note ?? null).slice(0, 40));
 
-  // 4. 冲突：本地改 known，外部改 saved（同一字段双方不同改）
-  const setStatus = await send({ type: 'setStatus', key: 'ja::学ぶ', status: 'known' });
-  check('本地状态改 known', setStatus?.ok);
+  // 4. 冲突：外部先改 saved（相对 base），本地再改 known（同一字段双方不同改）
   const external2 = await page.evaluate(call(EDIT_EXTERNAL, 'saved'));
   check('外部同字段改 saved', !!external2 && external2.includes('status: saved'));
+  const setStatus = await send({ type: 'setStatus', key: 'ja::学ぶ', status: 'known' });
+  check('本地状态改 known', setStatus?.ok);
+  // 等待本地写库尝试完成：写前检查应发现外部改动并拒绝覆盖（待办保留）
+  let conflictQueued = false;
+  for (let i = 0; i < 20; i++) {
+    const st = await send({ type: 'vaultStatus' });
+    if (st?.ok && st.status.lastError === 'conflict') { conflictQueued = true; break; }
+    await page.waitForTimeout(300);
+  }
+  check('写前检查发现外部改动且未覆盖（待办保留）', conflictQueued);
   const sync2 = await send({ type: 'vaultSync' });
   check('同步报告冲突且不丢本地', sync2?.ok && sync2.conflicts >= 1, JSON.stringify(sync2));
   const entry2 = await send({ type: 'getEntry', key: 'ja::学ぶ' });
