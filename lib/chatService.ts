@@ -554,6 +554,10 @@ export async function handleChatRequest(
   const windowId = sender.tab?.windowId ?? (typeof m.windowId === 'number' ? m.windowId : -1);
   const activeKey = `chat-active:${windowId}`;
   const currentId = async () => (await browser.storage.session.get(activeKey))[activeKey] as string | undefined;
+  // manifest 无 tabs 权限，Tab.url 恒为 undefined：来源标签页只能在 chatEnsure
+  //（内容脚本发起）时按 windowId 记账，侧栏引用定位用它找回原页。
+  const tabKey = `chat-tab:${windowId}`;
+  const sourceTabId = async () => ((await browser.storage.session.get(tabKey))[tabKey] as number | undefined) ?? null;
   const operation = ['chatNew', 'chatSelect', 'chatClear'].includes(String(m.type)) ? beginChatOperation(windowId) : chatOperation(windowId);
   const currentOperation = () => chatOperation(windowId) === operation;
   switch (m.type) {
@@ -566,7 +570,7 @@ export async function handleChatRequest(
       const id = await currentId();
       if (edit.id && edit.id === id) {
         const record = await getChat(edit.id, isLiveRequest(edit.id));
-        if (!currentOperation()) return { ok: true, chat: await readChatEdit(windowId) };
+        if (!currentOperation()) return { ok: true, chat: await readChatEdit(windowId), sourceTabId: await sourceTabId() };
         if (!record) {
           if (ownsChatEdit(windowId, edit)) await activateChatEdit(windowId, null);
         } else if (ownsChatEdit(windowId, edit)) {
@@ -577,7 +581,7 @@ export async function handleChatRequest(
         const record = await getChat(id, isLiveRequest(id));
         if (record && currentOperation() && ownsChatEdit(windowId, edit)) await replaceChatEdit(windowId, record);
       }
-      return { ok: true, chat: await readChatEdit(windowId) };
+      return { ok: true, chat: await readChatEdit(windowId), sourceTabId: await sourceTabId() };
     }
     case 'chatSelect': {
       if (typeof m.chatId !== 'string') return bad('bad-payload');
@@ -624,7 +628,10 @@ export async function handleChatRequest(
       if (typeof m.chatId === 'string' && m.chatId !== edit.id || m.editId && m.editId !== edit.editId) return bad('stale-edit');
       editChatMaterial(edit, { source, material, quote });
       await writeChatEdit(windowId, edit);
-      const r: ChatEnsureResult = { ok: true, chat: edit, panelOpened };
+      if (typeof sender.tab?.id === 'number') {
+        await browser.storage.session.set({ [tabKey]: sender.tab.id });
+      }
+      const r: ChatEnsureResult = { ok: true, chat: edit, panelOpened, sourceTabId: await sourceTabId() };
       return r;
     }
     case 'chatUpdateMaterial': {

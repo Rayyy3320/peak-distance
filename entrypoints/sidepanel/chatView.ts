@@ -17,6 +17,8 @@ import {
 } from '@/shared/chat';
 import {
   CHAT_PORT_NAME,
+  type ChatActiveResult,
+  type ChatEnsureResult,
   type ChatPortEvent,
   type ChatPortMessage,
   type ChatRecentItem,
@@ -108,6 +110,12 @@ let sending: string | null = null;
 let submittedInput = '';
 let submittedQuoteKey = '';
 let chatTabId: number | null = null;
+// 内容脚本发起 chatEnsure 时由 background 记账的来源标签页（无 tabs 权限，
+// tab.url 读不到，只能拿账面 tabId 回验）
+let chatSourceTabId: number | null = null;
+function noteSourceTab(r: { sourceTabId?: number | null } | null | undefined): void {
+  chatSourceTabId = typeof r?.sourceTabId === 'number' ? r.sourceTabId : null;
+}
 let chatSource: SourceDescriptor | null = null;
 let chatRecord: ChatRecordView | null = null;
 let chatQuote: QuoteRef | null = null;
@@ -125,9 +133,10 @@ export function snapshotChat():ChatViewSnapshot {const list=document.getElementB
 export function setChatActive(active:boolean) {panelActive=active;if(!active)operation++;}
 export async function restoreChat(snapshot?:ChatViewSnapshot) {
   const op = ++operation;
-  const r=await send<{ok:boolean;chat:ChatRecordView}>({type:'chatActive'});
+  const r=await send<ChatActiveResult>({type:'chatActive'});
   if(op !== operation || !panelActive) return;
   if(!r?.ok||!r.chat)return;
+  noteSourceTab(r);
   await acceptRecord(r.chat,false);
   (document.getElementById('chat-input') as HTMLTextAreaElement).value=r.chat.draft??'';
   if(snapshot?.chatId===chatId&&snapshot.materialVersion===(r.chat.activeSnapshotVersion??null)&&snapshot.quoteKey===JSON.stringify(chatQuote)){chatSegmentIndex=snapshot.segmentIndex;historyOpen=snapshot.historyOpen;retainedOnly=snapshot.retainedOnly;autoScroll=snapshot.autoScroll;messageScrollTop=snapshot.top;}
@@ -245,8 +254,8 @@ function clearInlineError(): void {
 async function reloadRecord(): Promise<void> {
   if (!chatId) return;
   const id = chatId, op = operation;
-  const r = await send<{ ok: boolean; chat: ChatRecordView | null }>({ type: 'chatActive' });
-  if (r?.ok && r.chat && id === chatId && op === operation) await acceptRecord(r.chat);
+  const r = await send<ChatActiveResult>({ type: 'chatActive' });
+  if (r?.ok && r.chat && id === chatId && op === operation) { noteSourceTab(r); await acceptRecord(r.chat); }
 }
 
 function resetCitePanel(): void {
@@ -291,8 +300,9 @@ async function pollChatSource(): Promise<void> {
   const op = operation;
   polling = true;
   try {
-    const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatActive' });
+    const r = await send<ChatActiveResult>({ type: 'chatActive' });
     if (op !== operation) return;
+    if (r?.ok) noteSourceTab(r);
     if (r?.ok && r.chat && (r.chat.editId !== chatRecord?.editId || r.chat.id !== chatId || JSON.stringify(r.chat.pendingQuote??null)!==JSON.stringify(chatQuote) || r.chat.updatedAt !== chatRecord?.updatedAt)) {
       await acceptRecord(r.chat);
     }
@@ -306,10 +316,11 @@ export async function attachSelectionCandidate(candidate: SelectionCandidate, op
   clearInlineError();
   const built = materialFromCandidate(candidate);
   if (!built) { inlineError('选区内容无法附加，请重新选择'); return false; }
-  const r = await send<{ ok: boolean; chat: ChatRecordView }>({
+  const r = await send<ChatEnsureResult>({
     type: 'chatEnsure', chatId, source: candidate.source, material: built.material, quote: built.quote,
   });
-  if (r?.ok && op === operation) {
+  if (r?.ok && r.chat && op === operation) {
+    noteSourceTab(r);
     if (typeof opts.tabId === 'number') chatTabId = opts.tabId;
     chatSegmentIndex = 0;
     await acceptRecord(r.chat);
@@ -367,8 +378,8 @@ async function attachMaterial(kind: 'page' | 'selection' | 'video'): Promise<voi
     inlineError(info.hint || (kind === 'video' ? '字幕尚未就绪，稍后再试' : '未识别到可附加的正文'));
     return;
   }
-  const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatEnsure', chatId, source: info.source, material: material.material });
-  if (r?.ok && op === operation) { chatTabId = tab.id; chatQuote = null; chatSegmentIndex = 0; await acceptRecord(r.chat); }
+  const r = await send<ChatEnsureResult>({ type: 'chatEnsure', chatId, source: info.source, material: material.material });
+  if (r?.ok && r.chat && op === operation) { noteSourceTab(r); chatTabId = tab.id; chatQuote = null; chatSegmentIndex = 0; await acceptRecord(r.chat); }
   else if (op === operation) inlineError('附加失败，材料未改变');
 }
 
@@ -527,16 +538,19 @@ async function openCitation(msg: ChatMessageRecord, blockId: string): Promise<vo
     showCitationPanel(blockId, block.text, isVideo, true, snap.source);
     return;
   }
-  // 网页 / X：显示保存原文 + 尝试滚动定位
+  // 网页 / X：无 tabs 权限读不到 Tab.url，只能按账面 tabId 回验当前页面
+  // 地址后再滚动定位；验证不过即显示保存原文
   let located = false;
-  const tabs = await browser.tabs.query({});
-  const sourceTab = tabs.find(t => t.url?.split('#')[0] === snap.source.url.split('#')[0]);
-  if (typeof sourceTab?.id === 'number') {
-    const r = await tabSend<{ found: boolean }>(sourceTab.id, {
-      type: 'blc-chat-locate',
-      text: block.text,
-    });
-    located = !!r?.found;
+  const sourceTabId = chatTabId ?? chatSourceTabId;
+  if (typeof sourceTabId === 'number') {
+    const info = await tabSend<ChatSourceInfo>(sourceTabId, { type: 'blc-chat-source' });
+    if (info && normalizeArticleUrl(info.pageUrl ?? '') === normalizeArticleUrl(snap.source.url)) {
+      const r = await tabSend<{ found: boolean }>(sourceTabId, {
+        type: 'blc-chat-locate',
+        text: block.text,
+      });
+      located = !!r?.found;
+    }
   }
   showCitationPanel(blockId, block.text, isVideo, located, snap.source);
 }
@@ -710,8 +724,8 @@ async function refreshHistory(): Promise<void> {
           historyTotal.textContent = `历史 · ${historyRows.size} 个对话`;
           historyFeedback.textContent = '已删除一个对话';
           if (current && op === operation) {
-            const active = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatActive' });
-            if (active?.ok && op === operation) await acceptRecord(active.chat);
+            const active = await send<ChatActiveResult>({ type: 'chatActive' });
+            if (active?.ok && active.chat && op === operation) { noteSourceTab(active); await acceptRecord(active.chat); }
           }
           if (!historyRows.size) historyList.textContent = '还没有历史对话';
         });
@@ -911,8 +925,8 @@ async function clearConversation(): Promise<void> {
   const r = await send<{ ok: boolean }>({ type: chatId ? 'chatClear' : 'chatNew', chatId });
   if (op !== operation) return;
   if (!r?.ok) { clearButton.setDisabled(false); inlineError('清空失败，请重试'); return; }
-  const active = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatActive' });
-  if (active?.ok && op === operation) await acceptRecord(active.chat);
+  const active = await send<ChatActiveResult>({ type: 'chatActive' });
+  if (active?.ok && active.chat && op === operation) { noteSourceTab(active); await acceptRecord(active.chat); }
 }
 
 // ---- 字幕列表「问 AI」入口 ---------------------------------------------------------
@@ -944,13 +958,14 @@ export async function subtitleAskAi(subs: SubViewState, cue: SubtitleCueView): P
     blockIds: [`p${cue.id + 1}`],
     note: `${fmtClock(cue.startMs)} · ${cue.text.slice(0, 80)}`,
   };
-  const r = await send<{ ok: boolean; chat: ChatRecordView | null }>({
+  const r = await send<ChatEnsureResult>({
     type: 'chatEnsure',
     source,
     material,
     quote,
   });
   if (!r?.ok) return;
+  noteSourceTab(r);
   // 未发送引用留在会话中，直到提交或明确移除；容器切换不会消费它。
   if (r.chat) await acceptRecord(r.chat);
   deps?.switchView('chat');

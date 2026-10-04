@@ -277,8 +277,12 @@ export interface ChatRecentItem {
   updatedAt: number;
 }
 
+/** chatEnsure 由内容脚本发起时记录、chatActive 随结果带出的来源标签页（manifest 无 tabs 权限，引用定位按此账面对账而非 tab.url 匹配）。 */
 export type ChatEnsureResult =
-  | { ok: true; chat: ChatRecordView | null; panelOpened: boolean }
+  | { ok: true; chat: ChatRecordView | null; panelOpened: boolean; sourceTabId?: number | null }
+  | BgcError;
+export type ChatActiveResult =
+  | { ok: true; chat: ChatRecordView | null; sourceTabId?: number | null }
   | BgcError;
 export type ChatGetResult = { ok: true; chat: ChatRecordView | null } | BgcError;
 export type ChatMutationResult = { ok: true } | BgcError;
