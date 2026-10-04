@@ -978,16 +978,18 @@ export async function migrateLegacyLanguages(): Promise<LanguageMigrationReport>
           legacyKey: entry.key,
           updatedAt: Date.now(),
         };
+        if (groups.length > 1 && g !== groups[0]) {
+          // 拆分组除最大组外复制状态；词条本体（forms/note）保留在首组。
+          // 须在 put 前剔除：put 调用时即完成序列化，事后 delete 不落盘。
+          delete newEntry.forms;
+          delete newEntry.note;
+        }
         byKey.set(newKey, newEntry);
         entries.put(newEntry);
         for (const i of g.indexes) {
           const c = ctxs[i]!;
           c.entryKey = newKey;
           contexts.put(c);
-        }
-        if (groups.length > 1) {
-          // 拆分组除最大组外复制状态；词条本体（forms/note）保留在首组
-          delete (newEntry as Partial<VocabEntryRecord>).forms;
         }
       }
       if (newKeys.length > 1 || newKeys[0] !== entry.key) entries.delete(entry.key);
