@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>语言筛选 · 合并到搜索框方案</title>
+<style>
+:root{
+  color-scheme:light;
+  --ink:#2f3a40;--muted:#59636b;--paper:#f7f4ec;--surface:#fffdfa;
+  --blue:#1a5fc4;--mist:#6b8db7;--selected:#e4eef6;--line:#ddd9cf;
+  --shadow:0 12px 40px #2f3a4029;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:30px 20px 56px;font:14px/1.6 system-ui,'Segoe UI','Microsoft YaHei',sans-serif;color:var(--ink);background:#e8e5dd;display:flex;gap:24px;flex-wrap:wrap;justify-content:center;align-items:flex-start}
+.variant{width:432px}
+.tag{display:flex;align-items:baseline;gap:8px;margin:0 2px 8px;font-size:12px;color:#4c565d}
+.tag b{font-weight:600;color:var(--ink)}
+.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+.panel-head{display:flex;justify-content:space-between;align-items:center;padding:16px 16px 0}
+.panel-head .title{font:600 18px/1.4 Georgia,'Noto Serif SC',SimSun,serif}
+.panel-head .review{border:0;background:transparent;color:var(--blue);font-size:12px;min-height:0;padding:2px 4px}
+.library-tabs{display:flex;gap:8px;padding:12px 16px 0}
+.library-tabs button{border:0;background:transparent;color:var(--muted);min-height:0;padding:4px 10px;border-radius:6px}
+.library-tabs .active{background:var(--selected);color:var(--blue)}
+.toolbar{padding:10px 16px 16px;border-bottom:1px solid var(--line)}
+.state-label{font-size:11px;color:var(--muted);margin:10px 2px 4px}
+.state-label:first-child{margin-top:0}
+
+/* 组合搜索栏 */
+.bar{display:flex;align-items:stretch;height:38px;background:var(--surface);border:1px solid var(--line);border-radius:8px}
+.bar:focus-within{border-color:var(--mist)}
+.bar input{flex:1;min-width:0;border:0;background:transparent;padding:0 12px;color:inherit}
+.bar input::placeholder{color:var(--muted)}
+.bar input:focus-visible{outline:none}
+.bar svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
+
+/* 方案 A：左侧分隔按钮（globe + 当前值 + chevron，纵向分隔线） */
+.bar .lang-btn{display:flex;align-items:center;gap:6px;min-width:96px;padding:0 10px;border:0;border-right:1px solid var(--line);border-radius:0;background:transparent;color:var(--muted);min-height:0}
+.bar .lang-btn:hover{background:var(--paper)}
+.bar .lang-btn span{flex:1;text-align:left;white-space:nowrap}
+.bar .lang-btn .chev{width:14px;height:14px;opacity:.75}
+.bar .lang-btn.on{color:var(--blue);background:var(--selected)}
+.bar .lang-btn.on .chev{opacity:1}
+
+/* 方案 B：图标按钮 + 可清除 chip */
+.bar .icon-btn{position:relative;display:flex;align-items:center;justify-content:center;width:40px;border:0;border-right:1px solid var(--line);border-radius:0;background:transparent;color:var(--muted);min-height:0}
+.bar .icon-btn:hover{background:var(--paper)}
+.bar .icon-btn.on{color:var(--blue)}
+.bar .icon-btn.on::after{content:'';position:absolute;top:7px;right:8px;width:6px;height:6px;border-radius:50%;background:var(--blue)}
+.bar .filter-chip{display:flex;align-items:center;gap:2px;margin:5px 6px 5px 0;padding:0 5px 0 10px;background:var(--selected);border:1px solid #c3d8ee;border-radius:999px;color:var(--blue);font-size:12px;flex:none}
+.bar .filter-chip button{display:flex;align-items:center;justify-content:center;width:16px;height:16px;border:0;border-radius:50%;background:transparent;color:inherit;min-height:0;padding:0}
+.bar .filter-chip button:hover{background:#d2e2f3}
+.bar .filter-chip svg{width:9px;height:9px;stroke-width:2}
+
+/* 方案 C：输入框内嵌胶囊筛选 */
+.bar .lang-chip{display:flex;align-items:center;gap:5px;margin:5px 0 5px 5px;padding:0 9px;background:var(--paper);border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px;min-height:0;flex:none}
+.bar .lang-chip:hover{border-color:var(--mist)}
+.bar .lang-chip svg{width:13px;height:13px}
+.bar .lang-chip .chev{width:11px;height:11px;opacity:.75}
+.bar .lang-chip.on{background:var(--selected);border-color:#c3d8ee;color:var(--blue)}
+
+/* 展开菜单示例（A） */
+.menu{width:196px;margin-top:6px;background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);padding:6px;display:flex;flex-direction:column;gap:2px}
+.menu button{display:flex;align-items:center;gap:8px;border:0;background:transparent;min-height:0;padding:7px 10px;border-radius:7px;font-size:13px;text-align:left;color:var(--ink)}
+.menu button:hover{background:var(--paper)}
+.menu button.cur{color:var(--blue);background:var(--selected)}
+.menu button .cnt{margin-left:auto;font-size:11px;color:var(--muted)}
+.menu .check{width:14px;height:14px;visibility:hidden}
+.menu button.cur .check{visibility:visible}
+
+/* 词条上下文 */
+.entries{padding:2px 16px 8px}
+.entry{padding:14px 0;border-bottom:1px solid var(--line)}
+.entry:last-child{border-bottom:0;padding-bottom:6px}
+.entry-head{display:flex;align-items:center;gap:8px}
+.entry-head h2{margin:0;font:600 16px/1.5 system-ui;flex:1;min-width:0}
+.kind{font-size:11px;color:var(--muted)}
+.delete{border:0;background:transparent;color:#ad342e;font-size:12px;min-height:0;padding:3px}
+.entry-preview{margin:6px 0 0;color:var(--muted);font-size:13px}
+.entry details{margin-top:6px}
+.entry summary{font-size:12px;color:var(--blue);cursor:pointer}
+</style>
+</head>
+<body>
+
+<!-- 方案 A -->
+<section class="variant">
+  <div class="tag"><b>方案 A</b>左侧分隔按钮（globe + 当前语言 + chevron）</div>
+  <div class="panel">
+    <div class="panel-head"><div class="title">生词本</div><button class="review">原句复习 →</button></div>
+    <div class="library-tabs"><button class="active">词语</button><button>句子</button></div>
+    <div class="toolbar">
+      <div class="state-label">未筛选</div>
+      <div class="bar">
+        <button class="lang-btn" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg>
+          <span>全部语言</span>
+          <svg class="chev" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 7.5 5 5 5-5"/></svg>
+        </button>
+        <input type="search" placeholder="搜索表达…">
+      </div>
+      <div class="state-label">筛选：英语</div>
+      <div class="bar">
+        <button class="lang-btn on" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg>
+          <span>英语</span>
+          <svg class="chev" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 7.5 5 5 5-5"/></svg>
+        </button>
+        <input type="search" placeholder="搜索表达…">
+      </div>
+      <div class="state-label">展开态</div>
+      <div class="bar">
+        <button class="lang-btn on" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg>
+          <span>英语</span>
+          <svg class="chev" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 12.5 5-5 5 5"/></svg>
+        </button>
+        <input type="search" placeholder="搜索表达…">
+      </div>
+      <div class="menu" role="listbox">
+        <button type="button"><svg class="check" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10.5 4 4 8-9"/></svg>全部语言<span class="cnt">12</span></button>
+        <button type="button"><svg class="check" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10.5 4 4 8-9"/></svg>待确认<span class="cnt">2</span></button>
+        <button type="button" class="cur"><svg class="check" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10.5 4 4 8-9"/></svg>英语<span class="cnt">7</span></button>
+        <button type="button"><svg class="check" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10.5 4 4 8-9"/></svg>日语<span class="cnt">2</span></button>
+        <button type="button"><svg class="check" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10.5 4 4 8-9"/></svg>法语<span class="cnt">1</span></button>
+      </div>
+    </div>
+    <div class="entries">
+      <div class="entry">
+        <div class="entry-head"><h2>speculation</h2><span class="kind">词</span><span class="kind">英语</span><button class="delete">删除</button></div>
+        <p class="entry-preview">投机，投机买卖</p>
+        <details><summary>添加笔记</summary></details>
+        <details><summary>原句与详情</summary></details>
+      </div>
+      <div class="entry">
+        <div class="entry-head"><h2>deletion</h2><span class="kind">词</span><span class="kind">英语</span><button class="delete">删除</button></div>
+        <p class="entry-preview">删除，删去的部分</p>
+        <details><summary>添加笔记</summary></details>
+        <details><summary>原句与详情</summary></details>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 方案 B -->
+<section class="variant">
+  <div class="tag"><b>方案 B</b>图标按钮 + 已选语言可清除 chip</div>
+  <div class="panel">
+    <div class="panel-head"><div class="title">生词本</div><button class="review">原句复习 →</button></div>
+    <div class="library-tabs"><button class="active">词语</button><button>句子</button></div>
+    <div class="toolbar">
+      <div class="state-label">未筛选</div>
+      <div class="bar">
+        <button class="icon-btn" type="button" title="语言筛选" aria-label="语言筛选">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg>
+        </button>
+        <input type="search" placeholder="搜索表达…">
+      </div>
+      <div class="state-label">筛选：英语（chip 可 × 清除）</div>
+      <div class="bar">
+        <button class="icon-btn on" type="button" title="语言筛选" aria-label="语言筛选：英语">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg>
+        </button>
+        <input type="search" placeholder="搜索表达…">
+        <span class="filter-chip">英语<button type="button" aria-label="清除语言筛选"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15"/></svg></button></span>
+      </div>
+    </div>
+    <div class="entries">
+      <div class="entry">
+        <div class="entry-head"><h2>speculation</h2><span class="kind">词</span><span class="kind">英语</span><button class="delete">删除</button></div>
+        <p class="entry-preview">投机，投机买卖</p>
+        <details><summary>添加笔记</summary></details>
+        <details><summary>原句与详情</summary></details>
+      </div>
+      <div class="entry">
+        <div class="entry-head"><h2>deletion</h2><span class="kind">词</span><span class="kind">英语</span><button class="delete">删除</button></div>
+        <p class="entry-preview">删除，删去的部分</p>
+        <details><summary>添加笔记</summary></details>
+        <details><summary>原句与详情</summary></details>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 方案 C -->
+<section class="variant">
+  <div class="tag"><b>方案 C</b>输入框内嵌胶囊筛选（选中后为胶囊 chip）</div>
+  <div class="panel">
+    <div class="panel-head"><div class="title">生词本</div><button class="review">原句复习 →</button></div>
+    <div class="library-tabs"><button class="active">词语</button><button>句子</button></div>
+    <div class="toolbar">
+      <div class="state-label">未筛选</div>
+      <div class="bar">
+        <button class="lang-chip" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg>
+          全部语言
+          <svg class="chev" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 7.5 5 5 5-5"/></svg>
+        </button>
+        <input type="search" placeholder="搜索表达…">
+      </div>
+      <div class="state-label">筛选：英语</div>
+      <div class="bar">
+        <button class="lang-chip on" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg>
+          英语
+          <svg class="chev" viewBox="0 0 20 20" aria-hidden="true"><path d="m5 7.5 5 5 5-5"/></svg>
+        </button>
+        <input type="search" placeholder="搜索表达…">
+      </div>
+    </div>
+    <div class="entries">
+      <div class="entry">
+        <div class="entry-head"><h2>speculation</h2><span class="kind">词</span><span class="kind">英语</span><button class="delete">删除</button></div>
+        <p class="entry-preview">投机，投机买卖</p>
+        <details><summary>添加笔记</summary></details>
+        <details><summary>原句与详情</summary></details>
+      </div>
+      <div class="entry">
+        <div class="entry-head"><h2>deletion</h2><span class="kind">词</span><span class="kind">英语</span><button class="delete">删除</button></div>
+        <p class="entry-preview">删除，删去的部分</p>
+        <details><summary>原句与详情</summary></details>
+      </div>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
