@@ -36,3 +36,21 @@ export function clampRangeToElement(range:Range,el:Element):Range {
   if(!el.contains(out.endContainer))out.setEnd(el,el.childNodes.length);
   return out;
 }
+
+// 选区文本块的通用检测：内联标签（样式与结构上的行内元素）。
+const INLINE_TAGS=new Set(['A','SPAN','B','I','EM','STRONG','CODE','S','U','MARK','SMALL','SUB','SUP','ABBR','TIME','CITE','Q','WBR','BDI','BDO','DATA','DFN','KBD','SAMP','VAR','RUBY','RT','RP','LABEL','FONT','BIG','NOBR','INS','DEL']);
+
+/**
+ * 节点所在的最小文本块（段落级容器）：向上穿过连续的内联祖先，停在第一个
+ * 非内联元素。语义页得到 p/li 本身；div 结构站（X 推文 tweetText、YouTube
+ * 描述/评论的 yt-formatted-string）得到该文本容器本身。不依赖固定语义标签
+ * 清单——清单在 div 站点取不到块，选区会被一律当作跨块句段，单词分类、
+ * 有效表达补全与卡片清洗整体失效（选区查词在 X 上的实际根因）。
+ */
+export function inlineRunContainer(node:Node|null):HTMLElement|null {
+  const el=node instanceof Element?node:node?.parentElement??null;
+  if(!el)return null;
+  let block:HTMLElement=el as HTMLElement;
+  while(INLINE_TAGS.has(block.tagName)&&block.parentElement)block=block.parentElement;
+  return block;
+}

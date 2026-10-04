@@ -36,6 +36,14 @@ const ARTICLE_HTML = `<!doctype html><html><head><title>Selection Article</title
 const OTHER_HTML = `<!doctype html><html><head><title>Other Page</title></head><body>
 <p id="q1">A different page entirely, with different text about mountains and rivers.</p>
 </body></html>`;
+// X 形态页：推文正文是 div[dir=auto]（无语义标签）， hashtag 为 span ——
+// 标签清单式块检测在此类页面取不到块（历史根因），通用内联链检测应生效
+const X_HTML = `<!doctype html><html><head><title>Teslaconomics on X</title></head><body>
+<main>
+<article data-testid="tweet">
+  <div dir="auto" data-testid="tweetText">Seriously.... what is going on?! It's gotten ridiculously good... <span>#learning</span></div>
+</article>
+</main></body></html>`;
 
 const browser = await chromium.launchPersistentContext(profile, {
   executablePath: process.env.BLC_CHROME || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -44,6 +52,7 @@ const browser = await chromium.launchPersistentContext(profile, {
 });
 await browser.route('https://example.com/article', r => r.fulfill({ contentType: 'text/html', body: ARTICLE_HTML }));
 await browser.route('https://example.com/other', r => r.fulfill({ contentType: 'text/html', body: OTHER_HTML }));
+await browser.route('https://x.com/example/status/9999', r => r.fulfill({ contentType: 'text/html', body: X_HTML }));
 const sw = browser.serviceWorkers()[0] || await browser.waitForEvent('serviceworker');
 const extId = new URL(sw.url()).host;
 await sw.evaluate(() => {
@@ -141,6 +150,42 @@ check('A4 句段分类：隐藏查词，保留翻译与添加', await page.evalu
   const root = document.getElementById('blc-lookup-pill').shadowRoot;
   return root.querySelector('#translate').hidden === false && root.querySelector('#chat').hidden === false;
 }));
+
+// X1/X2 X 形态页（推文正文 div[dir=auto]、hashtag span，无语义标签）：
+// 历史根因复现——标签清单式块检测在此取不到块，所有选区被当作句段、
+// 残缺词原样上翻译卡。通用内联链检测后应与语义页同规则。
+const xpage = await browser.newPage();
+await xpage.goto('https://x.com/example/status/9999');
+await xpage.waitForFunction(() => document.documentElement.getAttribute('data-blc-web') === '1', null, { timeout: 10000 });
+const xSelect = (from, to) => xpage.evaluate(([f, t]) => {
+  const node = document.querySelector('[data-testid="tweetText"]').firstChild;
+  const range = document.createRange();
+  range.setStart(node, Math.max(0, f));
+  range.setEnd(node, Math.min(t, node.length));
+  const s = document.getSelection();
+  s.removeAllRanges();
+  s.addRange(range);
+  document.dispatchEvent(new Event('selectionchange'));
+  return range.toString();
+}, [from, to]);
+
+// X1 单词（残缺 Seriousl）：word 分类生效，查词+添加（无翻译）；词内补全
+await xSelect(0, 8);
+await xpage.waitForSelector('#blc-lookup-pill', { timeout: 5000 });
+check('X1 X 推文单词分类：查词+添加到对话（无翻译）', await xpage.waitForFunction(() => {
+  const root = document.getElementById('blc-lookup-pill')?.shadowRoot;
+  return root && root.querySelector('#lookup')?.hidden === false && root.querySelector('#translate')?.hidden === true && root.querySelector('#chat')?.hidden === false;
+}, null, { timeout: 4000 }).then(() => true, () => false));
+await xpage.click('#lookup');
+check('X1 X 推文词内补全：Seriousl → Seriously', await xpage.waitForFunction(() =>
+  document.getElementById('blc-lookup-popup')?.shadowRoot?.querySelector('.expr')?.textContent === 'Seriously',
+  null, { timeout: 5000 }).then(() => true, () => false));
+await xpage.evaluate(() => {
+  const card = document.getElementById('blc-lookup-popup')?.shadowRoot?.querySelector('.card');
+  [...card.querySelectorAll('button')].find((b) => b.textContent === '关闭')?.click();
+});
+await xpage.waitForFunction(() => !document.getElementById('blc-lookup-popup'));
+await xpage.close();
 
 // 面板：以 iframe 注入页面（复刻浮动模式——页面与面板同可见、同活动标签页）；
 // 页面导航会销毁 iframe，用 mountPanel 重挂（临时编辑状态经 storage.session 恢复）
@@ -294,7 +339,7 @@ const server = createServer((req, res) => {
 <button class="ytp-subtitles-button" aria-pressed="false" onclick="this.setAttribute('aria-pressed', String(this.getAttribute('aria-pressed') !== 'true'))">CC</button>
 </div>
 <div id="page-body" style="padding:12px">
-<p id="desc">Learning a language takes daily practice and patient review.</p>
+<div id="desc" dir="auto">Learning a language takes daily practice and patient review.</div>
 <p id="comment">The narrator finally decided to give up learning japanese because the grammar felt impossibly hard at first.</p>
 </div></body></html>`);
 });

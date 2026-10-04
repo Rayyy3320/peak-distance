@@ -6,7 +6,7 @@
 // （YouTube 用它排除字幕栏等自身 UI 内的选区）。
 import { brandTokens, brandControls, CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from './brand';
 import { classifySelection, detectTextLanguage, effectiveLookupExpression, sentenceContaining } from './tokenize';
-import { rangeOffsetsIn } from './selection';
+import { rangeOffsetsIn, inlineRunContainer } from './selection';
 import { materialFromCandidate, type SelectionCandidate, type SourceDescriptor } from './chat';
 import type { LookupPopup } from './lookupPopup';
 import type { SelectionSnapshot } from './panel';
@@ -40,9 +40,6 @@ export interface SelectionPillDeps {
   /** 额外跳过条件：自身其它 UI（如字幕栏、选区操作条、词卡）内的选区不产生入口。 */
   skipSelection?: (sel: Selection) => boolean;
 }
-
-const WORD_BLOCK_SELECTOR =
-  'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, th, dd, dt, figcaption';
 
 function editableTarget(sel: Selection): boolean {
   const node = sel.anchorNode;
@@ -79,8 +76,9 @@ export function createSelectionPill(deps: SelectionPillDeps) {
   };
 
   function blockElementOf(node: Node | null): Element | null {
-    const el = node && (node.nodeType === 1 ? (node as Element) : node.parentElement);
-    return el?.closest(WORD_BLOCK_SELECTOR) ?? null;
+    // 通用文本块检测（见 shared/selection.ts）：不依赖语义标签清单，
+    // X / YouTube 页面正文等 div 结构同样得到正确的块
+    return inlineRunContainer(node);
   }
 
   function evaluate(): PillSelectionInfo | null {
