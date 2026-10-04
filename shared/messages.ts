@@ -287,7 +287,7 @@ export type ChatActiveResult =
 export type ChatGetResult = { ok: true; chat: ChatRecordView | null } | BgcError;
 /** chatTick 结果：编辑工作区的身份签名（pendingQuoteKey = JSON.stringify(pendingQuote)），任一字段变化才需要全量 chatActive。 */
 export type ChatTickResult =
-  | { ok: true; chatId: string; editId: string | null; updatedAt: number; pendingQuoteKey: string }
+  | { ok: true; chatId: string; editId: string | null; updatedAt: number; pendingQuoteKey: string; generating: boolean }
   | BgcError;
 export type ChatMutationResult = { ok: true } | BgcError;
 

@@ -610,9 +610,11 @@ export async function handleChatRequest(
       return { ok: true, chats: await listChats() };
     }
     case 'chatTick': {
-      // 轮询瘦身：只回编辑工作区身份签名（readChatEdit 内存缓存，不读 IDB）
+      // 轮询瘦身：只回编辑工作区身份签名（readChatEdit 内存缓存，不读 IDB）。
+      // generating 附带该会话是否正在生成：端口事件丢失（SW 重启等）时，
+      // 生成中的每次 tick 与完成翻转都会触发调用方全量拉取，兜底流式与收尾。
       const edit = await readChatEdit(windowId);
-      return { ok: true, chatId: edit.id, editId: edit.editId ?? null, updatedAt: edit.updatedAt, pendingQuoteKey: JSON.stringify(edit.pendingQuote ?? null) };
+      return { ok: true, chatId: edit.id, editId: edit.editId ?? null, updatedAt: edit.updatedAt, pendingQuoteKey: JSON.stringify(edit.pendingQuote ?? null), generating: activeChats.has(edit.id) };
     }
     case 'chatEnsure': {
       const source = parseSource(m.source);

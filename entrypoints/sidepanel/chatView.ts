@@ -292,6 +292,14 @@ async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise
     retainedOnly = false;
     (document.getElementById('chat-input') as HTMLTextAreaElement).value = record.draft ?? '';
   }
+  // 迟到的旧快照不回退终态：同一回答（同 requestId）已完成/停止/出错时，
+  // 生成中每 1.5s 的兜底拉取可能在完成前读取、完成后返回，不能把端口事件
+  // 已落定的终态改回“生成中”；新尝试（requestId 变化）整体采纳
+  for (const m of record.messages) {
+    if (m.role !== 'assistant' || m.state !== 'streaming') continue;
+    const local = chatRecord?.messages.find((x) => x.id === m.id);
+    if (local && local.requestId === m.requestId && local.state && local.state !== 'streaming') m.state = local.state;
+  }
   chatId = record.id;
   chatRecord = record;
   chatSource = record.source;
@@ -311,8 +319,9 @@ async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise
 let polling = false;
 // 轮询瘦身：先比对 chatTick 身份签名，变化才发全量 chatActive（整条会话记录）
 let tickKey = '';
+let tickGenerating = false;
 function syncTickKey(chat: ChatRecordView): void {
-  tickKey = `${chat.id}|${chat.editId ?? ''}|${chat.updatedAt}|${JSON.stringify(chat.pendingQuote ?? null)}`;
+  tickKey = `${chat.id}|${chat.editId ?? ''}|${chat.updatedAt}|${JSON.stringify(chat.pendingQuote ?? null)}|done`;
 }
 async function pollChatSource(): Promise<void> {
   if (polling || !panelActive) return;
@@ -321,8 +330,14 @@ async function pollChatSource(): Promise<void> {
   try {
     const t = await send<ChatTickResult>({ type: 'chatTick' });
     if (op !== operation) return;
-    const key = t?.ok ? `${t.chatId}|${t.editId ?? ''}|${t.updatedAt}|${t.pendingQuoteKey}` : '';
-    if (key !== tickKey) {
+    // generating 参与签名：生成中每轮 tick 都全量拉取（端口事件丢失时的
+    // 兜底流式）；true→false 翻转时无论签名是否相同都再拉一次收尾，
+    // 端口事件丢失也能在完成后的第一轮轮询内取回终态
+    const generating = !!t && t.ok && t.generating;
+    const key = t?.ok ? `${t.chatId}|${t.editId ?? ''}|${t.updatedAt}|${t.pendingQuoteKey}|${generating ? 'gen' : 'done'}` : '';
+    const changed = generating !== tickGenerating || key !== tickKey;
+    tickGenerating = generating;
+    if (changed) {
       const r = await send<ChatActiveResult>({ type: 'chatActive' });
       if (op !== operation) return;
       if (r?.ok && r.chat) {
