@@ -171,7 +171,7 @@ document.getElementById('panel-mode')!.addEventListener('click',async()=>{
   // Native sidePanel.open must run before the first await in the click handler.
   const nativeOpen=floating?browser.sidePanel.open({windowId:panelWindow}).then(()=>true,()=>false):Promise.resolve(false);
   lookupPopup.close();
-  await saveDraft();await persistPanel();
+  await saveDraft(true);await persistPanel();
   const r=await send<{ok:boolean;error?:string}>({type:'panelSwitch',mode:floating?'fixed':'floating',nativeOpened:await nativeOpen});
   if(!r?.ok)feedback(r?.error??'切换失败，请重试');
 });
@@ -818,5 +818,5 @@ async function restorePanel(view?:unknown) {
   if(version!==restoreVersion)return;
   workspaceFailureStage='';setChatActive(activePanel);ready=true;document.body.inert=false;
 }
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){void persistPanel();setChatActive(false);}else setChatActive(activePanel&&ready);});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){void saveDraft(true);void persistPanel();setChatActive(false);}else setChatActive(activePanel&&ready);});
 void boot().catch(error=>workspaceFailed('boot',error));

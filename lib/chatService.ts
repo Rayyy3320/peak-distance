@@ -609,6 +609,11 @@ export async function handleChatRequest(
     case 'chatRecent': {
       return { ok: true, chats: await listChats() };
     }
+    case 'chatTick': {
+      // 轮询瘦身：只回编辑工作区身份签名（readChatEdit 内存缓存，不读 IDB）
+      const edit = await readChatEdit(windowId);
+      return { ok: true, chatId: edit.id, editId: edit.editId ?? null, updatedAt: edit.updatedAt, pendingQuoteKey: JSON.stringify(edit.pendingQuote ?? null) };
+    }
     case 'chatEnsure': {
       const source = parseSource(m.source);
       if (!source) return bad('bad-payload', 'source');

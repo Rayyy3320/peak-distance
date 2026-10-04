@@ -23,6 +23,7 @@ import {
   type ChatPortMessage,
   type ChatRecentItem,
   type ChatSourceInfo,
+  type ChatTickResult,
   type SelectionCandidateResult,
   type SubtitleCueView,
   type SubViewState,
@@ -227,6 +228,11 @@ function onPortEvent(ev: ChatPortEvent): void {
     msg.state = 'error';
     msg.errorKind = ev.errorKind;
   }
+  if (ev.kind === 'delta' && updateStreamingMessage(msg)) {
+    renderInputState();
+    renderGenerationState();
+    return;
+  }
   renderMessages();
   renderInputState();
   renderGenerationState();
@@ -263,10 +269,17 @@ function resetCitePanel(): void {
   if (panel) { panel.hidden = true; panel.textContent = ''; }
 }
 
-export async function saveDraft(): Promise<void> {
-  if(!panelActive)return;
+// 草稿写回防抖：键入路径 400ms 尾沿合并；离开页面 / 发送 / 切面板模式显式 flush
+let draftTimer: ReturnType<typeof setTimeout> | null = null;
+export function saveDraft(flush = false): Promise<void> {
+  if (!panelActive || !chatRecord) return Promise.resolve();
+  if (draftTimer) { clearTimeout(draftTimer); draftTimer = null; }
+  if (!flush) {
+    draftTimer = setTimeout(() => { draftTimer = null; void saveDraft(true); }, 400);
+    return Promise.resolve();
+  }
   const input = document.getElementById('chat-input') as HTMLTextAreaElement;
-  if (chatRecord) await send({ type: 'chatSetDraft', chatId, draft: input.value.slice(0, 8000) });
+  return send({ type: 'chatSetDraft', chatId, draft: input.value.slice(0, 8000) }).then(() => {});
 }
 
 async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise<void> {
@@ -282,6 +295,7 @@ async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise
   chatId = record.id;
   chatRecord = record;
   chatSource = record.source;
+  syncTickKey(record);
   if (record.pendingQuote && JSON.stringify(record.pendingQuote)!==JSON.stringify(chatQuote)) {
     chatQuote = record.pendingQuote;
     const snap = latestSnapshot();
@@ -295,16 +309,29 @@ async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise
 }
 
 let polling = false;
+// 轮询瘦身：先比对 chatTick 身份签名，变化才发全量 chatActive（整条会话记录）
+let tickKey = '';
+function syncTickKey(chat: ChatRecordView): void {
+  tickKey = `${chat.id}|${chat.editId ?? ''}|${chat.updatedAt}|${JSON.stringify(chat.pendingQuote ?? null)}`;
+}
 async function pollChatSource(): Promise<void> {
   if (polling || !panelActive) return;
   const op = operation;
   polling = true;
   try {
-    const r = await send<ChatActiveResult>({ type: 'chatActive' });
+    const t = await send<ChatTickResult>({ type: 'chatTick' });
     if (op !== operation) return;
-    if (r?.ok) noteSourceTab(r);
-    if (r?.ok && r.chat && (r.chat.editId !== chatRecord?.editId || r.chat.id !== chatId || JSON.stringify(r.chat.pendingQuote??null)!==JSON.stringify(chatQuote) || r.chat.updatedAt !== chatRecord?.updatedAt)) {
-      await acceptRecord(r.chat);
+    const key = t?.ok ? `${t.chatId}|${t.editId ?? ''}|${t.updatedAt}|${t.pendingQuoteKey}` : '';
+    if (key !== tickKey) {
+      const r = await send<ChatActiveResult>({ type: 'chatActive' });
+      if (op !== operation) return;
+      if (r?.ok && r.chat) {
+        noteSourceTab(r);
+        syncTickKey(r.chat);
+        if (r.chat.editId !== chatRecord?.editId || r.chat.id !== chatId || JSON.stringify(r.chat.pendingQuote??null)!==JSON.stringify(chatQuote) || r.chat.updatedAt !== chatRecord?.updatedAt) {
+          await acceptRecord(r.chat);
+        }
+      }
     }
     if (historyOpen) void refreshHistory();
   } finally { polling = false; }
@@ -462,7 +489,7 @@ async function doSend(): Promise<void> {
   const editId = chatRecord.editId;
   submittedInput = input.value;
   submittedQuoteKey = JSON.stringify(chatQuote);
-  await saveDraft();
+  await saveDraft(true);
   if (id !== chatId || editId !== chatRecord?.editId) { if (sending === id) sending = null; return; }
   portSend({
     type: 'chat-send',
@@ -790,6 +817,23 @@ function renderAnswerText(box: HTMLElement, msg: ChatMessageRecord): void {
   }
 }
 
+/** 流式 delta 快路径：该条消息 DOM 已在列表时只更新状态 chip 与正文。 */
+function updateStreamingMessage(msg: ChatMessageRecord): boolean {
+  if (!deps || deps.getActiveView() !== 'chat' || !msg.requestId) return false;
+  const item = document.querySelector<HTMLElement>(`#chat-list [data-request-id="${CSS.escape(msg.requestId)}"]`);
+  if (!item) return false;
+  item.querySelector('.a-head .state')?.replaceWith(assistantStateChip(msg));
+  const body = el('div', 'a-text');
+  renderAnswerText(body, msg);
+  if (msg.state === 'streaming' && !msg.text) body.appendChild(el('span', 'pending', '……'));
+  item.querySelector('.a-text')?.replaceWith(body);
+  if (autoScroll) {
+    const list = document.getElementById('chat-list');
+    if (list) list.scrollTop = list.scrollHeight;
+  }
+  return true;
+}
+
 function renderMessages(): void {
   if (!deps || deps.getActiveView() !== 'chat') return;
   const list = document.getElementById('chat-list')!;
@@ -837,6 +881,8 @@ function renderMessages(): void {
         item.appendChild(el('div', 'quote-ref', `引用：${m.quote.expression}`));
       }
     } else {
+      // 流式中的消息带请求标记：delta 快路径只更新这一条，不重建列表
+      if (m.state === 'streaming' && m.requestId) item.dataset.requestId = m.requestId;
       const headRow = el('div', 'a-head');
       headRow.appendChild(assistantStateChip(m));
       if (m.state === 'streaming') {
@@ -1026,7 +1072,7 @@ export function initChatView(d: ChatViewDeps): void {
     void pollChatSource();
     setInterval(() => void pollChatSource(), 1500);
   });
-  window.addEventListener('pagehide', () => { port?.disconnect(); });
+  window.addEventListener('pagehide', () => { void saveDraft(true); port?.disconnect(); });
   const input = document.getElementById('chat-input') as HTMLTextAreaElement | null;
   input?.addEventListener('input', () => {
     updateCount();
@@ -1070,5 +1116,5 @@ export function chatViewEnter(): void {
 export function chatViewLeave(): void {
   const list=document.getElementById('chat-list');
   if(list?.clientHeight)messageScrollTop=list.scrollTop;
-  void saveDraft();
+  void saveDraft(true);
 }
