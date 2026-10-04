@@ -1,5 +1,8 @@
 import { brandTokens, brandControls } from './brand';
 import { selectionError, type SelectionSnapshot } from './panel';
+import { detectTextLanguage } from './tokenize';
+import { langDisplayName } from './languages';
+import { comprehensionLangFor, DEFAULT_SETTINGS } from './settings';
 
 export function createTranslationPopup(send: <T>(msg: unknown) => Promise<T>) {
   let host: HTMLElement | null = null;
@@ -14,7 +17,7 @@ export function createTranslationPopup(send: <T>(msg: unknown) => Promise<T>) {
     if (restoreFocus) focus?.focus();
     focus = null;
   }
-  function open(snapshot: SelectionSnapshot, rect?: DOMRect | null) {
+  async function open(snapshot: SelectionSnapshot, rect?: DOMRect | null) {
     openedAt = performance.timeOrigin + performance.now();
     close(false); focus = document.activeElement as HTMLElement;
     sourcePage=location.href;
@@ -26,6 +29,15 @@ export function createTranslationPopup(send: <T>(msg: unknown) => Promise<T>) {
       header,footer{display:flex;gap:8px;align-items:center;padding:12px 16px}header{border-bottom:1px solid var(--pd-line)}header strong{flex:1}main{overflow:auto;padding:0 16px;min-height:0}p{white-space:pre-wrap;overflow-wrap:anywhere}small,a{color:var(--pd-muted)}footer{border-top:1px solid var(--pd-line)}#result{font-size:15px}#close{margin-left:auto}
     </style><section class="card" role="dialog" aria-label="选区翻译"><header><strong>翻译</strong><button id="close" aria-label="关闭翻译">×</button></header><main><p id="original"></p><small>简体中文 · Google 翻译</small><p id="result" role="status">正在翻译…</p><a id="source" target="_blank" rel="noopener"></a></main><footer><button id="copy" disabled>复制译文</button><button id="retry">重试</button></footer></section>`;
     root.querySelector('#original')!.textContent = snapshot.text;
+    // M11：源语言局部初判（无法判定交给免费渠道自动检测）；目标按设置解析。
+    const sourceLang = detectTextLanguage(snapshot.text) ?? undefined;
+    let settings: typeof DEFAULT_SETTINGS = DEFAULT_SETTINGS;
+    try {
+      const r = await send<{ ok: boolean; settings?: typeof DEFAULT_SETTINGS }>({ type: 'getSettings' });
+      if (r?.ok && r.settings) settings = { ...DEFAULT_SETTINGS, ...r.settings };
+    } catch { /* 设置不可达时用默认 */ }
+    const targetLang = comprehensionLangFor(settings, sourceLang);
+    (root.querySelector('main small') as HTMLElement).textContent = `${langDisplayName(targetLang)} · Google 翻译`;
     const link = root.querySelector<HTMLAnchorElement>('#source')!;
     if (/^https?:\/\//.test(snapshot.url)) link.href = snapshot.url;
     link.textContent = snapshot.title || '原文来源';
@@ -44,7 +56,8 @@ export function createTranslationPopup(send: <T>(msg: unknown) => Promise<T>) {
       if (error) { result.textContent = error; retry.hidden = true; return; }
       const id = requestId = `selection-${crypto.randomUUID()}`;
       copy.disabled = true; copy.textContent='复制译文'; retry.disabled = true; result.textContent = '正在翻译…';
-      const r = await send<{ok:boolean; text?:string; error?:string}>({ type:'translateSelection', text:snapshot.text, requestId:id });
+      const r = await send<{ok:boolean; text?:string; error?:string}>({ type:'translateSelection', text:snapshot.text, requestId:id,
+        ...(sourceLang ? { sourceLang } : {}), targetLang });
       if (requestId !== id || !host) return;
       if(location.href!==sourcePage){close();return;}
       retry.disabled = false;

@@ -5,7 +5,8 @@ import { isPanelView, panelStateKey, panelTransportFailure, type SelectionSnapsh
 import { createTranslationPopup } from '@/shared/translationPopup';
 import { createLookupPopup } from '@/shared/lookupPopup';
 import { shadowSelection } from '@/shared/selection';
-import { buildSurfaceStatusMap } from '@/shared/vocab';
+import { buildMarkBuckets } from '@/shared/marker';
+import { segmentWords } from '@/shared/tokenize';
 // 侧栏三个视图：生词本（词条 / 上下文 / 词形关联管理）、字幕（当前标签页
 // 视频的原文列表 + 译文 + 播放控制）、复习（原句回忆，无 AI 调用）。
 // 数据全部来自 background 的 IndexedDB；vocab-changed 广播后刷新。
@@ -362,7 +363,7 @@ const videoWorkspace=createYoutubeWorkspace({
     events.addEventListener('focusin',e=>{const w=wordOf(e);if(w&&w!==hoveredWord){hoveredWord=w;openWord(w,true);}});
     events.addEventListener('keydown',e=>{const key=e as KeyboardEvent,w=wordOf(e);if(w&&(key.key==='Enter'||key.key===' ')){key.preventDefault();hoveredWord=w;openWord(w,false);}});
   },
-  words:(parent,text)=>{for(const part of text.split(/([A-Za-z]+(?:['’][A-Za-z]+)*)/)){if(/^[A-Za-z]/.test(part)){const w=el('span','w',part);w.tabIndex=0;w.setAttribute('role','button');w.style.userSelect='text';parent.append(w);}else parent.append(document.createTextNode(part));}},
+  words:(parent,text)=>{const lang=((cachedVideo?.trackLang||subsState?.trackLang)||'en').split('-')[0]!;let last=0;for(const s of segmentWords(text,lang)){if(s.start>last)parent.append(document.createTextNode(text.slice(last,s.start)));const w=el('span','w',s.text);w.tabIndex=0;w.setAttribute('role','button');w.style.userSelect='text';parent.append(w);last=s.end;}if(last<text.length)parent.append(document.createTextNode(text.slice(last)));},
   seek:(i,play)=>void videoAction('seek',i,undefined,play),lookup:(word,i,anchor)=>openPanelWord(word,i,anchor,false),
   save:i=>void videoAction('save',i),remove:id=>void send({type:'deleteSentence',id}),
   ask:i=>{if(subsState?.cues[i])void subtitleAskAi(subsState,subsState.cues[i]!);},open:switchView,
@@ -377,7 +378,7 @@ function openPanelWord(word:string,index:number,anchor:HTMLElement,compact:boole
   let closed=false;
   const resume=()=>void tabSend(tabId,{type:'pd-video-action',videoId:state.videoId,index,action:'resumeLookup',token});
   void tabSend(tabId,{type:'pd-video-action',videoId:state.videoId,index,action:'pauseLookup',token}).then(()=>{if(closed)resume();});
-  lookupPopup.open({snapshot:{source:'video',expression:word,sentence:cue.text,title:state.title,video:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:cue.startMs}},anchor,compact,subLine:`YouTube · ${fmtClock(cue.startMs)}`,onContinueAsk:()=>void subtitleAskAi(state,cue),onClose:()=>{closed=true;resume();}});
+  lookupPopup.open({snapshot:{source:'video',expression:word,sentence:cue.text,title:state.title,lang:state.trackLang||undefined,video:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:cue.startMs}},anchor,compact,subLine:`YouTube · ${fmtClock(cue.startMs)}`,onContinueAsk:()=>void subtitleAskAi(state,cue),onClose:()=>{closed=true;resume();}});
   const card=lookupPopup.host()?.shadowRoot?.querySelector('.card');card?.addEventListener('pointerenter',()=>clearTimeout(closeTimer));card?.addEventListener('pointerleave',()=>{closeTimer=setTimeout(()=>{if(lookupPopup.isCompact()){lookupPopup.close();hoveredWord=null;}},220);});
 }
 async function videoAction(action:string,index:number,word?:string,play?:boolean) {
@@ -412,7 +413,10 @@ async function pollSubs():Promise<void> {
   const cues=state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0}));
   const stable=<T>(old:T,next:T):T=>JSON.stringify(old)===JSON.stringify(next)?old:next;
   cachedVideo={videoId:state.videoId,videoRef:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:0},
-    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),statuses:buildSurfaceStatusMap(index?.items??[]),sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[]),notice:state.notice,chinese:state.chineseVisible!==false};
+    trackLang:state.trackLang||undefined,
+    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),
+    statuses:buildMarkBuckets(index?.items??[]).get((state.trackLang||'en').split('-')[0]!)?.statusByKey??new Map<string,string>(),
+    sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[]),notice:state.notice,chinese:state.chineseVisible!==false};
   videoWorkspace.update(cachedVideo);
 }
 setInterval(()=>void pollSubs(),1000);

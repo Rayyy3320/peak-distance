@@ -14,6 +14,7 @@ import { createTranslationPopup } from '@/shared/translationPopup';
 import { initFloatingPanel } from '@/shared/floatingPanel';
 import { brandTokens, brandControls } from '@/shared/brand';
 import { createMarker } from '@/shared/marker';
+import { detectTextLanguage } from '@/shared/tokenize';
 import {
   normalizeArticleUrl,
   sourceKeyOf,
@@ -212,6 +213,8 @@ export default defineContentScript({
           sentence: info.sentence,
           url: location.href,
           title: document.title,
+          // 局部语言初判（选区优先，其次所在原句）；无法判定则缺省（待确认由词卡纠正）
+          lang: detectTextLanguage(info.expression) ?? detectTextLanguage(info.sentence) ?? undefined,
         },
         onContinueAsk: (ctx) => void continueAskFromPage(ctx),
       });

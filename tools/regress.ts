@@ -11,6 +11,8 @@ import {
   effectiveEntryLanguage,
   normalizeExpressionInLanguage,
 } from '../shared/languages';
+import { wordAt, detectTextLanguage } from '../shared/tokenize';
+import { scanMarkHits, type MarkBucket } from '../shared/marker';
 // 离线回归检查（node 运行，无需浏览器）：
 //   1. M0 时序 A/B：捕获归属、换视频重置、跨视频旧响应丢弃。
 //   2. M1 词汇逻辑：规范化去重、上下文追加 / 去重、状态保持与显式更新。
@@ -782,6 +784,40 @@ console.log('M11 查询路由：语言对、词典门控与 AI 兜底');
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+console.log('M11 分词与标记命中');
+{
+  const jaRaw = '私は毎日日本語を学ぶ。';
+  const manabu = jaRaw.indexOf('学ぶ');
+  check('点击定位日语词', wordAt(jaRaw, manabu, 'ja')?.text === '学ぶ');
+  check('点击定位土耳其语词', wordAt('DIŞARI çıkmak', 0, 'tr')?.text === 'DIŞARI');
+  check('点击落在词间取紧邻词', !!wordAt('hello world', 5, 'en'));
+  check('纯数字不判语言', detectTextLanguage('123 456') === null);
+  check('假名判日语', detectTextLanguage('これはペンです') === 'ja');
+  check('无假名汉字判中文', detectTextLanguage('我们学习中文') === 'zh');
+  check('波斯语特有字符判 fa', detectTextLanguage('زبان فارسی') === 'fa');
+  check('阿拉伯语判 ar', detectTextLanguage('اللغة العربية') === 'ar');
+  check('拉丁保守判英语桶', detectTextLanguage('Le pain est bon') === 'en');
+
+  const mkBucket = (tokens: Record<string, string>, phrases: Record<string, string> = {}): MarkBucket => ({
+    statusByKey: new Map(Object.entries(tokens)),
+    phrases: new Map(Object.entries(phrases)),
+  });
+  const buckets = new Map<string, MarkBucket>([
+    ['ja', mkBucket({ 学ぶ: 'learning' })],
+    ['zh', mkBucket({ 中文: 'known' })],
+    ['en', mkBucket({ constrained: 'saved' }, { 'take off': 'learning' })],
+    ['fr', mkBucket({ pain: 'saved' })],
+  ]);
+  const jaHits = scanMarkHits(jaRaw, buckets);
+  check('日语词条命中且范围正确', jaHits.length === 1 && jaRaw.slice(jaHits[0]!.start, jaHits[0]!.end) === '学ぶ');
+  check('法语词条不套用到拉丁默认桶', scanMarkHits('Le pain est bon', buckets).length === 0);
+  check('英语桶命中词条', scanMarkHits('The constrained design', buckets).length === 1);
+  const phHits = scanMarkHits('Take off now', buckets);
+  check('英语短语窗口命中', phHits.length === 1 && phHits[0]!.end - phHits[0]!.start === 'Take off'.length);
+  check('中文词条命中', scanMarkHits('我们学习中文。', buckets).length === 1);
+  check('无语言文本零标记', scanMarkHits('123', buckets).length === 0);
 }
 
 console.log(`\n通过 ${passed}，失败 ${failed}`);

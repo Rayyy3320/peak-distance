@@ -35,11 +35,14 @@ import { subtitleFontSize } from '@/shared/youtubeWorkspace';
 import { createLookupPopup } from '@/shared/lookupPopup';
 import {
   sentenceId, type SavedSentence,
-  buildSurfaceStatusMap,
   videoContextUrl,
   type VocabIndexItem,
   type VideoSnapshot,
 } from '@/shared/vocab';
+import { buildMarkBuckets, type MarkBucket } from '@/shared/marker';
+import { segmentWords } from '@/shared/tokenize';
+import { normalizeExpressionInLanguage, langDisplayName } from '@/shared/languages';
+import { comprehensionLangFor } from '@/shared/settings';
 import {
   sourceKeyOf,
   type MaterialPayload,
@@ -118,7 +121,7 @@ export default defineContentScript({
     let renderQueued = false;
 
     // 词状态（字幕内低强调标记）
-    let surfaceStatus = new Map<string, string>();
+    let markBuckets = new Map<string, MarkBucket>();
     // 查词暂停恢复
     let pausedByUsVideo: string | null = null;
     let externalLookupToken='';
@@ -323,31 +326,25 @@ export default defineContentScript({
       return (s || '').split('-')[0]!.toLowerCase();
     }
 
-    /** 轨道优先级：en manual > en asr > 其它（明确提示，不当英文用）。 */
+    /** 轨道优先级（M11 3.2）：沿用当前可用轨道；同语言人工优先于自动；
+     *  无当前轨道时任选人工轨道，不强制切英语。 */
     function evaluateTrackPreference(): void {
       if (!tracklist.length || preferTried) return;
-      const hasEnManual = tracklist.some((t) => t.lang === 'en' && t.kind === 'manual');
-      const hasEnAsr = tracklist.some((t) => t.lang === 'en' && t.kind === 'asr');
-      const curEn = baseLang(lastTrackLang) === 'en' && cues.length > 0;
-      const curGood = curEn && (lastTrack === 'manual' || !hasEnManual);
-      if (curGood) return;
-      if (hasEnManual) {
+      const cur = baseLang(lastTrackLang);
+      if (cues.length > 0) {
+        // 已有产出：仅当同语言存在人工轨且当前是自动轨时升级
+        const sameManual = tracklist.find((t) => t.kind === 'manual' && baseLang(t.lang) === cur);
+        if (lastTrack === 'manual' || !sameManual) return;
         preferTried = true;
-        sendPrefer('en', 'manual');
-        log('prefer', { lang: 'en', kind: 'manual' });
-      } else if (hasEnAsr) {
+        sendPrefer(sameManual.lang, 'manual');
+        log('prefer', { lang: sameManual.lang, kind: 'manual' });
+        return;
+      }
+      const pick = tracklist.find((t) => t.kind === 'manual') ?? tracklist.find((t) => t.kind === 'asr');
+      if (pick) {
         preferTried = true;
-        sendPrefer('en', 'asr');
-        log('prefer', { lang: 'en', kind: 'asr' });
-      } else if (!curEn) {
-        // 没有任何英文轨道：明确提示，不把其它语言当英文处理
-        if (cues.length) {
-          notice = '该视频没有英文字幕轨道';
-          renderBar();
-        } else {
-          notice = '该视频没有英文字幕轨道';
-        }
-        renderBadge();
+        sendPrefer(pick.lang, pick.kind === 'asr' ? 'asr' : 'manual');
+        log('prefer', { lang: pick.lang, kind: pick.kind });
       }
     }
 
@@ -630,7 +627,7 @@ export default defineContentScript({
       if (!cues.length) {
         const n = document.createElement('div');
         n.className = 'notice';
-        n.textContent = notice || '正在获取英文字幕…';
+        n.textContent = notice || '正在获取字幕…';
         bar.appendChild(n);
         body.appendChild(bar);
         return;
@@ -650,7 +647,7 @@ export default defineContentScript({
         if (!en.textContent) appendWords(en, cue.text);
         en.querySelectorAll<HTMLElement>('.w').forEach(w => {
           w.classList.remove('saved', 'learning', 'known');
-          const status = surfaceStatus.get(w.textContent!.toLowerCase()); if (status) w.classList.add(status);
+          const status = wordStatus(w.textContent!); if (status) w.classList.add(status);
         });
         bar.appendChild(en);
         if (zhVisible) {
@@ -672,7 +669,7 @@ export default defineContentScript({
             }); bar.appendChild(retry);
           } else {
             const pending = document.createElement('div'); pending.className = 'notice'; pending.setAttribute('role', 'status');
-            pending.textContent = !settingsReady ? '正在读取翻译设置…' : platformState === 'waiting' ? '正在获取中文字幕…' : '正在翻译…';
+            pending.textContent = !settingsReady ? '正在读取翻译设置…' : platformState === 'waiting' ? `正在获取${langDisplayName(targetLangOf())}译文…` : '正在翻译…';
             bar.appendChild(pending);
           }
         }
@@ -680,20 +677,18 @@ export default defineContentScript({
       body.appendChild(bar);
     }
 
-    /** 英文行按词切分为可点击 span，已存词条按状态低强调标出。 */
+    /** 原文行按轨道语言分词为可点击 span（M11：Segmenter 统一边界），已存词条按状态低强调标出。 */
     function appendWords(en: HTMLDivElement, text: string): void {
-      const re = /([A-Za-z][A-Za-z'’-]*)/g;
       let last = 0;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(text)) !== null) {
-        if (m.index > last) en.appendChild(document.createTextNode(text.slice(last, m.index)));
+      for (const s of segmentWords(text, baseLang(lastTrackLang) || 'en')) {
+        if (s.start > last) en.appendChild(document.createTextNode(text.slice(last, s.start)));
         const w = document.createElement('span');
         w.className = 'w'; w.tabIndex = 0; w.setAttribute('role', 'button');
-        w.textContent = m[0];
-        const st = surfaceStatus.get(m[0].toLowerCase().normalize('NFC'));
+        w.textContent = s.text;
+        const st = wordStatus(s.text);
         if (st) w.classList.add(st);
         en.appendChild(w);
-        last = m.index + m[0].length;
+        last = s.end;
       }
       if (last < text.length) en.appendChild(document.createTextNode(text.slice(last)));
     }
@@ -734,6 +729,7 @@ export default defineContentScript({
       const video = videoRef(index), id = sentenceId(video, cue.text);
       const r = await send<{ ok:boolean }>(sentences.some(s => s.id === id) ? { type:'deleteSentence', id } : {
         type:'saveSentence', sentence:{ id, video, text:cue.text, zh:translations.get(index), translationSource:translationSources.get(index),
+          ...(lastTrackLang ? { language: lastTrackLang } : {}),
           endMs:cue.start + cue.dur, title:document.title, createdAt:Date.now() },
       });
       if (!r?.ok) playerToast('收藏失败，请重试');
@@ -872,6 +868,7 @@ export default defineContentScript({
         sentence: cue.text,
         neighbors: neighborsText(index) || undefined,
         title: document.title,
+        lang: lastTrackLang || undefined,
         video: {
           videoId: currentVideoId,
           trackId: lastTrackId,
@@ -973,11 +970,18 @@ export default defineContentScript({
       renderBar();
     }
 
+    /** 当前内容的理解语言（M11：按源语言覆盖优先；轨道语言缺省用全局默认）。 */
+    function targetLangOf(): string {
+      return comprehensionLangFor(settings, lastTrackLang || undefined);
+    }
+
     function captionCacheKey(): string {
+      // 缓存随目标语言区分（默认 zh 与旧 'youtube-zh' 键一致，老缓存继续可用）
+      const target = baseLang(targetLangOf());
       try {
         const p = new URL(lastTrackId).searchParams;
-        return JSON.stringify([currentVideoId, p.get('lang'), p.get('kind'), p.get('name'), p.get('vssId'), 'youtube-zh']);
-      } catch { return `${currentVideoId}|${lastTrackId}|youtube-zh`; }
+        return JSON.stringify([currentVideoId, p.get('lang'), p.get('kind'), p.get('name'), p.get('vssId'), `youtube-${target}`]);
+      } catch { return `${currentVideoId}|${lastTrackId}|youtube-${target}`; }
     }
 
     function requestPlatform(): void {
@@ -991,7 +995,7 @@ export default defineContentScript({
           applyPlatformCues(r.cues); platformState = 'done'; scheduleTranslate(); return;
         }
         platformRequest = crypto.randomUUID();
-        postToInject({ type: 'translation-request', requestId: platformRequest, videoId: currentVideoId, trackId: lastTrackId });
+        postToInject({ type: 'translation-request', requestId: platformRequest, videoId: currentVideoId, trackId: lastTrackId, targetLang: targetLangOf() });
         platformTimer = setTimeout(() => {
           if (epoch !== translationEpoch) return;
           postToInject({ type: 'translation-cancel' }); platformRequest = null; platformState = 'done'; scheduleTranslate();
@@ -1001,7 +1005,8 @@ export default defineContentScript({
 
     function applyPlatformCues(translated: Cue[]): void {
       const byTime = new Map(translated.filter(c => c.zh).map(c => [`${c.start}|${c.text}`, c.zh!]));
-      cues.forEach((cue, id) => { const zh = byTime.get(`${cue.start}|${cue.text}`); if (zh) { translations.set(id, zh); translationSources.set(id, 'YouTube 中文字幕 / 平台翻译'); } });
+      const sourceLabel = `YouTube ${langDisplayName(targetLangOf())}译文 / 平台翻译`;
+      cues.forEach((cue, id) => { const zh = byTime.get(`${cue.start}|${cue.text}`); if (zh) { translations.set(id, zh); translationSources.set(id, sourceLabel); } });
       queueRender();
     }
 
@@ -1025,6 +1030,7 @@ export default defineContentScript({
       requestId = crypto.randomUUID();
       void send<{ ok: boolean; translations?: { id: number; text: string }[] }>({
         type: 'translateCues', mode: translationMode, requestId, videoId: currentVideoId, trackId: lastTrackId,
+        sourceLang: lastTrackLang || undefined, targetLang: targetLangOf(),
         items: win.map(id => ({ id, text: cues[id]!.text })),
       }).then(r => {
         if (epoch !== translationEpoch) return;
@@ -1083,6 +1089,7 @@ export default defineContentScript({
             title: document.title,
             trackKind: lastTrack === 'asr' ? 'asr' : cues.length ? 'manual' : '',
             trackLang: lastTrackLang,
+            translationLang: targetLangOf(),
             trackId: lastTrackId,
             cues: cues.map((c, i) => ({
               id: i,
@@ -1158,9 +1165,18 @@ export default defineContentScript({
         type: 'vocabIndex',
       });
       if (r?.ok && Array.isArray(r.items)) {
-        surfaceStatus = buildSurfaceStatusMap(r.items) as Map<string, string>;
+        // 与页面标记共用语言桶：词条只在同语言轨道文本上标状态
+        markBuckets = buildMarkBuckets(r.items);
         queueRender();
       }
+    }
+
+    /** 轨道语言下的词状态（按语言规范化；跨语言同形词互不套用）。 */
+    function wordStatus(text: string): string | undefined {
+      const lang = baseLang(lastTrackLang) || 'en';
+      return markBuckets
+        .get(lang)
+        ?.statusByKey.get(normalizeExpressionInLanguage(text, lang));
     }
 
     browser.runtime.onMessage.addListener((msg: unknown) => {
@@ -1273,7 +1289,8 @@ export default defineContentScript({
 
         if (d.type === 'cues' && Array.isArray(d.cues)) {
           const kind = d.trackKind === 'asr' ? 'asr' : 'manual';
-          const lang = baseLang(String(d.trackLang || ''));
+          // 保留轨道完整语言标签（含变体，如 pt-BR）；匹配用 primary。
+          const lang = String(d.trackLang || '').toLowerCase();
           const newTrackId = String(d.trackId || '');
           // 同轨道重复产出（如 nocues 重试后的 config）不丢已取得的译文
           if (lastTrackId !== newTrackId) {
@@ -1290,22 +1307,9 @@ export default defineContentScript({
           nocuesRetries = 0;
           currentIdx = -1;
           if (typeof d.seen === 'number') sawTimedtext = d.seen;
-          if (lang !== 'en') {
-            // 不把其它语言当英文处理：丢弃内容并尝试切英文轨道。
-            // 新捕获的非英文轨（如用户中途改了 CC 语言）允许再次发起偏好切换。
-            cues = [];
-            preferTried = false;
-            evaluateTrackPreference();
-            notice = preferTried
-              ? '正在切换英文轨道…'
-              : tracklist.length
-                ? '该视频没有英文字幕轨道'
-                : '当前字幕非英文，等待轨道信息…';
-            log('drop-non-english', { lang });
-          } else {
-            notice = '';
-            evaluateTrackPreference();
-          }
+          // M11：非英文原文字幕是合法轨道，按实际语言继续（不强切英语）
+          notice = '';
+          evaluateTrackPreference();
           log('cues', {
             videoId: d.videoId,
             track: `${lastTrackLang}(${lastTrack})`,
