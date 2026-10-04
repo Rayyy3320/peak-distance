@@ -24,6 +24,7 @@ import {
   serializeMaterialSnapshot,
 } from './chatFormat';
 import type { MaterialSnapshotRecord } from '@/shared/chat';
+import { DB_NAME, DB_VERSION } from '@/lib/db';
 import {
   VAULT_FORMAT_VERSION,
   type VaultIdentity,
@@ -415,7 +416,7 @@ export async function pickVaultDirectoryInPage(): Promise<boolean> {
     return false; // 用户取消
   }
   await new Promise<void>((resolve, reject) => {
-    const req = indexedDB.open('blc-learning', 5);
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onsuccess = () => {
       const db = req.result;
       const tx = db.transaction('vault', 'readwrite');

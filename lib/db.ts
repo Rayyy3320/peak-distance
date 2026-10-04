@@ -33,8 +33,8 @@ import { effectiveEntryLanguage, normalizeLangTag, entryKeyOf, parseEntryKey, LA
 import { planLegacyLanguage } from '@/shared/vocab';
 import type { VaultIdentity, VaultPendingWrite, VaultStatus } from '@/shared/vault';
 
-const DB_NAME = 'blc-learning';
-const DB_VERSION = 5;
+export const DB_NAME = 'blc-learning';
+export const DB_VERSION = 5;
 const ENTRIES = 'entries';
 const CONTEXTS = 'contexts';
 const CHATS = 'conversations';
