@@ -12,7 +12,9 @@
 
 ## 主要改动
 
+- X / YouTube 页面正文选区整体失效的实际根因（用户第三轮反馈定位）：块检测用固定语义标签清单（p/li/blockquote…），而 X 推文正文是 `div[dir=auto]`、YouTube 描述/评论是自定义元素——清单取不到块 → `crossesBlock` 恒真 → **这类站点所有选区一律判为句段**：单词也出现「翻译」按钮、有效表达恒为 null、残缺词原样上翻译卡（用户截图全部由此产生）。根治：`shared/selection.ts` 新增 `inlineRunContainer`（从文本节点向上穿过内联元素取第一个非内联祖先 = 最小文本块；语义页得 p 本身、div 站得 tweetText/描述容器本身），`selectionPill` 的标签清单替换为该通用检测；`web.content.locateSavedText`（引用定位，同类清单在此类站点静默失效）同源改为「有直接文本的元素里取文本最短命中」。文章段落枚举（`visibleTextBlocks`）保留语义清单：X 走目标帖子专用路径、YouTube 隐藏「附加页面」，不受影响。对照验证：换回标签清单后 X 用例（单词分类）稳定失败；修复后 X 形态页（div 推文 + span hashtag）单词分类/词内补全/句段首尾清洗全通过。
 - 扩展重载后旧标签页报 `Extension context invalidated`（用户反馈，x.com / YouTube watch 上下文共多笔）：事件期扩展 API 调用按根因修复——`shared/lookupPopup.ts` 纸纹背景地址改在注入期解析一次（常量，事件期不再调用 `runtime.getURL`）；`shared/floatingPanel.ts` 四处通知上报（Esc 关闭/全屏切换/卡外点击/页面卸载）收口为 `notify()`（孤儿宿主中 `runtime.sendMessage` 同步抛出、`.catch` 挂不上，按无处可上报处理）。两个内容脚本的事件期扩展调用全量核对：其余路径均经带 try/catch 的 `send()`（web / youtube / selectionPill / 词卡与翻译卡 / marker）或已有 try/catch（面板 probe 与重试）。selection-check Part D：`chrome.runtime.reload()` 后在旧页完成 选区→浮条→查词→卡内关闭→再开→卡外点击 全路径且无 invalidated 报错（修复前同用例稳定复现报错）；web 与 youtube 打包同一批共享模块，YouTube 侧同链路由此覆盖。
+- 翻译卡片使用补全/清洗后的正常表达（用户补充需求两轮反馈：截图示 X 页选区残缺片段 Seriousl.... 上翻译卡）：三处翻译入口（网页/X 浮条、播放器字幕操作条、侧栏字幕列表）统一改为 `expression ?? raw`，且有效表达对所有分类计算（原先 sentence 恒为 null）——词/短语整体用有效表达；句段卡片清洗首尾（补齐首尾残缺词、去词外标点），内部保持原文（换行、大小写、句读不动），跨正文块句段无可靠定位自然保持原文。选区候选与附加材料的 expression 对句段仍为 null（「选中句段」范围不变）。词卡原本即用有效表达，未改。
 - `shared/floatingPanel.ts`（用户补充反馈的修复）：非全屏不再把面板钳在播放器上方（旧 `safeBottom = player.bottom - 64` 使高面板被钉在顶部且无法下移、 maxHeight 随播放器压缩）；非全屏可在整个视口内移动，全屏字幕安全区避让保留。check-m8 新增「浮动面板非全屏可向下移动到播放器下方」用例（经产品自带方向键路径；受控 headless 中指针捕获跨扩展 iframe 的事件派发不全，鼠标拖动路径由真机使用验证）。
 - `shared/selectionPill.ts`（用户补充反馈的修复）：把网页选区浮条（分类按钮、有效查词表达、候选推送、附加到对话）抽成共享模块。根因：web.content 自 M1 起 `excludeMatches` 排除 youtube.com，而 youtube.content 只在字幕栏内提供选区操作，页面正文（描述/评论/标题）选区无任何入口。修复后 `web.content.ts` 与 `youtube.content.ts` 共用同一浮条；YouTube 侧注入 article 来源（当前地址，不绑视频轨道）、播放器轻提示与「继续问」回调，`skipSelection` 以选区根节点是否为 document 排除字幕栏/操作条/词卡/翻译卡等自身 Shadow UI，站内导航（onNav）清理浮条与去重键。
 - `shared/tokenize.ts`：`classifySelection`（word/phrase/sentence，跨块与句界判定，无空格文字按分词器计词）、`effectiveLookupExpression`（补齐残缺词、剥离词外标点、保留词内撇号/连字符与词尾撇号/所有格）、`sentenceContaining`（所在原句，跨句不兜底）。
@@ -33,7 +35,7 @@
 | `node tools/render-check.mjs`（57 项：网页浮条/标记/弹窗 + 模拟视频页字幕链路） | 通过 |
 | `node tools/check-m8.mjs`（60 项：选区翻译、工作区、固定/浮动、全屏、AP，含新增「浮动面板非全屏可向下移动」） | 通过 |
 | `npm run e2e-check -- --no-video`（49/50；唯一失败「显式 AI 解释真实请求」需真实 API Key，环境项） | 通过（环境项除外） |
-| `npm run selection-check -- --no-video`（35/35：分类浮条按钮矩阵、learnin→learning、候选折叠后仍可附加、菜单摘要与入口、div 正文附加页面、重复附加不叠加、A→B 替换、× 保留草稿、导航失效原因、失败反馈保留、新选区清除错误、附件展开有界滚动、零 LLM；注入式播放器页单词/句段分类、拖选不误触词卡、短语残缺补齐、附加消息形状含时间与 openPanel；YouTube 页面正文单词/短语残缺补齐/句段分类、article 源候选与附加、字幕栏选区不出现页面浮条；扩展重载后旧页查词全路径无 invalidated 报错） | 通过 |
+| `npm run selection-check -- --no-video`（42/42：X 形态页（div 推文）单词分类/词内补全/句段清洗首尾、分类浮条按钮矩阵、learnin→learning、候选折叠后仍可附加、菜单摘要与入口、div 正文附加页面、重复附加不叠加、A→B 替换、× 保留草稿、导航失效原因、失败反馈保留、新选区清除错误、附件展开有界滚动、零 LLM；注入式播放器页单词/句段分类、拖选不误触词卡、短语残缺补齐、附加消息形状含时间与 openPanel；YouTube 页面正文单词/短语残缺补齐/句段分类、article 源候选与附加、字幕栏选区不出现页面浮条；翻译卡片展示补全/清洗表达（teady pace.→steady pace、went ho→went home、句段首尾 teady pace. Th→steady pace. The、hey… it al→they … it all；YouTube 页面正文容器改 div 形态复验）；扩展重载后旧页查词全路径无 invalidated 报错） | 通过 |
 
 零 LLM 由 SW fetch 记录断言：分类与附加全程无任何 AI 请求。
 
