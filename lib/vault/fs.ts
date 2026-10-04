@@ -46,15 +46,26 @@ type DirHandle = FileSystemDirectoryHandle & {
 
 // ---- 基础文件操作（每次重新取句柄；不缓存 FileHandle） ---------------------------
 
-async function readTextFile(dir: DirHandle, path: string[]): Promise<string | null> {
+/** 读取结果：text 成功；missing 文件或父目录不存在（合法缺失）；failed 其它错误（权限瞬断、IO、句柄失效）。 */
+type VaultReadText = { text: string } | { missing: true } | { failed: true };
+
+async function readTextFile(dir: DirHandle, path: string[]): Promise<VaultReadText> {
   try {
     let d = dir;
     for (const seg of path.slice(0, -1)) d = await d.getDirectoryHandle(seg);
     const fh = await d.getFileHandle(path.at(-1)!);
-    return await (await fh.getFile()).text();
-  } catch {
-    return null;
+    return { text: await (await fh.getFile()).text() };
+  } catch (e) {
+    // NotFoundError = 文件/目录确实不在；其余异常是读取失败，不能当“已删除”
+    if ((e as DOMException)?.name === 'NotFoundError') return { missing: true };
+    return { failed: true };
   }
+}
+
+/** 宽松读取：缺失与读取失败都当无内容（仅身份/索引这类可安全重建的数据使用）。 */
+async function readTextIfAny(dir: DirHandle, path: string[]): Promise<string | null> {
+  const r = await readTextFile(dir, path);
+  return 'text' in r ? r.text : null;
 }
 
 async function writeTextFile(dir: DirHandle, path: string[], text: string): Promise<void> {
@@ -86,7 +97,7 @@ async function listFilesRecursive(
 // ---- 身份与索引 -------------------------------------------------------------------
 
 export async function ensureVault(dir: DirHandle): Promise<VaultIdentity> {
-  const raw = await readTextFile(dir, [META_DIR, IDENTITY_FILE]);
+  const raw = await readTextIfAny(dir, [META_DIR, IDENTITY_FILE]);
   if (raw) {
     try {
       const parsed = JSON.parse(raw) as VaultIdentity;
@@ -123,7 +134,7 @@ interface VaultIndex {
 }
 
 async function readIndex(dir: DirHandle): Promise<VaultIndex> {
-  const raw = await readTextFile(dir, [META_DIR, INDEX_FILE]);
+  const raw = await readTextIfAny(dir, [META_DIR, INDEX_FILE]);
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw);
@@ -170,9 +181,11 @@ export async function writeVocabToVault(
   if (!path) {
     for (const f of await listFilesRecursive(dir)) {
       if (!f.startsWith(`${targetDir}/`)) continue;
-      const text = await readTextFile(dir, f.split('/'));
-      if (!text) continue;
-      const parsed = parseVocabDocument(text);
+      const read = await readTextFile(dir, f.split('/'));
+      // 读取失败≠不存在：无法确认记录是否已有文件，中止写入让待办重试（避免落重复文件）
+      if ('failed' in read) throw new Error(`vault read failed: ${f}`);
+      if ('missing' in read) continue;
+      const parsed = parseVocabDocument(read.text);
       if (!('error' in parsed) && parsed.id === record.id) {
         path = f;
         break;
@@ -181,7 +194,10 @@ export async function writeVocabToVault(
   }
 
   if (path) {
-    const existing = await readTextFile(dir, path.split('/'));
+    const read = await readTextFile(dir, path.split('/'));
+    // 读取失败不得当“文件不存在”整体重写（会丢用户在 Obsidian 自由编辑的内容）
+    if ('failed' in read) throw new Error(`vault read failed: ${path}`);
+    const existing = 'text' in read ? read.text : null;
     const next =
       existing !== null && !('error' in parseVocabDocument(existing))
         ? applyVocabToDocument(record, existing)
@@ -265,16 +281,20 @@ export interface VaultFileScan {
   preference: { defaultComprehensionLang: string; comprehensionOverrides: Record<string, string> } | null;
   /** 解析失败但存在的受管文件（定位问题；不阻断其它记录） */
   broken: { path: string; reason: string }[];
+  /** 读取失败（权限瞬断 / IO 错误）的文件数：>0 表示本轮扫描不完整，调用方须跳过删除检测 */
+  readFailures: number;
   paths: string[];
 }
 
 export async function scanVault(dir: DirHandle): Promise<VaultFileScan> {
-  const scan: VaultFileScan = { vocab: [], sentences: [], chats: [], materials: [], preference: null, broken: [], paths: [] };
+  const scan: VaultFileScan = { vocab: [], sentences: [], chats: [], materials: [], preference: null, broken: [], readFailures: 0, paths: [] };
   const files = await listFilesRecursive(dir);
   scan.paths = files;
   for (const f of files) {
-    const text = await readTextFile(dir, f.split('/'));
-    if (text === null) continue;
+    const read = await readTextFile(dir, f.split('/'));
+    if ('failed' in read) { scan.readFailures++; continue; }
+    if ('missing' in read) continue; // 扫描间隙被外部删除：合法缺失
+    const text = read.text;
     if (f.startsWith('对话/')) {
       scan.chats.push({ path: f, text });
       continue;
@@ -335,8 +355,11 @@ export async function readVocabRecordById(
     paths = (await listFilesRecursive(dir)).filter((f) => f.startsWith(`${targetDir}/`));
   }
   for (const p of paths) {
-    const text = await readTextFile(dir, p.split('/'));
-    if (text === null) continue;
+    const read = await readTextFile(dir, p.split('/'));
+    if ('missing' in read) continue;
+    // 读取失败≠不存在：抛错让调用方（flush）走 catch 保留待办，不当新文件覆盖丢三方合并 base
+    if ('failed' in read) throw new Error(`vault read failed: ${p}`);
+    const text = read.text;
     const parsed = parseVocabDocument(text);
     if ('error' in parsed) continue;
     if (parsed.id !== recordId) continue;
