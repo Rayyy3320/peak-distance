@@ -262,7 +262,6 @@ export type ChatRequest = (
       quote?: QuoteRef | null;
       openPanel?: boolean;
     }
-  | { type: 'chatUpdateMaterial'; chatId: string; material: MaterialPayload }
   | { type: 'chatSetDraft'; chatId: string; draft: string }
   | { type: 'chatTakeQuote'; chatId: string }
   | { type: 'chatRetain'; chatId: string; messageId: string; retained: boolean }

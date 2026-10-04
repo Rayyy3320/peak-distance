@@ -639,15 +639,6 @@ export async function handleChatRequest(
       const r: ChatEnsureResult = { ok: true, chat: edit, panelOpened, sourceTabId: await sourceTabId() };
       return r;
     }
-    case 'chatUpdateMaterial': {
-      const material = parseMaterial(m.material);
-      if (!material) return bad('bad-payload', 'material');
-      const edit = await readChatEdit(windowId);
-      if (edit.id !== m.chatId || m.editId && m.editId !== edit.editId) return bad('stale-edit');
-      editChatMaterial(edit, { source: edit.source, material });
-      await writeChatEdit(windowId, edit);
-      return { ok: true, chat: edit };
-    }
     case 'chatSetDraft': {
       if (typeof m.chatId !== 'string' || typeof m.draft !== 'string') return bad('bad-payload');
       const edit = await readChatEdit(windowId);
