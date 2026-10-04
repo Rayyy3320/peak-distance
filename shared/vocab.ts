@@ -94,6 +94,8 @@ export interface VocabEntryRecord {
   key: string;
   /** 源语言（'und' = 待确认）；缺失 = 迁移前旧记录，待语言迁移赋值 */
   language?: LanguageTag;
+  /** 迁移追溯：语言迁移前的旧键（一次性，不再变化） */
+  legacyKey?: string;
   expression: string;
   kind: 'word' | 'phrase';
   status: VocabStatus;
@@ -284,6 +286,63 @@ export function shouldBackfill(
   context: Pick<ContextRecord, 'definition'> | undefined,
 ): boolean {
   return !!context && (context.definition === null || context.definition === undefined);
+}
+
+// ---- M11 语言迁移决策（spec 第 5 节；纯函数，regress 覆盖） ------------------------
+//
+// 证据规则（不足以证明的不得当英语）：
+//   视频语境 → 明确轨道语言（primary）；
+//   网页语境且有词典结果（youdao/cambridge 英汉词典命中）→ 英语；
+//   其余（ASCII 拼写、旧请求固定 en 等）→ 无证据。
+// 全部有证据且一致 → 归属该语言（无证据语境随词条）；
+// 证据冲突 → 按语境拆分（每语言一个新词条，无证据语境随最大组）；
+// 完全无证据 → 'und'（待确认：可查看／复习，不自动用于跨语言标记）。
+// 状态继承到每个拆分词条，避免丢失用户操作。
+
+export interface LegacyContextEvidence {
+  sourceType: 'web' | 'video';
+  trackLang?: string;
+  hasDictionaryResult?: boolean;
+}
+
+export type LegacyLanguagePlan =
+  | { kind: 'assign'; language: string }
+  | { kind: 'split'; groups: { language: string; contextIndexes: number[] }[] }
+  | { kind: 'none' };
+
+/** 单条语境的证据语言；无证据返回 null。 */
+export function legacyContextLanguage(c: LegacyContextEvidence): string | null {
+  if (c.sourceType === 'video' && c.trackLang) {
+    const primary = c.trackLang.trim().toLowerCase().split('-')[0] ?? '';
+    if (/^[a-z]{2,3}$/.test(primary)) return primary;
+  }
+  if (c.sourceType === 'web' && c.hasDictionaryResult) return 'en';
+  return null;
+}
+
+export function planLegacyLanguage(
+  contexts: LegacyContextEvidence[],
+): LegacyLanguagePlan {
+  const langs = new Map<string, number[]>();
+  contexts.forEach((c, i) => {
+    const l = legacyContextLanguage(c);
+    if (l) {
+      const arr = langs.get(l) ?? [];
+      arr.push(i);
+      langs.set(l, arr);
+    }
+  });
+  if (!langs.size) return { kind: 'none' };
+  if (langs.size === 1) return { kind: 'assign', language: [...langs.keys()][0]! };
+  // 证据冲突：按语言分组拆分；无证据语境跟随最大组
+  const groups = [...langs.entries()]
+    .sort((a, b) => b[1].length - a[1].length)
+    .map(([language, indexes]) => ({ language, contextIndexes: [...indexes] }));
+  contexts.forEach((c, i) => {
+    if (!legacyContextLanguage(c)) groups[0]!.contextIndexes.push(i);
+  });
+  groups[0]!.contextIndexes.sort((a, b) => a - b);
+  return { kind: 'split', groups };
 }
 
 // ---- 词形关联（M3）：只存模型给出的明确关联，不后台批量调用 AI --------------

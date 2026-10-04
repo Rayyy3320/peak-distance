@@ -28,7 +28,8 @@ import {
   type QuoteRef,
 } from '@/shared/chat';
 import type { EntryView, SaveResult } from '@/shared/messages';
-import { effectiveEntryLanguage, normalizeLangTag } from '@/shared/languages';
+import { effectiveEntryLanguage, normalizeLangTag, entryKeyOf, parseEntryKey, LANG_UNDETERMINED } from '@/shared/languages';
+import { planLegacyLanguage } from '@/shared/vocab';
 import type { VaultIdentity, VaultPendingWrite, VaultStatus } from '@/shared/vault';
 
 const DB_NAME = 'blc-learning';
@@ -253,6 +254,25 @@ export async function listIndex(): Promise<VocabIndexItem[]> {
       status: e.status,
       forms: e.forms ?? [],
     }));
+  });
+}
+
+/** 个人笔记（M11：学习库“我的笔记”同源字段；空串清除）。 */
+export async function setEntryNote(key: string, note: string): Promise<boolean> {
+  return withDb(async (db) => {
+    const tx = db.transaction([ENTRIES], 'readwrite');
+    const store = tx.objectStore(ENTRIES);
+    const entry = (await px(store.get(key))) as VocabEntryRecord | undefined;
+    if (!entry) {
+      await txDone(tx);
+      return false;
+    }
+    if (note.trim()) entry.note = note.slice(0, 4000);
+    else delete entry.note;
+    entry.updatedAt = Date.now();
+    store.put(entry);
+    await txDone(tx);
+    return true;
   });
 }
 
@@ -829,5 +849,120 @@ export async function getVaultRaw<T>(key: string): Promise<T | null> {
     const r = (await px(tx.objectStore(VAULT).get(key))) as T | undefined;
     await txDone(tx);
     return r ?? null;
+  });
+}
+
+// ---- M11 语言迁移：旧词条按证据赋语言（spec 第 5 节） ------------------------------
+// 幂等：迁移后不再存在“裸键且无 language”的词条；键冲突时合并（不增副本）。
+// 旧键 → 新键映射存 vault store 'legacyMap'（可追溯）。
+
+export interface LanguageMigrationReport {
+  entriesScanned: number;
+  assigned: number;   // 单一证据语言
+  split: number;      // 跨语言语境拆分
+  undetermined: number; // 无证据 → 待确认
+  merged: number;     // 迁入已存在的同语言词条
+  sentencesBackfilled: number;
+}
+
+export async function migrateLegacyLanguages(): Promise<LanguageMigrationReport> {
+  const report: LanguageMigrationReport = {
+    entriesScanned: 0, assigned: 0, split: 0, undetermined: 0, merged: 0, sentencesBackfilled: 0,
+  };
+  return withDb(async db => {
+    const tx = db.transaction([ENTRIES, CONTEXTS, VAULT, 'sentences'], 'readwrite');
+    const entries = tx.objectStore(ENTRIES);
+    const contexts = tx.objectStore(CONTEXTS);
+    const vault = tx.objectStore(VAULT);
+
+    const allEntries = (await px(entries.getAll())) as VocabEntryRecord[];
+    const allContexts = (await px(contexts.getAll())) as ContextRecord[];
+    const byKey = new Map(allEntries.map(e => [e.key, e]));
+    const ctxsOf = (key: string) => allContexts.filter(c => c.entryKey === key);
+    const legacyMap: Record<string, string[]> = (await px(vault.get('legacyMap'))) as Record<string, string[]> ?? {};
+
+    for (const entry of allEntries) {
+      if (entry.language) continue;
+      if (parseEntryKey(entry.key)) continue; // 已是语言作用域键
+      report.entriesScanned++;
+      const ctxs = ctxsOf(entry.key);
+      const plan = planLegacyLanguage(
+        ctxs.map(c => ({
+          sourceType: c.sourceType ?? 'web',
+          ...(c.video?.trackLang ? { trackLang: c.video.trackLang } : {}),
+          ...(c.result?.kind === 'dictionary' ? { hasDictionaryResult: true } : {}),
+        })),
+      );
+
+      // 目标分组：assign/none 单组；split 多组
+      const groups: { language: string; indexes: number[] }[] =
+        plan.kind === 'split'
+          ? plan.groups.map(g => ({ language: g.language, indexes: g.contextIndexes }))
+          : [{ language: plan.kind === 'assign' ? plan.language : LANG_UNDETERMINED, indexes: ctxs.map((_, i) => i) }];
+      if (plan.kind === 'assign') report.assigned++;
+      else if (plan.kind === 'split') report.split++;
+      else report.undetermined++;
+
+      const newKeys: string[] = [];
+      for (const g of groups) {
+        const newKey = entryKeyOf(g.language, entry.expression);
+        newKeys.push(newKey);
+        const existing = byKey.get(newKey);
+        if (existing && existing !== entry) {
+          // 已有同语言词条：语境迁入，状态取较新的一方（不清空用户操作）
+          for (const i of g.indexes) {
+            const c = ctxs[i]!;
+            c.entryKey = newKey;
+            contexts.put(c);
+          }
+          const newer = existing.updatedAt >= entry.updatedAt ? existing : entry;
+          existing.status = newer.status;
+          existing.updatedAt = Date.now();
+          existing.forms = [...new Set([...existing.forms ?? [], ...(newer.forms ?? [])])];
+          if (entry.note && !existing.note) existing.note = entry.note;
+          entries.put(existing);
+          entries.delete(entry.key);
+          report.merged++;
+          continue;
+        }
+        if (existing === entry) continue; // 目标键恰为自身（不应发生：裸键）
+        const newEntry: VocabEntryRecord = {
+          ...entry,
+          key: newKey,
+          language: g.language,
+          legacyKey: entry.key,
+          updatedAt: Date.now(),
+        };
+        byKey.set(newKey, newEntry);
+        entries.put(newEntry);
+        for (const i of g.indexes) {
+          const c = ctxs[i]!;
+          c.entryKey = newKey;
+          contexts.put(c);
+        }
+        if (groups.length > 1) {
+          // 拆分组除最大组外复制状态；词条本体（forms/note）保留在首组
+          delete (newEntry as Partial<VocabEntryRecord>).forms;
+        }
+      }
+      if (newKeys.length > 1 || newKeys[0] !== entry.key) entries.delete(entry.key);
+      legacyMap[entry.key] = newKeys;
+    }
+
+    // 旧句子收藏：语言 = 轨道语言
+    const sentenceStore = tx.objectStore('sentences');
+    const sentences = (await px(sentenceStore.getAll())) as SavedSentence[];
+    for (const s of sentences) {
+      if (s.language) continue;
+      const primary = (s.video.trackLang ?? '').trim().toLowerCase().split('-')[0] ?? '';
+      if (!/^[a-z]{2,3}$/.test(primary)) continue;
+      s.language = primary;
+      sentenceStore.put(s);
+      report.sentencesBackfilled++;
+    }
+
+    vault.put(legacyMap, 'legacyMap');
+    await txDone(tx);
+    return report;
   });
 }

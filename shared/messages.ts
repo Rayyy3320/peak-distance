@@ -73,6 +73,7 @@ export type BgcRequest =
   | { type: 'backfillResult'; contextId: number; result?: LearningResult; explanation?: ContextExplanation }
   | { type: 'backfillDefinition'; contextId: number; definition: string }
   | { type: 'setStatus'; key: string; status: VocabStatus } // 落到关联词条
+  | { type: 'setNote'; key: string; note: string } // 个人笔记（学习库“我的笔记”同源）
   | { type: 'deleteEntry'; key: string }
   | { type: 'removeForm'; key: string; form: string }
   | { type: 'listEntries'; query?: string; language?: string } // language: 'all'（缺省）| 语言标签 | 'und'

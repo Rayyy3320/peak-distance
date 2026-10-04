@@ -6,6 +6,7 @@ import { createTranslationPopup } from '@/shared/translationPopup';
 import { createLookupPopup } from '@/shared/lookupPopup';
 import { shadowSelection } from '@/shared/selection';
 import { buildMarkBuckets } from '@/shared/marker';
+import { effectiveEntryLanguage, isRtlLanguage, langDisplayName } from '@/shared/languages';
 import { segmentWords } from '@/shared/tokenize';
 // 侧栏三个视图：生词本（词条 / 上下文 / 词形关联管理）、字幕（当前标签页
 // 视频的原文列表 + 译文 + 播放控制）、复习（原句回忆，无 AI 调用）。
@@ -230,9 +231,17 @@ function renderEntry(entry: EntryView): HTMLElement {
 
   const head = el('div', 'entry-head');
   const expr = el('h2', 'expr', entry.expression);
+  const entryLang = effectiveEntryLanguage(entry);
+  if (entryLang && isRtlLanguage(entryLang)) expr.dir = 'rtl';
   head.appendChild(expr);
   const kind = el('span', 'kind', entry.kind === 'word' ? '词' : '短语');
   head.appendChild(kind);
+  // 语言徽标：缺失（迁移前旧记录）不显示，不冒充任何语言
+  if (entryLang) {
+    const chip = el('span', 'kind', langDisplayName(entryLang));
+    chip.title = entryLang;
+    head.appendChild(chip);
+  }
 
   const sel = el('select', 'status') as HTMLSelectElement;
   for (const s of ['saved', 'learning', 'known'] as const) {
@@ -261,8 +270,30 @@ function renderEntry(entry: EntryView): HTMLElement {
   card.appendChild(head);
 
   const first=entry.contexts[0];
-  const meaning=first?.result?.kind==='dictionary'?first.result.entry.senses[0]?.definition:first?.result?.kind==='translation'?first.result.text:first?.definition;
+  const meaning=first?.result?.kind==='dictionary'?first.result.entry.senses[0]?.definition:first?.result?.kind==='translation'?first.result.text:first?.result?.kind==='ai-definition'?first.result.text.split('\n')[0]:first?.definition;
   if(meaning)card.append(el('p','entry-preview',meaning));
+
+  // 个人笔记（学习库“我的笔记”同源；就地编辑，正常保存给就近状态）
+  const noteBox = el('details', 'note-box');
+  const noteSummary = el('summary', undefined, entry.note ? '我的笔记' : '添加笔记');
+  noteBox.appendChild(noteSummary);
+  const noteArea = document.createElement('textarea');
+  noteArea.value = entry.note ?? '';
+  noteArea.placeholder = '写下自己的理解（同步到学习库“我的笔记”，Obsidian 中可直接编辑）';
+  noteArea.setAttribute('aria-label', `${entry.expression} 我的笔记`);
+  const noteState = el('p', 'hint');
+  const noteSave = el('button', 'ghost', '保存笔记');
+  noteSave.addEventListener('click', async () => {
+    noteSave.disabled = true;
+    const r = await send<{ ok: boolean }>({ type: 'setNote', key: entry.key, note: noteArea.value });
+    noteSave.disabled = false;
+    noteState.textContent = r?.ok ? '已保存' : '保存失败，请重试';
+    if (r?.ok) noteSummary.textContent = noteArea.value.trim() ? '我的笔记' : '添加笔记';
+  });
+  const noteRow = el('div', 'note-actions');
+  noteRow.append(noteSave, noteState);
+  noteBox.append(noteArea, noteRow);
+  card.appendChild(noteBox);
 
   // 词形关联：查看 + 移除错误关联
   if (entry.forms.length) {
@@ -292,6 +323,7 @@ function renderEntry(entry: EntryView): HTMLElement {
       const sense = result.entry.senses[result.selectedSense ?? 0];
       if (sense) box.appendChild(el('p', 'definition', `${result.entry.source === 'youdao' ? '有道' : '剑桥英汉'} · ${sense.partOfSpeech ?? ''} ${sense.definition}`));
     } else if (c.result?.kind === 'translation') box.appendChild(el('p', 'definition', `翻译 · ${c.result.text}`));
+    else if (c.result?.kind === 'ai-definition') box.appendChild(el('p', 'definition', `AI 释义 · ${c.result.text}`));
     if (c.explanation) box.appendChild(el('p', 'definition', `AI 语境解释 · ${c.explanation.text}`));
     else if (c.definition) box.appendChild(el('p', 'definition', `已存语境释义 · ${c.definition}`));
     details.appendChild(box);
@@ -313,17 +345,39 @@ async function refresh(): Promise<void> {
     list.appendChild(el('div', 'empty', '加载失败，请重试'));
     return;
   }
-  if (r.entries.length === 0) {
+  // 语言筛选：全部 / 待确认 / 出现过的语言（记住选择，spec 3.4）
+  const filter = document.getElementById('lang-filter') as HTMLSelectElement;
+  const langs = [...new Set(r.entries.map((e) => effectiveEntryLanguage(e)).filter((l): l is string => !!l))].sort();
+  const wanted = localStorage.getItem('blc-lang-filter') ?? 'all';
+  if (filter.dataset.langs !== langs.join(',')) {
+    filter.dataset.langs = langs.join(',');
+    const current = wanted;
+    filter.replaceChildren();
+    const all = el('option', undefined, '全部语言'); all.value = 'all'; filter.appendChild(all);
+    const und = el('option', undefined, '待确认'); und.value = 'und'; filter.appendChild(und);
+    for (const l of langs) {
+      if (l === 'und') continue;
+      const o = el('option', undefined, langDisplayName(l)); o.value = l; filter.appendChild(o);
+    }
+    filter.value = [...filter.options].some((o) => o.value === current) ? current : 'all';
+  }
+  const filtered = filter.value === 'all' ? r.entries : r.entries.filter((e) => effectiveEntryLanguage(e) === filter.value);
+  if (filtered.length === 0) {
     list.appendChild(
-      el('div', 'empty', q ? '没有匹配的表达' : '还没有收藏的表达。在网页上选中一个词或短语，点击“查词”开始。'),
+      el('div', 'empty', q ? '没有匹配的表达' : filter.value !== 'all' ? '该语言暂无词条' : '还没有收藏的表达。在网页上选中一个词或短语，点击“查词”开始。'),
     );
     return;
   }
-  for (const e of r.entries) list.appendChild(renderEntry(e));
+  for (const e of filtered) list.appendChild(renderEntry(e));
   currentMain()?.scrollTo(0,savedScroll[currentView]??0);
 }
 
 document.getElementById('search')!.addEventListener('input', () => void refresh());
+document.getElementById('lang-filter')!.addEventListener('change', () => {
+  const filter = document.getElementById('lang-filter') as HTMLSelectElement;
+  localStorage.setItem('blc-lang-filter', filter.value);
+  void refresh();
+});
 
 // ---- 字幕视图（当前标签页的视频） ---------------------------------------------------
 

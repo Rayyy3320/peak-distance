@@ -114,7 +114,7 @@ function vaultRecordToEntry(record: VaultVocabRecord, note: string): {
   };
 }
 
-function sentenceToVaultRecord(s: SavedSentence): VaultSentenceRecord {
+export function sentenceToVaultRecord(s: SavedSentence): VaultSentenceRecord {
   return {
     id: s.id,
     language: s.language ?? s.video.trackLang ?? 'und',

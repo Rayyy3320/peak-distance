@@ -12,6 +12,7 @@ import {
   normalizeExpressionInLanguage,
 } from '../shared/languages';
 import { wordAt, detectTextLanguage } from '../shared/tokenize';
+import { planLegacyLanguage } from '../shared/vocab';
 import { scanMarkHits, type MarkBucket } from '../shared/marker';
 // 离线回归检查（node 运行，无需浏览器）：
 //   1. M0 时序 A/B：捕获归属、换视频重置、跨视频旧响应丢弃。
@@ -818,6 +819,27 @@ console.log('M11 分词与标记命中');
   check('英语短语窗口命中', phHits.length === 1 && phHits[0]!.end - phHits[0]!.start === 'Take off'.length);
   check('中文词条命中', scanMarkHits('我们学习中文。', buckets).length === 1);
   check('无语言文本零标记', scanMarkHits('123', buckets).length === 0);
+}
+
+console.log('M11 旧数据语言迁移决策');
+{
+  const videoEn = { sourceType: 'video' as const, trackLang: 'en' };
+  const videoJa = { sourceType: 'video' as const, trackLang: 'ja' };
+  const webDict = { sourceType: 'web' as const, hasDictionaryResult: true };
+  const webPlain = { sourceType: 'web' as const };
+  const assign = planLegacyLanguage([videoEn, webPlain]);
+  check('轨道语言证据归属（无证据语境随词条）', assign.kind === 'assign' && assign.language === 'en');
+  const viaDict = planLegacyLanguage([webDict]);
+  check('词典命中是英语证据', viaDict.kind === 'assign' && viaDict.language === 'en');
+  const none = planLegacyLanguage([webPlain, { sourceType: 'web' as const }]);
+  check('无证据归待确认', none.kind === 'none');
+  const split = planLegacyLanguage([videoEn, videoJa, webPlain, videoJa]);
+  check('跨语言语境拆分成两组', split.kind === 'split' && split.groups.length === 2);
+  if (split.kind === 'split') {
+    const ja = split.groups.find(g => g.language === 'ja')!;
+    check('无证据语境随最大组', ja.contextIndexes.length === 3 && ja.contextIndexes.includes(2));
+  }
+  check('旧请求固定语言不是证据', planLegacyLanguage([{ sourceType: 'web' as const }]).kind === 'none');
 }
 
 console.log(`\n通过 ${passed}，失败 ${failed}`);

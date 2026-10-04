@@ -22,13 +22,14 @@ import {
   removeForm,
   resolveEntry,
   saveSnapshot,
+  setEntryNote,
   setStatus,
 } from '@/lib/db';
 import { lookupExpression, translateSentences } from '@/lib/aiClient';
 import { getAiConfig } from '@/lib/aiTransport';
 import { aiCacheScope, isAiProvider, validateAiProfile } from '@/shared/aiConfig';
 import { handleChatRequest, initChatService } from '@/lib/chatService';
-import { getVaultIdentity, getVaultStatus } from '@/lib/db';
+import { getVaultIdentity, getVaultStatus, migrateLegacyLanguages } from '@/lib/db';
 import {
   adoptVault,
   disconnectVault,
@@ -37,6 +38,7 @@ import {
   enqueueVocabWrite,
   entryViewToVaultRecord,
   flushVaultWrites,
+  sentenceToVaultRecord,
   syncFromVault,
 } from '@/lib/vault/sync';
 import { isLanguageTag, normalizeLangTag } from '@/shared/languages';
@@ -399,6 +401,24 @@ async function handle(
       const ok = await setStatus(target, m.status);
       if (!ok) return bad('not-found');
       broadcast({ type: 'vocab-changed' });
+      // 状态是学习库受管字段：连接时排队写回
+      queueVaultWriteAfterSave(async () => {
+        const entry = await getEntry(target);
+        if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
+      });
+      return { ok: true };
+    }
+    case 'setNote': {
+      const key = typeof m.key === 'string' ? normalizeExpression(m.key) : '';
+      if (!key || typeof m.note !== 'string' || m.note.length > 4000) return bad('bad-payload');
+      const target = (await resolveEntry(key))?.key ?? key;
+      const ok = await setEntryNote(target, m.note);
+      if (!ok) return bad('not-found');
+      broadcast({ type: 'vocab-changed' });
+      queueVaultWriteAfterSave(async () => {
+        const entry = await getEntry(target);
+        if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
+      });
       return { ok: true };
     }
     case 'deleteEntry': {
@@ -556,6 +576,25 @@ export default defineBackground(() => {
     .setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
     .catch(() => {});
 
+  // M11 语言迁移（幂等）：旧词条按证据赋语言；有变化时补写学习库。
+  void (async () => {
+    try {
+      const report = await migrateLegacyLanguages();
+      if (report.entriesScanned || report.sentencesBackfilled) {
+        broadcast({ type: 'vocab-changed' });
+        broadcast({ type: 'sentences-changed' });
+        if (await getVaultIdentity()) {
+          for (const e of await listEntries()) await enqueueVocabWrite(entryViewToVaultRecord(e));
+          for (const s of await listSentences()) await enqueueSentenceWrite(sentenceToVaultRecord(s));
+          await flushVaultWrites();
+          broadcast({ type: 'vault-changed' });
+        }
+      }
+    } catch (e) {
+      console.warn('[blc] language migration failed', e);
+    }
+  })();
+
   // M5 问答：侧栏长连接（发送 / 停止 / 重试 / 流事件广播）
   initChatService();
   initPanelLifecycle();
@@ -565,6 +604,10 @@ export default defineBackground(() => {
     if (area !== 'local') return;
     if ('cacheLimit' in changes) void trimCache();
     if (Object.keys(changes).some(k => k in DEFAULT_SETTINGS)) broadcast({ type: 'settings-changed' });
+    // 语言偏好双向生效：设置变化即排队写回 偏好.md（幂等键，重复无害）
+    if ('defaultComprehensionLang' in changes || 'comprehensionOverrides' in changes) {
+      queueVaultWriteAfterSave(() => enqueuePreferenceWrite());
+    }
     const activeProfile = (raw: unknown) => {const value=raw as {active?:string;profiles?:Record<string,unknown>}|undefined;return [value?.active,value?.profiles?.[value?.active??'']];};
     if (changes.deepseekApiKey || changes.aiServices && JSON.stringify(activeProfile(changes.aiServices.oldValue)) !== JSON.stringify(activeProfile(changes.aiServices.newValue))) broadcast({type:'ai-service-changed'});
   });
