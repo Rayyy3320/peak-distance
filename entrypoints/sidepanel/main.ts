@@ -415,8 +415,9 @@ const videoWorkspace=createYoutubeWorkspace({
         if(!raw)return null;
         const lang=((cachedVideo?.trackLang||subsState?.trackLang)||'en').split('-')[0]!;
         const cls=classifySelection(raw,lang);
+        // 有效表达对所有分类计算：词/短语整体为查词表达，句段用作翻译卡的首尾清洗
         let expression:string|null=null;
-        if(cls.kind!=='sentence'){
+        {
           const offsets=rangeOffsetsIn(en,clamped);
           if(offsets&&offsets.start<=offsets.end&&offsets.end<=offsets.text.length)
             expression=effectiveLookupExpression(offsets.text,offsets.start,offsets.end,lang)?.expression??null;
@@ -470,7 +471,8 @@ const videoWorkspace=createYoutubeWorkspace({
       const selectedVideo=subsState.videoId,selectedCue=subsState.cues[info.firstIndex];
       const candidate=listSelectionCandidate(info);
       if(candidate)void send({type:'selectionCandidateSet',tabId:subsTabId??undefined,candidate});
-      const snapshot={text:info.raw,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue?.startMs??0)};
+      // 词/短语翻译用补全/清洗后的有效表达；句段/跨行保持实际选文
+      const snapshot={text:info.expression??info.raw,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue?.startMs??0)};
       // 分类表：word=查词+对话；phrase=查词+翻译+对话；sentence/cross-cue=翻译+对话
       if(info.kind!=='word'){
         const translate=el('button',undefined,'翻译');translate.onmousedown=e=>e.preventDefault();translate.onclick=()=>{buttons.remove();selectionPopup.open(snapshot,rect);};buttons.append(translate);

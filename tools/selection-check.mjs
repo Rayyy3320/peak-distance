@@ -151,6 +151,28 @@ check('A4 句段分类：隐藏查词，保留翻译与添加', await page.evalu
   return root.querySelector('#translate').hidden === false && root.querySelector('#chat').hidden === false;
 }));
 
+// A4b 词/短语翻译卡片使用补全+清洗后的正常表达（残缺词补齐、去词外标点）
+await selectText('#p1', p1Text.indexOf('teady'), p1Text.indexOf('pace.') + 5); // teady pace.
+await page.waitForFunction(() => document.getElementById('blc-lookup-pill')?.shadowRoot?.querySelector('#translate')?.hidden === false, null, { timeout: 4000 });
+await page.click('#translate');
+await page.waitForSelector('#pd-translation #original');
+check('A4b 翻译卡片展示补全/清洗后的表达：teady pace. → steady pace',
+  await page.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent === 'steady pace'),
+  await page.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent));
+await page.getByRole('button', { name: '关闭翻译' }).click();
+await page.waitForFunction(() => !document.getElementById('pd-translation'));
+
+// A4c 句段选区（含内部句界）：翻译卡同样清洗首尾（残缺词补齐；内部保持原文）
+await selectText('#p1', p1Text.indexOf('teady'), p1Text.indexOf('. The') + 4); // teady pace. Th
+await page.waitForFunction(() => document.getElementById('blc-lookup-pill')?.shadowRoot?.querySelector('#lookup')?.hidden === true, null, { timeout: 4000 });
+await page.click('#translate');
+await page.waitForSelector('#pd-translation #original');
+check('A4c 句段翻译卡清洗首尾：teady pace. Th → steady pace. The（内部句号保留）',
+  await page.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent === 'steady pace. The'),
+  await page.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent));
+await page.getByRole('button', { name: '关闭翻译' }).click();
+await page.waitForFunction(() => !document.getElementById('pd-translation'));
+
 // X1/X2 X 形态页（推文正文 div[dir=auto]、hashtag span，无语义标签）：
 // 历史根因复现——标签清单式块检测在此取不到块，所有选区被当作句段、
 // 残缺词原样上翻译卡。通用内联链检测后应与语义页同规则。
@@ -185,6 +207,19 @@ await xpage.evaluate(() => {
   [...card.querySelectorAll('button')].find((b) => b.textContent === '关闭')?.click();
 });
 await xpage.waitForFunction(() => !document.getElementById('blc-lookup-popup'));
+
+// X2 跨省略号句段（用户报障场景）：翻译卡清洗首尾
+await xSelect(0, 16); // Seriously.... wh
+await xpage.waitForFunction(() => {
+  const root = document.getElementById('blc-lookup-pill')?.shadowRoot;
+  return root && root.querySelector('#lookup')?.hidden === true && root.querySelector('#translate')?.hidden === false;
+}, null, { timeout: 4000 });
+await xpage.click('#translate');
+await xpage.waitForSelector('#pd-translation #original');
+check('X2 X 句段翻译卡清洗首尾：Seriousl.... wh → Seriously.... what',
+  await xpage.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent === 'Seriously.... what'),
+  await xpage.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent));
+await xpage.getByRole('button', { name: '关闭翻译' }).click();
 await xpage.close();
 
 // 面板：以 iframe 注入页面（复刻浮动模式——页面与面板同可见、同活动标签页）；
@@ -470,12 +505,34 @@ await yt.evaluate(() => {
   [...card.querySelectorAll('button')].find((b) => b.textContent === '关闭')?.click();
 });
 
+// B3b 字幕短语翻译卡片同样使用补全后的表达（went ho → went home）
+await barSelect(4, 11);
+await yt.waitForSelector('#pd-phrase-actions');
+await yt.locator('#pd-phrase-actions').getByRole('button', { name: '翻译', exact: true }).click();
+await yt.waitForSelector('#pd-translation #original');
+check('B3b 字幕翻译卡片展示补全表达：went ho → went home',
+  await yt.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent === 'went home'),
+  await yt.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent));
+await yt.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#close')?.click());
+await yt.waitForFunction(() => !document.getElementById('pd-translation'));
+
 // B4 句段（整句 7 词）：无查词，翻译+添加
 await yt.evaluate(() => { document.querySelector('video').currentTime = 9.5; });
 await yt.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent.startsWith('they finally'));
 await barSelect(0, 100);
 await yt.waitForSelector('#pd-phrase-actions');
 check('B4 播放器句段：隐藏查词', await yt.evaluate(() => document.getElementById('pd-phrase-actions')?.shadowRoot?.querySelector('#lookup').hidden === true));
+
+// B4b 句段残缺首尾：翻译卡补全首尾（hey…it al → they…all）
+await barSelect(2, 33);
+await yt.waitForSelector('#pd-phrase-actions');
+await yt.locator('#pd-phrase-actions').getByRole('button', { name: '翻译', exact: true }).click();
+await yt.waitForSelector('#pd-translation #original');
+check('B4b 字幕句段翻译卡补全首尾：hey… it al → they … it all',
+  await yt.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent === 'they finally decided to give it all'),
+  await yt.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#original')?.textContent));
+await yt.evaluate(() => document.getElementById('pd-translation')?.shadowRoot?.querySelector('#close')?.click());
+await yt.waitForFunction(() => !document.getElementById('pd-translation'));
 
 // B5 添加到对话：焦点+字幕项背景带时间，openPanel
 await yt.evaluate(() => { document.querySelector('video').currentTime = 5.5; });

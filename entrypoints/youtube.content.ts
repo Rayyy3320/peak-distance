@@ -597,8 +597,9 @@ export default defineContentScript({
       if (!cue || !currentVideoId || !lastTrackId) return null;
       const lang = baseLang(lastTrackLang) || 'en';
       const cls = classifySelection(raw, lang);
+      // 有效表达对所有分类计算：词/短语整体为查词表达，句段用作翻译卡的首尾清洗
       let expression: string | null = null;
-      if (cls.kind !== 'sentence') {
+      {
         const offsets = rangeOffsetsIn(en, clamped);
         if (offsets && offsets.start <= offsets.end && offsets.end <= offsets.text.length) {
           expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
@@ -652,7 +653,7 @@ export default defineContentScript({
       root.querySelector<HTMLElement>('#translate')!.hidden = info.kind === 'word';
       const rect = info.rect ?? undefined;
       root.querySelector('#lookup')!.addEventListener('click',()=>{host.remove();openLookup(info.expression ?? info.raw, info.cueIndex);});
-      root.querySelector('#translate')!.addEventListener('click',()=>{host.remove();popup.close();translationPopup.open({text:info.raw,url:videoContextUrl(currentVideoId,cues[info.cueIndex]?.start??0),title:document.title},rect);});
+      root.querySelector('#translate')!.addEventListener('click',()=>{host.remove();popup.close();translationPopup.open({text:info.expression??info.raw,url:videoContextUrl(currentVideoId,cues[info.cueIndex]?.start??0),title:document.title},rect);});
       root.querySelector('#chat')!.addEventListener('click',()=>{host.remove();popup.close();void attachSubtitleSelection(info);});
       host.addEventListener('mousedown',e=>e.preventDefault());
       // 选区形成即固定候选（面板进入/字幕重绘不清空）

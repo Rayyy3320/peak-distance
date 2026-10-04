@@ -109,10 +109,10 @@ export function createSelectionPill(deps: SelectionPillDeps) {
     if (!crossesBlock && startBlock) {
       const offsets = rangeOffsetsIn(startBlock, range);
       if (offsets && offsets.start <= offsets.end && offsets.end <= offsets.text.length) {
-        // 偏移基于块内原始文本（未做空白归一），补词与原句都用这份定位
-        if (cls.kind !== 'sentence') {
-          expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
-        }
+        // 偏移基于块内原始文本（未做空白归一），补词与原句都用这份定位。
+        // 有效表达对所有分类计算：词/短语整体为查词表达，句段用作翻译卡的
+        // 首尾清洗（补齐首尾残缺词、去词外标点；内部保持原文）。
+        expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
         sentence = sentenceContaining(offsets.text, offsets.start, offsets.end);
       }
     }
@@ -156,7 +156,9 @@ export function createSelectionPill(deps: SelectionPillDeps) {
         if (!info) return;
         dismissSelection();
         lookup.close();
-        translation.open({ text: info.raw, url: location.href, title: document.title }, info.rect);
+        // 卡片展示与翻译请求同一文本：词/短语/句段首尾均用补全/清洗后的
+        // 有效表达（残缺词补齐、去词外标点；句段内部保持原文）
+        translation.open({ text: info.expression ?? info.raw, url: location.href, title: document.title }, info.rect);
         remove();
       });
       const chat = document.createElement('button');
