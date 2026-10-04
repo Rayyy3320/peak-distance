@@ -28,12 +28,16 @@ import {
   type QuoteRef,
 } from '@/shared/chat';
 import type { EntryView, SaveResult } from '@/shared/messages';
+import { effectiveEntryLanguage, normalizeLangTag } from '@/shared/languages';
+import type { VaultIdentity, VaultPendingWrite, VaultStatus } from '@/shared/vault';
 
 const DB_NAME = 'blc-learning';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const ENTRIES = 'entries';
 const CONTEXTS = 'contexts';
 const CHATS = 'conversations';
+const VAULT = 'vault'; // 目录句柄 + 库身份（仅 background 读写）
+const VAULT_QUEUE = 'vaultQueue'; // 待写入学习库的队列（幂等键 id）
 
 function px<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -76,6 +80,10 @@ function openDb(): Promise<IDBDatabase> {
           };
         }
       }
+      // M11 v5：学习库句柄／身份（out-of-line 键 'handle'/'identity'）与待写入队列。
+      // 不迁移旧词条语言 —— 语言赋值由专门迁移批次按证据执行（spec 第 5 节）。
+      if (!db.objectStoreNames.contains(VAULT)) db.createObjectStore(VAULT);
+      if (!db.objectStoreNames.contains(VAULT_QUEUE)) db.createObjectStore(VAULT_QUEUE, { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -94,6 +102,7 @@ async function withDb<T>(fn: (db: IDBDatabase) => Promise<T>): Promise<T> {
 function toEntryView(e: VocabEntryRecord, contexts: ContextRecord[]): EntryView {
   return {
     key: e.key,
+    language: e.language,
     expression: e.expression,
     kind: e.kind,
     status: e.status,
@@ -210,15 +219,21 @@ export async function getEntry(key: string): Promise<EntryView | null> {
   });
 }
 
-export async function listEntries(query?: string): Promise<EntryView[]> {
+export async function listEntries(query?: string, language?: string): Promise<EntryView[]> {
   return withDb(async (db) => {
     const tx = db.transaction([ENTRIES, CONTEXTS], 'readonly');
     const entries = (await px(tx.objectStore(ENTRIES).getAll())) as VocabEntryRecord[];
     const contexts = (await px(tx.objectStore(CONTEXTS).getAll())) as ContextRecord[];
     await txDone(tx);
     const q = query?.trim().toLowerCase() ?? '';
+    // 语言筛选：'all'／缺省 = 全部；'und' = 待确认集合（已迁移、证据不足）。
+    // 迁移前旧记录（无语言）只在全部视图出现，不冒充任何语言。
+    const wantLang = !language || language === 'all' ? null : normalizeLangTag(language);
     return entries
-      .filter((e) => !q || e.key.includes(q) || e.expression.toLowerCase().includes(q))
+      .filter((e) => {
+        if (wantLang && effectiveEntryLanguage(e) !== wantLang) return false;
+        return !q || e.key.includes(q) || e.expression.toLowerCase().includes(q);
+      })
       .map((e) => toEntryView(e, contexts))
       .sort((a, b) => b.updatedAt - a.updatedAt);
   });
@@ -232,6 +247,7 @@ export async function listIndex(): Promise<VocabIndexItem[]> {
     await txDone(tx);
     return entries.map((e) => ({
       key: e.key,
+      language: e.language,
       expression: e.expression,
       status: e.status,
       forms: e.forms ?? [],
@@ -599,5 +615,127 @@ export async function deleteSentence(id: string): Promise<void> {
     const tx = db.transaction('sentences', 'readwrite');
     tx.objectStore('sentences').delete(id);
     await txDone(tx);
+  });
+}
+
+// ---- M11 学习库：句柄／身份／待写入队列（仅 background 读写） ---------------------
+// 句柄经 structured clone 存入 IDB（具体权限恢复行为以 V 探针实测为准），
+// 类型在 lib/vault/** 边界处收窄，这里按 unknown 保管。
+
+interface VaultStatusMeta {
+  lastCommitAt: number | null;
+  lastError: string | null;
+}
+
+export async function getVaultIdentity(): Promise<VaultIdentity | null> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = (await px(tx.objectStore(VAULT).get('identity'))) as VaultIdentity | undefined;
+    await txDone(tx);
+    return r ?? null;
+  });
+}
+
+export async function setVaultIdentity(identity: VaultIdentity): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(identity, 'identity');
+    await txDone(tx);
+  });
+}
+
+export async function clearVault(): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).clear(); // 断开：句柄与身份移除，不删除文件；待办按库身份保留在队列
+    await txDone(tx);
+  });
+}
+
+export async function getVaultHandle(): Promise<unknown> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = await px(tx.objectStore(VAULT).get('handle'));
+    await txDone(tx);
+    return r ?? null;
+  });
+}
+
+export async function setVaultHandle(handle: unknown): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(handle, 'handle');
+    await txDone(tx);
+  });
+}
+
+/** 本机事务提交成功后入队（幂等：同 id 覆盖，重试不重复导入）。 */
+export async function enqueueVaultWrite(write: VaultPendingWrite): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT_QUEUE, 'readwrite');
+    tx.objectStore(VAULT_QUEUE).put(write);
+    await txDone(tx);
+  });
+}
+
+export async function listVaultQueue(): Promise<VaultPendingWrite[]> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT_QUEUE, 'readonly');
+    const items = (await px(tx.objectStore(VAULT_QUEUE).getAll())) as VaultPendingWrite[];
+    await txDone(tx);
+    return items.sort((a, b) => a.queuedAt - b.queuedAt);
+  });
+}
+
+/** 写入成功后出队。 */
+export async function removeVaultWrite(id: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT_QUEUE, 'readwrite');
+    tx.objectStore(VAULT_QUEUE).delete(id);
+    await txDone(tx);
+  });
+}
+
+export async function markVaultWriteAttempt(id: string, error?: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction([VAULT_QUEUE, VAULT], 'readwrite');
+    const store = tx.objectStore(VAULT_QUEUE);
+    const write = (await px(store.get(id))) as VaultPendingWrite | undefined;
+    if (write) {
+      write.attempts = (write.attempts ?? 0) + 1;
+      write.lastError = error;
+      store.put(write);
+    }
+    const metaStore = tx.objectStore(VAULT);
+    const meta = (await px(metaStore.get('status'))) as VaultStatusMeta | undefined;
+    metaStore.put(
+      {
+        lastCommitAt: error ? (meta?.lastCommitAt ?? null) : Date.now(),
+        lastError: error ?? null,
+      },
+      'status',
+    );
+    await txDone(tx);
+  });
+}
+
+/** 面板／设置页展示的库状态；connected = 已持有句柄（权限在写入时验证）。 */
+export async function getVaultStatus(): Promise<VaultStatus> {
+  return withDb(async db => {
+    const tx = db.transaction([VAULT, VAULT_QUEUE], 'readonly');
+    const handle = await px(tx.objectStore(VAULT).get('handle'));
+    const identity = (await px(tx.objectStore(VAULT).get('identity'))) as
+      | VaultIdentity
+      | undefined;
+    const queue = (await px(tx.objectStore(VAULT_QUEUE).getAll())) as VaultPendingWrite[];
+    const meta = (await px(tx.objectStore(VAULT).get('status'))) as VaultStatusMeta | undefined;
+    await txDone(tx);
+    return {
+      connected: handle != null,
+      identity: identity ?? null,
+      pendingCount: queue.length,
+      lastCommitAt: meta?.lastCommitAt ?? null,
+      lastError: meta?.lastError ?? null,
+    };
   });
 }

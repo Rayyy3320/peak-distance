@@ -9,6 +9,8 @@ import type { LearningResult, ContextExplanation } from './vocab';
 // 指定标签页的 content script（字幕视图 / 播放控制），不经过 background。
 
 import type { LookupSnapshot, VocabIndexItem, VocabStatus } from './vocab';
+import type { LanguageTag } from './languages';
+import type { VaultIdentity, VaultStatus } from './vault';
 import type {
   ChatRecordView,
   MaterialPayload,
@@ -26,11 +28,31 @@ export type LookupErrorCode =
   | 'http'
   | 'bad-response';
 
+/**
+ * M11 查询意图（spec 3.3 路由表）：hover / preview / prefetch 一律不触发
+ * AI 兜底；缺省按 active（主动点击）处理（迁移前消息兼容）。
+ */
+export type LookupIntent = 'active' | 'hover' | 'preview' | 'prefetch';
+
 /** content script / 侧栏 / 设置页 → background 的请求。 */
 export type BgcRequest =
-  | { type: 'translateSelection'; text: string; requestId: string }
-  | { type: 'lookup'; snapshot: LookupSnapshot; source?: DictionarySource; requestId?: string }
-  | { type: 'explainContext'; snapshot: LookupSnapshot; requestId?: string }
+  | {
+      type: 'translateSelection';
+      text: string;
+      requestId: string;
+      sourceLang?: LanguageTag;
+      targetLang?: LanguageTag;
+    }
+  | {
+      type: 'lookup';
+      snapshot: LookupSnapshot; // 源语言在 snapshot.lang（'und' = 待确认）
+      source?: DictionarySource;
+      /** 理解语言（目标）；缺省用设置解析 */
+      targetLang?: LanguageTag;
+      intent?: LookupIntent;
+      requestId?: string;
+    }
+  | { type: 'explainContext'; snapshot: LookupSnapshot; targetLang?: LanguageTag; requestId?: string }
   | { type: 'cancelOnline'; requestId: string }
   | { type: 'subtitleMode'; videoId: string; mode?: 'regular' | 'ai'; autoPause?: boolean }
   | { type: 'saveSentence'; sentence: import('./vocab').SavedSentence }
@@ -53,7 +75,7 @@ export type BgcRequest =
   | { type: 'setStatus'; key: string; status: VocabStatus } // 落到关联词条
   | { type: 'deleteEntry'; key: string }
   | { type: 'removeForm'; key: string; form: string }
-  | { type: 'listEntries'; query?: string }
+  | { type: 'listEntries'; query?: string; language?: string } // language: 'all'（缺省）| 语言标签 | 'und'
   | { type: 'vocabIndex' } // 轻量索引：content script 标记用，不含上下文
   | { type: 'getSettings' } // 不含 key
   | { type: 'setSetting'; name: keyof Settings; value: Settings[keyof Settings] }
@@ -63,8 +85,16 @@ export type BgcRequest =
       requestId?: string;
       videoId: string;
       trackId: string;
+      sourceLang?: LanguageTag; // 原文轨道语言
+      targetLang?: LanguageTag; // 译文语言
       items: { id: number; text: string }[];
     }
+  // ---- M11 学习库（目录句柄与读写由 lib/vault/** 提供，background 只路由） ----
+  | { type: 'vaultConnect' } // 选择目录并授权（在探针证明的授权上下文执行）
+  | { type: 'vaultDisconnect' } // 断开：不删除文件，待办按库身份保留
+  | { type: 'vaultReauthorize' } // 重新授权现有目录
+  | { type: 'vaultStatus' }
+  | { type: 'vaultFlush' } // 立即尝试提交待写入队列
   | { type: 'openSettings' };
 
 export type OnlineLookupResult = { ok: true; result: LearningResult } | BgcError;
@@ -100,6 +130,8 @@ export interface ContextView {
 
 export interface EntryView {
   key: string;
+  /** 缺失 = 迁移前旧记录；'und' = 待确认集合（可筛选／复习） */
+  language?: LanguageTag;
   expression: string;
   kind: 'word' | 'phrase';
   status: VocabStatus;
@@ -132,6 +164,14 @@ export type SettingsView = Settings;
 
 export type GetSettingsResult = { ok: true; settings: SettingsView } | BgcError;
 
+// ---- M11 学习库消息结果 ----------------------------------------------------------
+
+export type VaultStatusResult = { ok: true; status: VaultStatus } | BgcError;
+export type VaultConnectResult =
+  | { ok: true; vault: VaultIdentity | null; imported: boolean } // imported = 首次连接合并了本机持久记录
+  | BgcError;
+export type VaultMutationResult = { ok: true } | BgcError;
+
 /**
  * background → 扩展页面与各标签页 content script 的广播。
  * 扩展页面走 runtime.sendMessage；content script 走 tabs.sendMessage
@@ -141,7 +181,9 @@ export type BroadcastEvent =
   | { type: 'ai-service-changed' }
   | { type: 'vocab-changed' }
   | { type: 'sentences-changed' }
-  | { type: 'settings-changed' };
+  | { type: 'settings-changed' }
+  /** 学习库状态变化：连接／断开、写入回执、读回变更（UI 刷新写入状态） */
+  | { type: 'vault-changed' };
 
 // ---- 标签页直达消息（侧栏 ↔ 视频页 content script） --------------------------
 
@@ -171,6 +213,8 @@ export type TabMessage = SubGetMessage | SubControlMessage;
 /** content script → 侧栏：字幕视图状态（非视频页 videoId 为空）。 */
 export interface SubViewState {
   chineseVisible?: boolean;
+  /** M11：当前译文语言（原文轨道 → 理解语言）；缺省视为中文（迁移前兼容） */
+  translationLang?: LanguageTag;
   type: 'blc-sub-state';
   videoId: string;
   title: string;

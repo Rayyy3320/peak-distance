@@ -28,6 +28,8 @@ import { lookupExpression, translateSentences } from '@/lib/aiClient';
 import { getAiConfig } from '@/lib/aiTransport';
 import { aiCacheScope, isAiProvider, validateAiProfile } from '@/shared/aiConfig';
 import { handleChatRequest, initChatService } from '@/lib/chatService';
+import { getVaultStatus } from '@/lib/db';
+import { isLanguageTag, normalizeLangTag } from '@/shared/languages';
 import {
   sentenceId,
   isVocabStatus,
@@ -59,6 +61,12 @@ function bad(error: string, detail?: string): BgcError {
   return { ok: false, error, detail };
 }
 
+/** M11 可选语言字段：undefined = 未提供（迁移前兼容）；null = 非法。 */
+function parseLangField(v: unknown): string | undefined | null {
+  if (v === undefined) return undefined;
+  return isLanguageTag(v) ? normalizeLangTag(v) : null;
+}
+
 function parseVideoRef(v: unknown): VideoRef | null {
   if (!v || typeof v !== 'object') return null;
   const s = v as Record<string, unknown>;
@@ -84,9 +92,16 @@ function parseSnapshot(v: unknown): LookupSnapshot | null {
   const s = v as Record<string, unknown>;
   if (typeof s.expression !== 'string' || !s.expression.trim()) return null;
   if (typeof s.sentence !== 'string') return null;
+  // M11：快照可带源语言（'und' = 待确认）；缺省 = 迁移前调用方。
+  let lang: string | undefined;
+  if (s.lang !== undefined) {
+    if (!isLanguageTag(s.lang)) return null;
+    lang = normalizeLangTag(s.lang);
+  }
   const base = {
     expression: s.expression.slice(0, MAX_EXPRESSION),
     sentence: s.sentence.slice(0, MAX_SENTENCE),
+    ...(lang ? { lang } : {}),
   };
   if (s.source === 'video') {
     if (typeof s.title !== 'string') return null;
@@ -140,6 +155,9 @@ function parseResult(v: unknown): LearningResult | undefined {
   if (r.kind === 'translation' && r.source === 'google-gtx' && typeof r.text === 'string') return r;
   if (r.kind === 'dictionary' && ['youdao', 'cambridge'].includes(r.entry?.source) && /^https:\/\//.test(r.entry.url) &&
       Array.isArray(r.entry.senses) && r.entry.senses.length && r.entry.senses.every(s => typeof s.definition === 'string')) return r;
+  // M11：AI 查词兜底结果（主动查词、词典明确未命中时；与语境解释区分）
+  if (r.kind === 'ai-definition' && r.source === 'ai' && typeof r.text === 'string' && r.text.length <= 6000 &&
+      isLanguageTag(r.lang?.source) && isLanguageTag(r.lang?.target)) return r;
   return undefined;
 }
 function parseExplanation(v: unknown): ContextExplanation | undefined {
@@ -168,11 +186,16 @@ async function handle(
     case 'translateSelection': {
       const error = selectionError(m.text);
       if (error || typeof m.requestId !== 'string') return bad('bad-payload', error ?? 'requestId');
+      const sourceLang = parseLangField(m.sourceLang);
+      const targetLang = parseLangField(m.targetLang);
+      if (sourceLang === null || targetLang === null) return bad('bad-payload', 'lang');
       const text = m.text!;
       const controller = new AbortController();
       const key = `${sender.tab?.id ?? sender.url}|${m.requestId}`;
       onlineRequests.set(key, controller);
-      try { return await cached(JSON.stringify(['translation','google-gtx','en-zh',text]), signal => translateRegularText(text,signal),controller.signal); }
+      // 缓存身份随语言对区分；未提供时沿用旧 'en-zh' 作用域（迁移前缓存兼容）。
+      const scope = sourceLang && targetLang ? `${sourceLang}|${targetLang}` : 'en-zh';
+      try { return await cached(JSON.stringify(['translation','google-gtx',scope,text]), signal => translateRegularText(text,signal),controller.signal); }
       finally { if(onlineRequests.get(key)===controller) onlineRequests.delete(key); }
     }
     case 'cancelOnline': {
@@ -195,11 +218,14 @@ async function handle(
     case 'saveSentence': {
       const s = m.sentence;
       const video = parseVideoRef(s?.video);
+      const language = parseLangField(s?.language);
       if (!s || !video || typeof s.text !== 'string' || !s.text.trim() || s.text.length > MAX_SENTENCE ||
-          typeof s.title !== 'string' || !Number.isFinite(s.endMs) || s.endMs < video.startMs) return bad('bad-payload');
+          typeof s.title !== 'string' || !Number.isFinite(s.endMs) || s.endMs < video.startMs || language === null) return bad('bad-payload');
       await saveSentence({ id: sentenceId(video, s.text), video, text: s.text, endMs: s.endMs, title: s.title.slice(0, MAX_TITLE),
         zh: typeof s.zh === 'string' ? s.zh.slice(0, MAX_SENTENCE) : undefined,
-        translationSource: typeof s.translationSource === 'string' ? s.translationSource.slice(0, 80) : undefined, createdAt: Date.now() });
+        translationSource: typeof s.translationSource === 'string' ? s.translationSource.slice(0, 80) : undefined,
+        ...(language ? { language } : {}),
+        createdAt: Date.now() });
       broadcast({ type: 'sentences-changed' });
       return { ok: true };
     }
@@ -226,6 +252,12 @@ async function handle(
     case 'lookup': {
       const snapshot = parseSnapshot(m.snapshot);
       if (!snapshot) return bad('bad-payload', 'snapshot');
+      // M11：理解语言与查询意图（路由表见 M11 spec 3.3；实际路由随 L 线程接入）。
+      if (m.targetLang !== undefined && !isLanguageTag(m.targetLang)) return bad('bad-payload', 'targetLang');
+      const intent = m.type === 'lookup' ? m.intent : undefined;
+      if (intent !== undefined && !['active', 'hover', 'preview', 'prefetch'].includes(intent)) {
+        return bad('bad-payload', 'intent');
+      }
       const controller = new AbortController();
       const requestKey = `${sender.tab?.id ?? sender.url}|${m.requestId}`;
       onlineRequests.set(requestKey, controller);
@@ -238,7 +270,8 @@ async function handle(
         const config = await getAiConfig();
         if (!config.apiKey) return bad('no-key');
         if (validateAiProfile(config)) return bad('invalid-config');
-        return await cached(JSON.stringify(['ai-context', aiCacheScope(config), 'en-zh', snapshot.expression, snapshot.sentence, neighbors]),
+        const aiScope = snapshot.lang && m.targetLang ? `${snapshot.lang}|${m.targetLang}` : 'en-zh';
+        return await cached(JSON.stringify(['ai-context', aiCacheScope(config), aiScope, snapshot.expression, snapshot.sentence, neighbors]),
           signal => lookupExpression(config, { expression: snapshot.expression, sentence: snapshot.sentence, neighbors }, signal), controller.signal);
       } finally { if (onlineRequests.get(requestKey) === controller) onlineRequests.delete(requestKey); }
     }
@@ -323,7 +356,11 @@ async function handle(
       if (m.query !== undefined && typeof m.query !== 'string') {
         return bad('bad-payload', 'query');
       }
-      return { ok: true, entries: await listEntries(m.query) };
+      // 语言筛选：'all'／缺省 = 全部；'und' = 待确认集合；其余为语言标签。
+      if (m.language !== undefined && m.language !== 'all' && !isLanguageTag(m.language)) {
+        return bad('bad-payload', 'language');
+      }
+      return { ok: true, entries: await listEntries(m.query, m.language) };
     }
     case 'vocabIndex': {
       const r: VocabIndexResult = { ok: true, items: await listIndex() };
@@ -361,6 +398,10 @@ async function handle(
         }
         items.push({ id: x.id, text: x.text.slice(0, MAX_CUE_TEXT) });
       }
+      const sourceLang = parseLangField(m.sourceLang);
+      const targetLang = parseLangField(m.targetLang);
+      if (sourceLang === null || targetLang === null) return bad('bad-payload', 'lang');
+      const langScope = sourceLang && targetLang ? `${sourceLang}|${targetLang}` : 'en-zh';
       const controller = new AbortController();
       const requestKey = `${sender.tab?.id ?? sender.url}|${m.requestId}`;
       onlineRequests.set(requestKey, controller);
@@ -372,7 +413,7 @@ async function handle(
           if (!config.apiKey) return bad('no-key');
           if (validateAiProfile(config)) return bad('invalid-config');
           const scope = aiCacheScope(config);
-          const textKey = (text: string) => JSON.stringify(['translation', scope, 'en-zh', text]);
+          const textKey = (text: string) => JSON.stringify(['translation', scope, langScope, text]);
           const translations: { id: number; text: string }[] = [];
           const missing: typeof items = [];
           for (const item of items) {
@@ -380,7 +421,7 @@ async function handle(
             if (hit) translations.push({ id: item.id, text: hit }); else missing.push(item);
           }
           if (missing.length) {
-            const key = JSON.stringify(['translation-batch', scope, 'en-zh', missing.map(i => i.text)]);
+            const key = JSON.stringify(['translation-batch', scope, langScope, missing.map(i => i.text)]);
             const r = await cached(key, signal => translateSentences(config, missing.map(i => i.text), signal), controller.signal);
             if (!r.ok && !translations.length) return r;
             if (r.ok) for (const t of r.translations) {
@@ -392,11 +433,23 @@ async function handle(
         }
         const translations: { id: number; text: string }[] = [];
         for (const item of items) {
-          const r = await cached(JSON.stringify(['translation', 'google-gtx', 'en-zh', item.text]), signal => translateRegularText(item.text, signal), controller.signal);
+          const r = await cached(JSON.stringify(['translation', 'google-gtx', langScope, item.text]), signal => translateRegularText(item.text, signal), controller.signal);
           if (r.ok) translations.push({ id: item.id, text: r.text });
         }
         return { ok: true, translations };
       } finally { if (onlineRequests.get(requestKey) === controller) onlineRequests.delete(requestKey); }
+    }
+    // ---- M11 学习库：状态真实读取；连接／授权／提交随 V 线程模块接入 -----
+    case 'vaultStatus': {
+      return { ok: true, status: await getVaultStatus() };
+    }
+    case 'vaultConnect':
+    case 'vaultReauthorize':
+    case 'vaultDisconnect':
+    case 'vaultFlush': {
+      // 目录选择与授权需要用户激活上下文（具体落点由 V 探针结果决定），
+      // 队列提交依赖 lib/vault/**；接入前明确报告，不伪造成功。
+      return bad('vault-module-pending', '学习库模块尚未接入');
     }
     case 'openSettings': {
       return handlePanelMessage({type:'panelOpen',view:'settings'},sender,nativeOpen);

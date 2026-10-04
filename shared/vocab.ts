@@ -1,12 +1,28 @@
 import type { DictionaryEntry } from '@/lib/onlineDictionary';
+import { entryKeyOf, normalizeExpressionInLanguage, type LanguageTag } from './languages';
 
 // 词汇与上下文的纯逻辑：类型、规范化、去重判定、词形关联。
 // background 的 IndexedDB 写入与 tools/regress.ts 共用，保证事务里执行的
 // 决策与离线回归检查的是同一套逻辑。
+//
+// M11 起词条带语言身份（shared/languages.ts 是唯一落点）：
+// - 新记录键为 `${lang}::${表达}`，language 字段与键一致；
+// - 无 language 字段且键无 '::' 的是迁移前旧记录，运行时按现状处理，
+//   语言由迁移批次按证据赋值（不清库、不盲目标英语）。
 
 export type LearningResult =
   | { kind: 'dictionary'; entry: DictionaryEntry; selectedSense?: number }
-  | { kind: 'translation'; source: 'google-gtx'; text: string };
+  | { kind: 'translation'; source: 'google-gtx'; text: string }
+  // M11 AI 查词兜底的结果（主动查词、词典明确未命中时）；与 ai-context 语境解释、
+  // 普通译文可区分。lang 记录请求时的语言对快照。
+  | {
+      kind: 'ai-definition';
+      source: 'ai';
+      text: string;
+      lang: { source: LanguageTag; target: LanguageTag };
+      provider?: import('./aiConfig').AiProvider;
+      model?: string;
+    };
 
 export interface ContextExplanation {
   kind: 'ai-context'; source: 'deepseek' | 'ai'; provider?: import('./aiConfig').AiProvider; model?: string; text: string; sentence: string; neighbors?: string;
@@ -27,6 +43,8 @@ export interface WebSnapshot {
   sentence: string;
   url: string;
   title: string;
+  /** 内容源语言（局部判断产物）；缺省 = 调用方未提供（迁移前行为），'und' = 待确认 */
+  lang?: LanguageTag;
 }
 
 /** 视频字幕轨道身份 + 起始毫秒。UI / URL 的秒数只在边界处转换。 */
@@ -48,6 +66,8 @@ export interface VideoSnapshot {
   neighbors?: string;
   video: VideoRef;
   title: string;
+  /** 内容源语言；缺省时视频侧默认取 video.trackLang */
+  lang?: LanguageTag;
 }
 
 export type LookupSnapshot = WebSnapshot | VideoSnapshot;
@@ -61,6 +81,8 @@ export interface SavedSentence {
   endMs: number;
   title: string;
   createdAt: number;
+  /** 原文语言（默认 video.trackLang）；'und' = 待确认 */
+  language?: LanguageTag;
 }
 
 export function sentenceId(video: VideoRef, text: string): string {
@@ -70,6 +92,8 @@ export function sentenceId(video: VideoRef, text: string): string {
 /** IndexedDB entries 记录（key 为规范化键）。forms 为关联词形（规范化后）。 */
 export interface VocabEntryRecord {
   key: string;
+  /** 源语言（'und' = 待确认）；缺失 = 迁移前旧记录，待语言迁移赋值 */
+  language?: LanguageTag;
   expression: string;
   kind: 'word' | 'phrase';
   status: VocabStatus;
@@ -172,7 +196,11 @@ export function planSave(
   opts: { status?: VocabStatus; definition?: string; now?: number },
 ): SavePlan | null {
   const raw = collapseWhitespace(snapshot.expression);
-  const key = existingEntry?.key ?? normalizeExpression(raw);
+  // 语言作用域键：同一表达在不同语言是不同词条（M11 L2）。
+  // 快照无 lang 时沿用旧键格式（迁移前调用方 / 旧消息兼容）。
+  const key =
+    existingEntry?.key ??
+    (snapshot.lang ? entryKeyOf(snapshot.lang, raw) : normalizeExpression(raw));
   if (!key) return null;
   const now = opts.now ?? Date.now();
 
@@ -184,6 +212,7 @@ export function planSave(
   } else {
     entry = {
       key,
+      language: snapshot.lang, // 可能是 'und'（待确认，收藏不被语言不确定阻断）
       expression: raw, // 保留原始大小写
       kind: expressionKind(raw),
       status: opts.status ?? 'saved',
@@ -260,6 +289,8 @@ export function shouldBackfill(
 /** 词汇轻量索引项（content script 标记 / 关联解析用，不含上下文）。 */
 export interface VocabIndexItem {
   key: string;
+  /** 缺失 = 迁移前旧记录：标记按现状处理，不套用到其它语言的同形词 */
+  language?: LanguageTag;
   expression: string;
   status: VocabStatus;
   forms: string[];
@@ -294,12 +325,15 @@ export function buildFormIndex(items: FormIndexInput[]): Map<string, string> {
 /**
  * 表面词形 → 词条键：精确词条优先；否则查唯一的词形关联；
  * 冲突或无关联返回 null（保留独立表达）。
+ * lang 提供时按该语言规范化（如土耳其语大小写）；缺省沿用旧规范化
+ *（迁移前调用方兼容）。跨语言的同形词靠语言作用域键天然分离。
  */
 export function resolveEntryKey(
   items: FormIndexInput[],
   surface: string,
+  lang?: LanguageTag,
 ): string | null {
-  const key = normalizeExpression(surface);
+  const key = lang ? normalizeExpressionInLanguage(surface, lang) : normalizeExpression(surface);
   if (!key) return null;
   if (items.some((it) => it.key === key)) return key;
   const formIndex = buildFormIndex(items);
@@ -309,16 +343,19 @@ export function resolveEntryKey(
 /**
  * 词条 forms 合并决策：新词形来自同次释义结果；以下情况不并入 ——
  * 已是某词条自身的键（保留独立表达）、已被其它词条声明（冲突）。
+ * lang 提供时按该语言规范化（词形关联限同一语言，M11 spec 3.4）；
+ * 缺省沿用旧规范化（迁移前调用方兼容）。
  */
 export function planForms(
   selfKey: string,
   existingForms: string[],
   incoming: string[],
   occupied: { isEntryKey: (k: string) => boolean; ownerOf: (f: string) => string | undefined },
+  lang?: LanguageTag,
 ): string[] {
   const merged = [...existingForms];
   for (const raw of incoming) {
-    const f = normalizeExpression(raw);
+    const f = lang ? normalizeExpressionInLanguage(raw, lang) : normalizeExpression(raw);
     if (!f || f === selfKey) continue;
     if (merged.includes(f)) continue;
     if (occupied.isEntryKey(f)) continue; // 它自己是独立词条
