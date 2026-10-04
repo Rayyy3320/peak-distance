@@ -387,6 +387,26 @@ document.getElementById('lang-filter')!.addEventListener('change', () => {
 let subsState: SubViewState | null = null;
 let subsTabId: number | null = null;
 let cachedVideo: WorkspaceState | null=null;
+// 字幕视图轮询分快慢路径：快路径（1s）只做 blc-sub-get 与译文/当前句/提示的
+// 轻量更新，签名不变直接跳过；慢路径（视频身份变化立即，平时 ≥5s 一次，或
+// vocab/sentences 广播置脏）才做三连 IDB 拉取与 statuses/sentences/entries 重建。
+let subsLibraryDirty=true;
+let subsLibraryAt=0;
+const SUBS_LIBRARY_INTERVAL_MS=5000;
+let subsSignatureCached='';
+const subsSignature=(s:SubViewState)=>`${s.videoId}:${s.trackId}:${s.cues.length}:${s.currentIndex}:${s.cues.reduce((n,c)=>n+(c.zh?1:0),0)}:${s.notice}:${s.chineseVisible!==false}`;
+function rebuildCachedVideo(state:SubViewState,library?:{cues?:WorkspaceState['cues'];statuses:WorkspaceState['statuses'];sentences:WorkspaceState['sentences'];entries:WorkspaceState['entries']}):WorkspaceState{
+  const cues=library?.cues??(cachedVideo&&cachedVideo.videoId===state.videoId&&cachedVideo.videoRef.trackId===state.trackId&&cachedVideo.cues.length===state.cues.length
+    ?cachedVideo.cues
+    :state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0})));
+  return {videoId:state.videoId,videoRef:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:0},
+    trackLang:state.trackLang||undefined,
+    cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),
+    statuses:library?.statuses??cachedVideo?.statuses??new Map<string,string>(),
+    sentences:library?.sentences??cachedVideo?.sentences??[],
+    entries:library?.entries??cachedVideo?.entries??[],
+    notice:state.notice,chinese:state.chineseVisible!==false};
+}
 const videoWorkspace=createYoutubeWorkspace({
   bindWords:host=>{
     const events=host.shadowRoot!;
@@ -519,6 +539,18 @@ async function videoAction(action:string,index:number,word?:string,play?:boolean
   if(!r?.ok)feedback('视频操作失败，请回到原视频重试');
   else await pollSubs();
 }
+async function refreshSubsLibrary(state:SubViewState):Promise<void> {
+  subsLibraryAt=Date.now();subsLibraryDirty=false;
+  const [vocab,saved,index]=await Promise.all([send<{ok:boolean;entries:EntryView[]}>({type:'listEntries'}),send<{ok:boolean;sentences:SavedSentence[]}>({type:'listSentences'}),send<{ok:boolean;items:import('@/shared/vocab').VocabIndexItem[]}>({type:'vocabIndex'})]);
+  if(currentView!=='subs'||subsState!==state)return;
+  const stable=<T>(old:T,next:T):T=>JSON.stringify(old)===JSON.stringify(next)?old:next;
+  const cues=state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0}));
+  cachedVideo=rebuildCachedVideo(state,{
+    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,
+    statuses:buildMarkBuckets(index?.items??[]).get((state.trackLang||'en').split('-')[0]!)?.statusByKey??new Map<string,string>(),
+    sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[])});
+  videoWorkspace.update(cachedVideo);
+}
 async function pollSubs():Promise<void> {
   if(currentView!=='subs'||!activePanel)return;
   const tab=(await browser.tabs.query({active:true,currentWindow:true}))[0];
@@ -526,7 +558,10 @@ async function pollSubs():Promise<void> {
   const id=tab.id;
   const st=await tabSend<SubViewState>(id,{type:'blc-sub-get'});
   if(currentView!=='subs')return;
-  if(subsTabId!==id||subsState?.videoId!==st?.videoId){lookupPopup.close();selectionPopup.close();document.getElementById('panel-selection-actions')?.remove();}
+  const switched=subsTabId!==id||subsState?.videoId!==st?.videoId;
+  if(switched){lookupPopup.close();selectionPopup.close();document.getElementById('panel-selection-actions')?.remove();}
+  // 换轨道不清浮层，但词表按轨道语言分桶，也算身份变化要重建
+  if(switched||(subsState?.trackId??'')!==(st?.trackId??''))subsLibraryDirty=true;
   subsTabId=id;subsState=st?.type==='blc-sub-state'?st:null;
   document.getElementById('video-workspace')!.hidden=!subsState?.videoId;
   const web=document.getElementById('web-selection')!;web.hidden=!!subsState?.videoId;
@@ -540,15 +575,16 @@ async function pollSubs():Promise<void> {
     return;
   }
   const state=subsState;
-  const [vocab,saved,index]=await Promise.all([send<{ok:boolean;entries:EntryView[]}>({type:'listEntries'}),send<{ok:boolean;sentences:SavedSentence[]}>({type:'listSentences'}),send<{ok:boolean;items:import('@/shared/vocab').VocabIndexItem[]}>({type:'vocabIndex'})]);
-  if(currentView!=='subs'||subsState!==state)return;
-  const cues=state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0}));
-  const stable=<T>(old:T,next:T):T=>JSON.stringify(old)===JSON.stringify(next)?old:next;
-  cachedVideo={videoId:state.videoId,videoRef:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:0},
-    trackLang:state.trackLang||undefined,
-    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),
-    statuses:buildMarkBuckets(index?.items??[]).get((state.trackLang||'en').split('-')[0]!)?.statusByKey??new Map<string,string>(),
-    sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[]),notice:state.notice,chinese:state.chineseVisible!==false};
+  const signature=subsSignature(state);
+  if(subsLibraryDirty||Date.now()-subsLibraryAt>=SUBS_LIBRARY_INTERVAL_MS){
+    await refreshSubsLibrary(state);
+    if(currentView!=='subs'||subsState!==state)return;
+    subsSignatureCached=signature;
+    return;
+  }
+  if(cachedVideo&&subsSignatureCached===signature)return;
+  subsSignatureCached=signature;
+  cachedVideo=rebuildCachedVideo(state);
   videoWorkspace.update(cachedVideo);
 }
 setInterval(()=>void pollSubs(),1000);
@@ -721,10 +757,16 @@ async function refreshReviewQueue(): Promise<void> {
 browser.runtime.onMessage.addListener((msg: unknown) => {
   const t = (msg as { type?: string })?.type;
   if (t === 'vocab-changed') {
+    subsLibraryDirty=true;
     if (currentView === 'list') void refresh();
     if (currentView === 'review') void refreshReviewQueue();
+    if (currentView === 'subs') void pollSubs();
   }
-  if (t === 'sentences-changed' && currentView === 'sentences') void refreshSentences();
+  if (t === 'sentences-changed') {
+    subsLibraryDirty=true;
+    if (currentView === 'sentences') void refreshSentences();
+    if (currentView === 'subs') void pollSubs();
+  }
   if (t === 'settings-changed') {
     /* 内容标记开关变化不影响侧栏自身展示 */
   }
