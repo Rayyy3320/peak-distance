@@ -17,6 +17,14 @@ import {
   serializeVocabRecord,
 } from './format';
 import {
+  materialIdOf,
+  parseChatDocument,
+  parseMaterialDocument,
+  serializeChatRecord,
+  serializeMaterialSnapshot,
+} from './chatFormat';
+import type { MaterialSnapshotRecord } from '@/shared/chat';
+import {
   VAULT_FORMAT_VERSION,
   type VaultIdentity,
   type VaultPendingWrite,
@@ -206,6 +214,40 @@ export async function writeSentenceToVault(
   return { path };
 }
 
+/** 会话写入：完整历史一份（受管内容整体替换；个人笔记不在此文件）。 */
+export async function writeChatToVault(
+  dir: DirHandle,
+  chatId: string,
+  title: string,
+  markdown: string,
+): Promise<{ path: string }> {
+  const index = await readIndex(dir);
+  const known = index[chatId];
+  const path = known && known.startsWith('对话/') ? known : `对话/${vaultFileName(title, chatId)}`;
+  await writeTextFile(dir, path.split('/'), markdown);
+  index[chatId] = path;
+  await writeIndex(dir, index);
+  return { path };
+}
+
+/** 材料快照写入：每版本一份，不可变（存在即跳过）。 */
+export async function writeMaterialToVault(
+  dir: DirHandle,
+  chatId: string,
+  snapshot: MaterialSnapshotRecord,
+): Promise<{ path: string }> {
+  const id = materialIdOf(chatId, snapshot.version);
+  const index = await readIndex(dir);
+  if (index[id]) return { path: index[id]! }; // 不可变：已存在不重写
+  const path = `材料/${vaultFileName(snapshot.label, id)}`;
+  await writeTextFile(dir, path.split('/'), serializeMaterialSnapshot(chatId, snapshot));
+  index[id] = path;
+  await writeIndex(dir, index);
+  return { path };
+}
+
+export { parseChatDocument, parseMaterialDocument };
+
 export async function writePreferenceToVault(
   dir: DirHandle,
   pref: { defaultComprehensionLang: string; comprehensionOverrides: Record<string, string> },
@@ -218,6 +260,8 @@ export async function writePreferenceToVault(
 export interface VaultFileScan {
   vocab: { path: string; record: VaultVocabRecord; note: string }[];
   sentences: { path: string; record: VaultSentenceRecord }[];
+  chats: { path: string; text: string }[];
+  materials: { path: string; text: string }[];
   preference: { defaultComprehensionLang: string; comprehensionOverrides: Record<string, string> } | null;
   /** 解析失败但存在的受管文件（定位问题；不阻断其它记录） */
   broken: { path: string; reason: string }[];
@@ -225,12 +269,20 @@ export interface VaultFileScan {
 }
 
 export async function scanVault(dir: DirHandle): Promise<VaultFileScan> {
-  const scan: VaultFileScan = { vocab: [], sentences: [], preference: null, broken: [], paths: [] };
+  const scan: VaultFileScan = { vocab: [], sentences: [], chats: [], materials: [], preference: null, broken: [], paths: [] };
   const files = await listFilesRecursive(dir);
   scan.paths = files;
   for (const f of files) {
     const text = await readTextFile(dir, f.split('/'));
     if (text === null) continue;
+    if (f.startsWith('对话/')) {
+      scan.chats.push({ path: f, text });
+      continue;
+    }
+    if (f.startsWith('材料/')) {
+      scan.materials.push({ path: f, text });
+      continue;
+    }
     if (f === '偏好.md') {
       const parsed = parsePreferenceDocument(text);
       if (!('error' in parsed)) {

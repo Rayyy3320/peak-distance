@@ -27,13 +27,23 @@ const bundle = await build({
   stdin: { contents: "export * from './lib/chatService'; export * from './lib/chatWorkspace'; export { emptyChat } from './shared/chat';", resolveDir: resolve(import.meta.dirname, '..') },
   bundle: true, write: false, platform: 'node', format: 'iife', globalName: 'Lifecycle',
   plugins: [{ name: 'controlled-boundaries', setup(builder) {
-    builder.onResolve({ filter: /^\.\/(db|aiClient|aiTransport|panelService)$/ }, args =>
+    builder.onResolve({ filter: /^\.\/(db|aiClient|aiTransport|panelService|vault\/sync)$/ }, args =>
       args.importer.endsWith('chatService.ts') ? { path: args.path, namespace: 'boundary' } : undefined);
     builder.onLoad({ filter: /.*/, namespace: 'boundary' }, args => {
+      const stubs: Record<string, string> = {
+        getVaultIdentity: 'Promise.resolve(null)',
+        flushVaultWrites: 'Promise.resolve({ committed: 0, failed: 0, skipped: 0 })',
+        enqueueChatWrite: 'Promise.resolve()',
+      };
       const names = args.path === './db'
-        ? ['appendChatTurn', 'clearChat', 'getChat', 'listChats', 'resetChatTurn', 'saveAssistantProgress', 'setChatRetained']
+        ? ['appendChatTurn', 'clearChat', 'getChat', 'getVaultIdentity', 'listChats', 'resetChatTurn', 'saveAssistantProgress', 'setChatRetained']
+        : args.path === './vault/sync' ? ['enqueueChatWrite', 'flushVaultWrites']
         : args.path === './aiTransport' ? ['getAiConfig'] : args.path === './aiClient' ? ['chatCompletionStream'] : ['openPanel'];
-      return { contents: names.map(name => `export const ${name} = (...args) => globalThis.boundaries.${name}(...args);`).join('\n') };
+      return {
+        contents: names
+          .map((n) => `export const ${n} = ${stubs[n] ?? `((...args) => globalThis.boundaries.${n}(...args))`};`)
+          .join('\n'),
+      };
     });
   } }],
 });

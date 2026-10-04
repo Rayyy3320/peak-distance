@@ -852,6 +852,30 @@ export async function getVaultRaw<T>(key: string): Promise<T | null> {
   });
 }
 
+
+/** 学习库读回的会话落库：本地不存在则插入；文件较新且本地无进行中生成时替换。
+ *  streaming 本地记录不被动（另一浏览器不接管，spec 4.5）。 */
+export async function upsertChatRecordFromVault(record: ChatRecord): Promise<'inserted' | 'replaced' | 'kept-local'> {
+  return withDb(async db => {
+    const tx = db.transaction([CHATS], 'readwrite');
+    const store = tx.objectStore(CHATS);
+    const local = (await px(store.get(record.id))) as ChatRecord | undefined;
+    if (!local) {
+      store.put(record);
+      await txDone(tx);
+      return 'inserted';
+    }
+    const liveLocal = local.messages.some(m => m.role === 'assistant' && m.state === 'streaming');
+    if (!liveLocal && record.updatedAt > local.updatedAt) {
+      store.put({ ...record, draft: local.draft, pendingQuote: local.pendingQuote });
+      await txDone(tx);
+      return 'replaced';
+    }
+    await txDone(tx);
+    return 'kept-local';
+  });
+}
+
 // ---- M11 语言迁移：旧词条按证据赋语言（spec 第 5 节） ------------------------------
 // 幂等：迁移后不再存在“裸键且无 language”的词条；键冲突时合并（不增副本）。
 // 旧键 → 新键映射存 vault store 'legacyMap'（可追溯）。

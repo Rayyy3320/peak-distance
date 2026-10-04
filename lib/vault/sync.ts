@@ -9,13 +9,19 @@
 import {
   ensurePermission,
   ensureVault,
+  parseChatDocument,
   readVocabRecordById,
   scanVault,
+  writeChatToVault,
+  writeMaterialToVault,
   writePreferenceToVault,
   writeSentenceToVault,
   writeVocabToVault,
   type VaultFileScan,
 } from './fs';
+import { serializeChatRecord } from './chatFormat';
+import type { VaultChatRecord } from '@/shared/vault';
+import type { ChatRecord, MaterialSnapshotRecord } from '@/shared/chat';
 import { mergeVocabRecord } from './format';
 import {
   clearSyncSnapshots,
@@ -29,8 +35,11 @@ import {
   getVaultStatus,
   importVaultEntry,
   listEntries,
+  getChat,
+  listChats,
   listSentences,
   listSyncSnapshotIds,
+  upsertChatRecordFromVault,
   listVaultQueue,
   markVaultWriteAttempt,
   putVaultRaw,
@@ -188,8 +197,15 @@ export async function flushVaultWrites(): Promise<FlushResult> {
       } else if (w.kind === 'preference') {
         const p = w.payload as { defaultComprehensionLang: string; comprehensionOverrides: Record<string, string> };
         await writePreferenceToVault(handle, p);
+      } else if (w.kind === 'chat') {
+        const record = w.payload as VaultChatRecord;
+        // 材料快照不可变：先落材料（存在即跳过），再写会话
+        for (const snap of record.snapshots) {
+          await writeMaterialToVault(handle, record.id, snap as MaterialSnapshotRecord);
+        }
+        await writeChatToVault(handle, record.id, record.title, serializeChatRecord(record));
       } else {
-        skipped++; // chat 等后续批次：留在队列，不伪造成功
+        skipped++;
         continue;
       }
       await removeVaultWrite(w.id);
@@ -220,6 +236,18 @@ export async function enqueueSentenceWrite(record: VaultSentenceRecord): Promise
     kind: 'sentence',
     recordId: record.id,
     payload: record,
+    queuedAt: Date.now(),
+  });
+}
+
+/** 会话写入排队（终态后调用；streaming 中间态不写文件）。 */
+export async function enqueueChatWrite(record: ChatRecord): Promise<void> {
+  const { draft: _draft, pendingQuote: _pq, ...vaultRecord } = record;
+  await enqueueVaultWrite({
+    id: `chat:${record.id}`,
+    kind: 'chat',
+    recordId: record.id,
+    payload: vaultRecord as VaultChatRecord,
     queuedAt: Date.now(),
   });
 }
@@ -312,6 +340,27 @@ export async function syncFromVault(): Promise<SyncResult & { error?: 'not-conne
     });
   }
 
+  // 会话读回：新会话插入；文件较新替换（本地 streaming 生成不被动）
+  for (const { text } of scan.chats) {
+    const parsed = parseChatDocument(text);
+    if ('error' in parsed) continue;
+    const record: ChatRecord = {
+      id: parsed.id,
+      title: parsed.title,
+      source: parsed.sourceType
+        ? { sourceType: parsed.sourceType, sourceKey: '', title: parsed.title, url: parsed.sourceUrl, ...(parsed.sourceVideo ? { video: parsed.sourceVideo } : {}) }
+        : null,
+      sourceKey: '',
+      snapshots: [],
+      activeSnapshotVersion: 0,
+      messages: parsed.messages,
+      updatedAt: parsed.updatedAt || Date.now(),
+      draft: '',
+      pendingQuote: null,
+    };
+    await upsertChatRecordFromVault(record);
+  }
+
   // 偏好双向生效：库里有而本地缺的偏好项以库为准（Key / AI 配置永不读取）
   if (scan.preference) {
     const stored = await storageLocal().get(['defaultComprehensionLang', 'comprehensionOverrides']);
@@ -347,6 +396,10 @@ export async function adoptVault(): Promise<
     const entries = await listEntries();
     for (const e of entries) await enqueueVocabWrite(entryViewToVaultRecord(e));
     for (const s of await listSentences()) await enqueueSentenceWrite(sentenceToVaultRecord(s));
+    for (const c of await listChats()) {
+      const record = await getChat(c.chatId);
+      if (record) await enqueueChatWrite(record);
+    }
     await storageLocal().set({ [marker]: true });
     imported = true;
   }

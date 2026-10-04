@@ -13,6 +13,8 @@ import {
 } from '../shared/languages';
 import { wordAt, detectTextLanguage } from '../shared/tokenize';
 import { planLegacyLanguage } from '../shared/vocab';
+import { serializeChatRecord, parseChatDocument, serializeMaterialSnapshot, parseMaterialDocument, materialIdOf } from '../lib/vault/chatFormat';
+import type { ChatMessageRecord, MaterialSnapshotRecord } from '../shared/chat';
 import { scanMarkHits, type MarkBucket } from '../shared/marker';
 // 离线回归检查（node 运行，无需浏览器）：
 //   1. M0 时序 A/B：捕获归属、换视频重置、跨视频旧响应丢弃。
@@ -840,6 +842,45 @@ console.log('M11 旧数据语言迁移决策');
     check('无证据语境随最大组', ja.contextIndexes.length === 3 && ja.contextIndexes.includes(2));
   }
   check('旧请求固定语言不是证据', planLegacyLanguage([{ sourceType: 'web' as const }]).kind === 'none');
+}
+
+console.log('M11 聊天/材料序列化往返');
+{
+  const record: {
+    id: string; title: string;
+    source: { sourceType: 'article'; sourceKey: string; title: string; url: string } | null;
+    sourceKey: string; snapshots: MaterialSnapshotRecord[]; activeSnapshotVersion: number;
+    messages: ChatMessageRecord[]; updatedAt: number;
+  } = {
+    id: 'chat-1', title: 'Language and the world',
+    source: { sourceType: 'article', sourceKey: 'web:x', title: 'Language', url: 'https://example.com/a' },
+    sourceKey: 'web:x', snapshots: [], activeSnapshotVersion: 0,
+    messages: [
+      { id: 'u1', role: 'user', turnId: 't1', text: 'What does constrained mean here?', at: 1700000000000, snapshotVersion: 1, segmentIndex: 0, scopeLabel: '已加载正文', quote: { blockIds: ['p1', 'p2'], expression: 'constrained' } },
+      { id: 'a1', role: 'assistant', turnId: 't1', text: '受控回答：受限制的。', at: 1700000001000, state: 'stopped' },
+    ],
+    updatedAt: 1700000002000,
+  };
+  const md = serializeChatRecord(record);
+  const parsed = parseChatDocument(md);
+  check('会话往返：身份与来源', !('error' in parsed) && parsed.id === 'chat-1' && parsed.sourceType === 'article');
+  if (!('error' in parsed)) {
+    check('会话往返：全部消息保序', parsed.messages.length === 2 && parsed.messages[0]!.text.includes('constrained'));
+    check('会话往返：终态与材料引用', parsed.messages[1]!.state === 'stopped' && parsed.messages[0]!.snapshotVersion === 1 && parsed.messages[0]!.segmentIndex === 0);
+    check('会话往返：引用块与表达', (parsed.messages[0]!.quote?.blockIds ?? []).join(',') === 'p1,p2');
+  }
+  const snapshot: MaterialSnapshotRecord = {
+    source: { sourceType: 'article', sourceKey: '', title: 'T', url: '' },
+    version: 2, createdAt: 1700000000000, label: '当前轨道完整字幕',
+    blocks: [
+      { id: 'p1', text: '第一句', startMs: 0, endMs: 2000 },
+      { id: 'p2', text: '第二句' },
+    ],
+  };
+  const mat = parseMaterialDocument(serializeMaterialSnapshot('chat-1', snapshot));
+  check('材料往返：版本与块', !('error' in mat) && mat.version === 2 && mat.snapshot.blocks.length === 2 && mat.snapshot.blocks[0]!.startMs === 0);
+  check('材料 ID 稳定', materialIdOf('chat-1', 2) === 'chat-1::v2');
+  check('坏会话输入报格式错误', 'error' in parseChatDocument('not a doc'));
 }
 
 console.log(`\n通过 ${passed}，失败 ${failed}`);
