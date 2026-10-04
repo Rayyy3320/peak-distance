@@ -1,6 +1,6 @@
 # M11：多语言学习与本地 Markdown 学习库
 
-状态：待实施。2026-10-04。
+状态：实施中，阶段状态见 ROADMAP。2026-10-04。
 
 入口：[ROADMAP](../ROADMAP.md)。M11 替代历史“仅英语／Chrome／中文／无文件夹共享”限制；其余行为沿用 [PRD](../PRD.md)、[ARCHITECTURE](../ARCHITECTURE.md)。
 
@@ -220,7 +220,7 @@ status: learning
 
 执行层确定函数、schema 和必要依赖；复用现有模块。
 
-并行时按 [三线程分工与开工 Prompt](m11-parallel-development.md) 的文件归属和合同基线执行。
+执行由 I 统一负责，按 [内部委派与续工 Prompt](m11-parallel-development.md) 组织必要的并行工作。
 
 | 阶段 | 最小交付 | 完成证据／后续 |
 | --- | --- | --- |
