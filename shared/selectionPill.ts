@@ -289,11 +289,13 @@ export function createSelectionPill(deps: SelectionPillDeps) {
     selectionTimer = setTimeout(refresh, 250);
   }
 
+  const onKeyUp = (e: KeyboardEvent): void => {
+    if (e.shiftKey) onMaybeSelection();
+  };
+
   document.addEventListener('selectionchange', onMaybeSelection, true);
   document.addEventListener('mouseup', onMaybeSelection, true);
-  document.addEventListener('keyup', (e) => {
-    if (e.shiftKey) onMaybeSelection();
-  }, true);
+  document.addEventListener('keyup', onKeyUp, true);
 
   return {
     /** 当前选区信息（供外部即时读取）。 */
@@ -309,6 +311,7 @@ export function createSelectionPill(deps: SelectionPillDeps) {
       remove();
       document.removeEventListener('selectionchange', onMaybeSelection, true);
       document.removeEventListener('mouseup', onMaybeSelection, true);
+      document.removeEventListener('keyup', onKeyUp, true);
     },
   };
 }
