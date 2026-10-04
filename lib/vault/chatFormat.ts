@@ -14,6 +14,17 @@ function fmValue(v: string | number): string {
 
 const MSG_RE = /^## 消息 (\d+) · (user|assistant)(?:\n|$)/;
 const META_RE = /^- ([^：]+)：(.*)$/;
+// 正文防碰撞：正文行若形如消息标题（split 的切分前缀，不限角色），行首加零宽空格；
+// 解析重建正文时剥掉，保证往返无损（零宽空格对 Obsidian 不可见）。
+const ZWSP = '\u200B';
+
+function escapeMessageText(text: string): string {
+  return text.replace(/^(?=## 消息 \d+ · )/gm, ZWSP);
+}
+
+function unescapeMessageText(text: string): string {
+  return text.replace(/(^|\n)\u200B/g, '$1');
+}
 
 export function serializeChatRecord(record: VaultChatRecord): string {
   const lines: string[] = [
@@ -45,10 +56,13 @@ export function serializeChatRecord(record: VaultChatRecord): string {
     if (m.retained) lines.push(`- 保留：是`);
     if (m.quote) {
       const q: QuoteRef = m.quote;
-      lines.push(`- 引用：${(q.blockIds ?? []).join(' ')}${q.expression ? ` · ${q.expression}` : ''}${q.note ? ` · ${q.note}` : ''}`);
+      // 分隔符用全角竖线：表达式/备注自身含 " · " 时不再移位；序号空槽保留（仅备注无表达式时）
+      const expr = q.expression ?? '';
+      const note = q.note ?? '';
+      lines.push(`- 引用：${(q.blockIds ?? []).join(' ')}${expr || note ? ` ｜ ${expr}` : ''}${note ? ` ｜ ${note}` : ''}`);
     }
     lines.push('');
-    lines.push(m.text);
+    lines.push(escapeMessageText(m.text));
     lines.push('');
   });
   return lines.join('\n');
@@ -97,7 +111,7 @@ export function parseChatDocument(text: string): ParsedChatDocument | { error: '
       if (!mm) break;
       meta[mm[1]!] = mm[2]!;
     }
-    const bodyText = lines.slice(i).join('\n').trim();
+    const bodyText = unescapeMessageText(lines.slice(i).join('\n')).trim();
     if (!bodyText && !Object.keys(meta).length) continue;
     const msg: ChatMessageRecord = {
       id: `${fm.id}:${head[1]}`,
@@ -118,8 +132,22 @@ export function parseChatDocument(text: string): ParsedChatDocument | { error: '
     if (meta['范围']) msg.scopeLabel = meta['范围'];
     if (meta['保留'] === '是') msg.retained = true;
     if (meta['引用']) {
-      const [blocks, ...notes] = meta['引用'].split(' · ');
-      msg.quote = { blockIds: (blocks ?? '').split(/\s+/).filter(Boolean), note: notes.join(' · ') || undefined };
+      const raw = meta['引用'];
+      if (raw.includes('｜')) {
+        // 新分隔符全角竖线：blocks ｜ 表达式 ｜ 备注（表达式槽可为空；备注含竖线时保留）
+        const parts = raw.split('｜');
+        const expr = (parts[1] ?? '').trim();
+        const note = parts.slice(2).join('｜').trim();
+        msg.quote = {
+          blockIds: (parts[0] ?? '').trim().split(/\s+/).filter(Boolean),
+          ...(expr ? { expression: expr } : {}),
+          ...(note ? { note } : {}),
+        };
+      } else {
+        // 旧文件按 " · " 解析（历史行为：表达式并入备注）
+        const [blocks, ...notes] = raw.split(' · ');
+        msg.quote = { blockIds: (blocks ?? '').split(/\s+/).filter(Boolean), note: notes.join(' · ') || undefined };
+      }
     }
     messages.push(msg);
   }
