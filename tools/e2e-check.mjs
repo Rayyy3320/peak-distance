@@ -44,7 +44,7 @@ async function launch() {
   await panel.waitForFunction(() => !!document.querySelector('[data-view="chat"]'));
 }
 async function send(message) { return panel.evaluate(async m => chrome.runtime.sendMessage({windowId:(await chrome.windows.getCurrent()).id,...m}), message); }
-const snapshot = (expression, sentence = 'I went to the bank.') => ({ source: 'web', expression, sentence, title: 'M6 acceptance', url: 'https://example.com/m6' });
+const snapshot = (expression, sentence = 'I went to the bank.') => ({ source: 'web', expression, sentence, title: 'M6 acceptance', url: 'https://example.com/m6', lang: 'en' });
 async function instrument() {
   await sw.evaluate(() => {
     globalThis.__network = []; globalThis.__mode = 'real';
@@ -148,6 +148,13 @@ try {
   await send({ type: 'save', snapshot: snapshot('late', 'Another sentence.') });
   let entry = (await send({ type: 'getEntry', key: 'late' })).entry;
   check('结果只补写原保存上下文', entry.contexts.find(c => c.sentence === 'Original sentence.').result?.text === '原句译文' && !entry.contexts.find(c => c.sentence === 'Another sentence.').result);
+  const dupSaved = await send({ type: 'save', snapshot: snapshot('late', 'Original sentence.') });
+  check('同语言同句重复保存不追加且命中同一上下文', dupSaved.ok && dupSaved.appended === false && dupSaved.contextId === emptySaved.contextId);
+  await send({ type: 'save', snapshot: snapshot('late', 'Explicit status sentence.'), status: 'known' });
+  await send({ type: 'save', snapshot: snapshot('late', 'Plain sentence.') });
+  const scoped = (await send({ type: 'getEntry', key: 'late' })).entry;
+  check('显式状态保存后普通保存不重置状态', scoped?.status === 'known' && scoped?.contexts.length === 4);
+  check('裸键查询命中语言作用域词条', scoped?.key === 'en::late');
   await send({ type: 'deleteEntry', key: 'late' });
   const late = await send({ type: 'backfillResult', contextId: emptySaved.contextId, result: { kind: 'translation', source: 'google-gtx', text: '迟到' } });
   check('删除后迟到补写不复活记录', late.filled === false && !(await send({ type: 'getEntry', key: 'late' })).entry);
