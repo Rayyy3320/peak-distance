@@ -5,8 +5,8 @@
 // 局部上下文）。来源、轻提示与「继续问」由调用方注入，跳过条件可扩展
 // （YouTube 用它排除字幕栏等自身 UI 内的选区）。
 import { brandTokens, brandControls, CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from './brand';
-import { classifySelection, detectTextLanguage, effectiveLookupExpression, sentenceContaining } from './tokenize';
-import { rangeOffsetsIn, inlineRunContainer } from './selection';
+import { detectTextLanguage } from './tokenize';
+import { classifyRangeIn, inlineRunContainer } from './selection';
 import { materialFromCandidate, type SelectionCandidate, type SourceDescriptor } from './chat';
 import type { LookupPopup } from './lookupPopup';
 import type { SelectionSnapshot } from './panel';
@@ -101,27 +101,16 @@ export function createSelectionPill(deps: SelectionPillDeps) {
     const endBlock = blockElementOf(range.endContainer);
     const blockText = (startBlock?.textContent ?? '').replace(/\s+/g, ' ').trim();
     const lang = detectTextLanguage(raw) ?? detectTextLanguage(blockText) ?? 'en';
-    // 未跨正文块时才有词/短语分类；跨块（或选区落在无块元素文本上）按句段处理
+    // 未跨正文块时才有词/短语分类；跨块（或选区落在无块元素文本上）按句段处理。
+    // 分类与有效表达的计算见 shared/selection.ts 的 classifyRangeIn
     const crossesBlock = !startBlock || startBlock !== endBlock;
-    const cls = classifySelection(raw, lang, { crossesBlock });
-    let expression: string | null = null;
-    let sentence: string | null = null;
-    if (!crossesBlock && startBlock) {
-      const offsets = rangeOffsetsIn(startBlock, range);
-      if (offsets && offsets.start <= offsets.end && offsets.end <= offsets.text.length) {
-        // 偏移基于块内原始文本（未做空白归一），补词与原句都用这份定位。
-        // 有效表达对所有分类计算：词/短语整体为查词表达，句段用作翻译卡的
-        // 首尾清洗（补齐首尾残缺词、去词外标点；内部保持原文）。
-        expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
-        sentence = sentenceContaining(offsets.text, offsets.start, offsets.end);
-      }
-    }
+    const cls = classifyRangeIn(startBlock, range, lang, { crossesBlock });
     return {
       raw,
-      kind: cls.kind,
-      hasWord: cls.hasWord,
-      expression,
-      sentence,
+      kind: cls?.kind ?? 'sentence',
+      hasWord: cls?.hasWord ?? false,
+      expression: cls?.expression ?? null,
+      sentence: cls?.sentence ?? null,
       blockText: blockText.slice(0, 600),
       source: deps.buildSource(),
       rect,

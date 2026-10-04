@@ -1,8 +1,8 @@
 import { initFloatingPanel } from '@/shared/floatingPanel';
 import { createTranslationPopup } from '@/shared/translationPopup';
-import { shadowSelection, rangeOffsetsIn, clampRangeToElement } from '@/shared/selection';
+import { shadowSelection, classifyRangeIn, clampRangeToElement } from '@/shared/selection';
 import { brandTokens, brandControls, CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
-import { classifySelection, detectTextLanguage, effectiveLookupExpression } from '@/shared/tokenize';
+import { detectTextLanguage } from '@/shared/tokenize';
 import { createSelectionPill } from '@/shared/selectionPill';
 import { DEFAULT_SETTINGS } from '@/shared/settings';
 import type { Settings } from '@/shared/settings';
@@ -632,18 +632,12 @@ export default defineContentScript({
       const cue = cues[cueIndex];
       if (!cue || !currentVideoId || !lastTrackId) return null;
       const lang = baseLang(lastTrackLang) || 'en';
-      const cls = classifySelection(raw, lang);
-      // 有效表达对所有分类计算：词/短语整体为查词表达，句段用作翻译卡的首尾清洗
-      let expression: string | null = null;
-      {
-        const offsets = rangeOffsetsIn(en, clamped);
-        if (offsets && offsets.start <= offsets.end && offsets.end <= offsets.text.length) {
-          expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
-        }
-      }
+      // 分类与有效表达的统一计算（shared/selection.ts 的 classifyRangeIn）
+      const cls = classifyRangeIn(en, clamped, lang);
+      if (!cls) return null;
       let rect: DOMRect | null = null;
       try { rect = selected.range.getBoundingClientRect(); } catch { /* ignore */ }
-      return { raw, kind: cls.kind, hasWord: cls.hasWord, expression, cueIndex, rect };
+      return { raw, kind: cls.kind, hasWord: cls.hasWord, expression: cls.expression, cueIndex, rect };
     }
 
     function subtitleCandidate(info: SubtitleSelectionInfo): SelectionCandidate | null {

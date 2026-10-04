@@ -4,10 +4,10 @@ import { createYoutubeWorkspace, type WorkspaceState } from '@/shared/youtubeWor
 import { isPanelView, panelStateKey, panelTransportFailure, type SelectionSnapshot, type PanelFrameState } from '@/shared/panel';
 import { createTranslationPopup } from '@/shared/translationPopup';
 import { createLookupPopup } from '@/shared/lookupPopup';
-import { shadowSelection, rangeOffsetsIn, clampRangeToElement } from '@/shared/selection';
+import { shadowSelection, classifyRangeIn, clampRangeToElement } from '@/shared/selection';
 import { buildMarkBuckets } from '@/shared/marker';
 import { effectiveEntryLanguage, isRtlLanguage, langDisplayName } from '@/shared/languages';
-import { classifySelection, effectiveLookupExpression, segmentWords } from '@/shared/tokenize';
+import { segmentWords } from '@/shared/tokenize';
 import { materialFromCandidate, type SelectionCandidate } from '@/shared/chat';
 import { CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
 // 侧栏三个视图：生词本（词条 / 上下文 / 词形关联管理）、字幕（当前标签页
@@ -16,7 +16,7 @@ import { CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
 // 字幕控制消息经 tabs.sendMessage 直达当前标签页，携带 videoId 防串页。
 
 import type { EntryView, SubViewState } from '@/shared/messages';
-import { videoContextUrl, blankExpression, type SavedSentence, type VocabStatus } from '@/shared/vocab';
+import { videoContextUrl, blankExpression, VOCAB_STATUS_LABEL, type SavedSentence, type VocabStatus } from '@/shared/vocab';
 import { buildReviewQueue, refreshQueue, type ReviewItem } from '@/shared/review';
 import { fmtClock } from '@/shared/cues';
 import {
@@ -28,12 +28,6 @@ import {
   saveDraft,
   snapshotChat,restoreChat,setChatActive,type ChatViewSnapshot,
 } from './chatView';
-
-const STATUS_LABEL: Record<VocabStatus, string> = {
-  saved: '已收藏',
-  learning: '在学',
-  known: '已掌握',
-};
 
 function send<T>(msg: unknown): Promise<T> {
   return new Promise((resolve) => {
@@ -254,7 +248,7 @@ function renderEntry(entry: EntryView): HTMLElement {
 
   const sel = el('select', 'status') as HTMLSelectElement;
   for (const s of ['saved', 'learning', 'known'] as const) {
-    const opt = el('option', undefined, STATUS_LABEL[s]);
+    const opt = el('option', undefined, VOCAB_STATUS_LABEL[s]);
     opt.value = s;
     if (entry.status === s) opt.selected = true;
     sel.appendChild(opt);
@@ -440,15 +434,10 @@ const videoWorkspace=createYoutubeWorkspace({
         const raw=clamped.toString().replace(/\s+/g,' ').trim();
         if(!raw)return null;
         const lang=((cachedVideo?.trackLang||subsState?.trackLang)||'en').split('-')[0]!;
-        const cls=classifySelection(raw,lang);
-        // 有效表达对所有分类计算：词/短语整体为查词表达，句段用作翻译卡的首尾清洗
-        let expression:string|null=null;
-        {
-          const offsets=rangeOffsetsIn(en,clamped);
-          if(offsets&&offsets.start<=offsets.end&&offsets.end<=offsets.text.length)
-            expression=effectiveLookupExpression(offsets.text,offsets.start,offsets.end,lang)?.expression??null;
-        }
-        return {kind:cls.kind,raw,expression,firstIndex:first,count:1,hasWord:cls.hasWord,rect:selection.range.getBoundingClientRect()};
+        // 分类与有效表达的统一计算（shared/selection.ts 的 classifyRangeIn）
+        const cls=classifyRangeIn(en,clamped,lang);
+        if(!cls)return null;
+        return {kind:cls.kind,raw,expression:cls.expression,firstIndex:first,count:1,hasWord:cls.hasWord,rect:selection.range.getBoundingClientRect()};
       }
       // 跨字幕项：实际选择的原文（按行收窄到 .en，不含译文/控件文字）
       const parts:string[]=[];
@@ -665,7 +654,7 @@ function renderReview(): void {
 
   const it = reviewQueue[reviewIdx]!;
   const prog = el('div', 'review-progress');
-  prog.textContent = `${reviewIdx + 1} / ${reviewQueue.length} · ${STATUS_LABEL[it.status]}`;
+  prog.textContent = `${reviewIdx + 1} / ${reviewQueue.length} · ${VOCAB_STATUS_LABEL[it.status]}`;
   body.appendChild(prog);
 
   const card = el('div', 'review-card');

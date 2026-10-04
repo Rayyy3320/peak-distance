@@ -19,6 +19,7 @@ import {
   type LearningResult,
   type ContextExplanation,
   type VocabStatus,
+  VOCAB_STATUS_LABEL,
 } from '@/shared/vocab';
 import { entryKeyOf } from './languages';
 
@@ -78,12 +79,6 @@ interface PinnedState {
   /** 保存成功后回填的词条键；后续状态查询 / 更新优先用它。 */
   entryKey?: string;
 }
-
-const STATUS_LABEL: Record<VocabStatus, string> = {
-  saved: '已收藏',
-  learning: '在学',
-  known: '已掌握',
-};
 
 const ERROR_LABEL: Record<string, string> = {
   'invalid-config': 'AI 配置无效，请在设置中检查接口与模型',
@@ -274,7 +269,7 @@ export function createLookupPopup(opts: {
     if (p.status) {
       const chip = document.createElement('span');
       chip.className = `chip ${p.status}`;
-      chip.textContent = STATUS_LABEL[p.status];
+      chip.textContent = VOCAB_STATUS_LABEL[p.status];
       head.appendChild(chip);
     }
     body.appendChild(head);
@@ -337,7 +332,7 @@ export function createLookupPopup(opts: {
       for (const s of ['saved', 'learning', 'known'] as const) {
         const opt = document.createElement('option');
         opt.value = s;
-        opt.textContent = STATUS_LABEL[s];
+        opt.textContent = VOCAB_STATUS_LABEL[s];
         if (p.status === s) opt.selected = true;
         sel.appendChild(opt);
       }

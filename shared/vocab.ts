@@ -32,6 +32,13 @@ export type VocabStatus = 'saved' | 'learning' | 'known';
 
 export const VOCAB_STATUSES: readonly VocabStatus[] = ['saved', 'learning', 'known'];
 
+/** 状态的界面显示名（词卡与侧栏共用）。 */
+export const VOCAB_STATUS_LABEL: Record<VocabStatus, string> = {
+  saved: '已收藏',
+  learning: '在学',
+  known: '已掌握',
+};
+
 export function isVocabStatus(v: unknown): v is VocabStatus {
   return v === 'saved' || v === 'learning' || v === 'known';
 }

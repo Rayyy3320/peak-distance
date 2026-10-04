@@ -1,3 +1,5 @@
+import { classifySelection, effectiveLookupExpression, sentenceContaining } from './tokenize';
+
 // getRangeAt may re-scope a native drag selection to the Shadow DOM host.
 export function shadowSelection(root:ShadowRoot):{text:string;range:Range}|null {
   const selection=getSelection();
@@ -53,4 +55,30 @@ export function inlineRunContainer(node:Node|null):HTMLElement|null {
   let block:HTMLElement=el as HTMLElement;
   while(INLINE_TAGS.has(block.tagName)&&block.parentElement)block=block.parentElement;
   return block;
+}
+
+export interface ContainerSelectionClass {
+  kind:'word'|'phrase'|'sentence';
+  hasWord:boolean;
+  /** 有效表达（所有分类计算：词/短语整体为查词表达，句段用作翻译卡首尾清洗）；无法定位为 null */
+  expression:string|null;
+  /** 所在原句；无可靠定位为 null */
+  sentence:string|null;
+}
+
+/**
+ * 容器内选区的统一分类与有效表达（页面浮条 / 播放器字幕操作条 / 侧栏字幕
+ * 列表共用）。偏移基于容器原始文本（未做空白归一）；跨块由调用方判定后经
+ * opts 传入（此时不做定位）。容器为 null 或端点不在容器文本内同样不定位。
+ */
+export function classifyRangeIn(container:Element|null,range:Range,lang:string,opts:{crossesBlock?:boolean}={}):ContainerSelectionClass|null {
+  const raw=range.toString().replace(/\s+/g,' ').trim();
+  if(!raw)return null;
+  const cls=classifySelection(raw,lang,opts);
+  if(opts.crossesBlock||!container)return {...cls,expression:null,sentence:null};
+  const offsets=rangeOffsetsIn(container,range);
+  if(!offsets||offsets.start>offsets.end||offsets.end>offsets.text.length)return {...cls,expression:null,sentence:null};
+  return {...cls,
+    expression:effectiveLookupExpression(offsets.text,offsets.start,offsets.end,lang)?.expression??null,
+    sentence:sentenceContaining(offsets.text,offsets.start,offsets.end)};
 }
