@@ -1,7 +1,10 @@
 import {
   CHAT_MATERIAL_BUDGET_CHARS,
   CHAT_QUESTION_MAX_CHARS,
+  SELECTION_MATERIAL_LABELS,
   buildSegments,
+  materialFromCandidate,
+  normalizeArticleUrl,
   parseAnswerCitations,
   pickDefaultSegment,
   snapshotChars,
@@ -9,6 +12,7 @@ import {
   type ChatRecordView,
   type MaterialPayload,
   type QuoteRef,
+  type SelectionCandidate,
   type SourceDescriptor,
 } from '@/shared/chat';
 import {
@@ -17,6 +21,7 @@ import {
   type ChatPortMessage,
   type ChatRecentItem,
   type ChatSourceInfo,
+  type SelectionCandidateResult,
   type SubtitleCueView,
   type SubViewState,
 } from '@/shared/messages';
@@ -223,9 +228,15 @@ function inlineError(text: string): void {
   if (box) {
     box.textContent = text;
     box.hidden = false;
-    setTimeout(() => {
-      box.hidden = true;
-    }, 3000);
+  }
+}
+
+/** 失败信息保留到重试或下一次操作：新操作开始时清除。 */
+function clearInlineError(): void {
+  const box = document.getElementById('chat-meta-error');
+  if (box) {
+    box.textContent = '';
+    box.hidden = true;
   }
 }
 
@@ -289,27 +300,88 @@ async function pollChatSource(): Promise<void> {
   } finally { polling = false; }
 }
 
+/** 附加选区候选（菜单入口与字幕列表直接附加共用）：材料+焦点，成功聚焦输入框。 */
+export async function attachSelectionCandidate(candidate: SelectionCandidate, opts: { tabId?: number } = {}): Promise<boolean> {
+  const op = operation;
+  clearInlineError();
+  const built = materialFromCandidate(candidate);
+  if (!built) { inlineError('选区内容无法附加，请重新选择'); return false; }
+  const r = await send<{ ok: boolean; chat: ChatRecordView }>({
+    type: 'chatEnsure', chatId, source: candidate.source, material: built.material, quote: built.quote,
+  });
+  if (r?.ok && op === operation) {
+    if (typeof opts.tabId === 'number') chatTabId = opts.tabId;
+    chatSegmentIndex = 0;
+    await acceptRecord(r.chat);
+    return true;
+  }
+  if (op === operation) inlineError('附加失败，材料未改变');
+  return false;
+}
+
+/** 候选是否仍与当前页面/视频轨道一致（导航、切视频、换轨道后失效）。 */
+function candidateStale(c: SelectionCandidate, info: ChatSourceInfo | null): boolean {
+  if (!info) return true;
+  if (normalizeArticleUrl(c.pageUrl) !== normalizeArticleUrl(info.pageUrl ?? '')) return true;
+  if (c.source.sourceType === 'youtube') {
+    const nowVideo = info.source?.video;
+    const candVideo = c.source.video;
+    if (!nowVideo || !candVideo) return true;
+    if (nowVideo.videoId !== candVideo.videoId || nowVideo.trackId !== candVideo.trackId) return true;
+  }
+  return false;
+}
+
 async function attachMaterial(kind: 'page' | 'selection' | 'video'): Promise<void> {
   const op = operation;
+  clearInlineError();
   const tabs = await browser.tabs.query({ active: true, currentWindow: true });
   const tab = tabs[0];
-  if (typeof tab?.id !== 'number') return;
-  const info = await tabSend<ChatSourceInfo>(tab.id, { type: 'blc-chat-source' });
-  if (!info?.source || (kind === 'video' && info.source.sourceType !== 'youtube')) {
-    inlineError(kind === 'video' ? '当前页面没有可附加的视频字幕' : '当前页面无法附加材料，仍可直接提问');
+  if (typeof tab?.id !== 'number') { inlineError('找不到当前页面，请重试'); return; }
+  if (kind === 'selection') {
+    const [info, got] = await Promise.all([
+      tabSend<ChatSourceInfo>(tab.id, { type: 'blc-chat-source' }),
+      send<SelectionCandidateResult>({ type: 'selectionCandidateGet', tabId: tab.id }),
+    ]);
+    if (op !== operation) return;
+    if (!info) { inlineError('无法连接当前页面，请刷新后重试'); return; }
+    if (!got?.ok) { inlineError('选区信息读取失败，请重试'); return; }
+    const candidate = got.candidate;
+    if (!candidate) { inlineError(selectionMissingReason(info)); return; }
+    if (candidateStale(candidate, info)) { inlineError('选区与当前页面不一致，请重新选择'); return; }
+    await attachSelectionCandidate(candidate, { tabId: tab.id });
     return;
   }
-  const material = await tabSend<{ material: MaterialPayload | null }>(tab.id, {
-    type: kind === 'selection' ? 'blc-chat-selection' : 'blc-chat-material',
-  });
-  if (!material?.material) { inlineError('没有可附加的内容，请先在页面选择文字'); return; }
+  const info = await tabSend<ChatSourceInfo>(tab.id, { type: 'blc-chat-source' });
   if (op !== operation) return;
+  if (!info) { inlineError('无法连接当前页面，请刷新后重试'); return; }
+  if (!info.source || (kind === 'video' && info.source.sourceType !== 'youtube') || (kind === 'page' && info.source.sourceType === 'youtube')) {
+    inlineError(info.source ? (kind === 'video' ? '当前页面没有可附加的视频字幕' : '当前页面无法附加材料，仍可直接提问') : (info.hint || '当前页面无法附加材料，仍可直接提问'));
+    return;
+  }
+  const material = await tabSend<{ material: MaterialPayload | null }>(tab.id, { type: 'blc-chat-material' });
+  if (op !== operation) return;
+  if (!material) { inlineError('材料提取失败，请重试'); return; }
+  if (!material.material) {
+    // 提取失败 ≠ 没有选区：按来源给出实际原因
+    inlineError(info.hint || (kind === 'video' ? '字幕尚未就绪，稍后再试' : '未识别到可附加的正文'));
+    return;
+  }
   const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatEnsure', chatId, source: info.source, material: material.material });
   if (r?.ok && op === operation) { chatTabId = tab.id; chatQuote = null; chatSegmentIndex = 0; await acceptRecord(r.chat); }
+  else if (op === operation) inlineError('附加失败，材料未改变');
+}
+
+/** 无候选的实际原因（页面能力而非“选区丢失”）。 */
+function selectionMissingReason(info: ChatSourceInfo): string {
+  if (info.source?.sourceType === 'youtube' && !info.source.video?.trackId) return '字幕尚未就绪，等字幕出现后再选择';
+  if (info.source?.sourceType === 'x') return '还没有可用选区：在目标帖子里选择文字';
+  return '还没有可用选区：在页面或字幕中选择文字';
 }
 
 async function newConversation(): Promise<void> {
   const op = ++operation;
+  clearInlineError();
   const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatNew' });
   if (r?.ok && op === operation) { historyOpen = false; await acceptRecord(r.chat); }
 }
@@ -365,6 +437,7 @@ async function doSend(): Promise<void> {
   const input = document.getElementById('chat-input') as HTMLTextAreaElement;
   const question = input.value.trim();
   if (!question) return;
+  clearInlineError();
   if (question.length > CHAT_QUESTION_MAX_CHARS) {
     inlineError(ERROR_LABEL['question-too-long']!);
     return;
@@ -499,7 +572,7 @@ function showCitationPanel(blockId: string, text: string, isVideo: boolean, loca
 function renderChat(): void {
   if (!deps || deps.getActiveView() !== 'chat') return;
   renderHead();
-  renderSegments();
+  renderAttachment();
   renderMessages();
   renderInputState();
 }
@@ -521,29 +594,78 @@ function renderHead(): void {
   clearButton.setDisabled(!chatId && !chatQuote && !latestSnapshot() && !(document.getElementById('chat-input') as HTMLTextAreaElement).value);
   row.append(clearButton.element);
   head.appendChild(row);
-  const snap = latestSnapshot();
-  if (snap) {
-    const material = el('div', 'quote-row', `${snap.source.title} · ${snap.label}（v${snap.version}）`);
-    const remove = el('button', 'chat-tool', '移除材料');
-    remove.addEventListener('click', async () => {
-      const op = operation;
-      const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatRemoveMaterial', chatId });
-      if (r?.ok && op === operation) { chatQuote = null; resetCitePanel(); await acceptRecord(r.chat); }
-    });
-    material.appendChild(remove); head.appendChild(material);
-  } else head.appendChild(el('div', 'chat-scope', '自由提问，也可以附加阅读材料'));
-  if (chatQuote) {
-    const quote = el('div', 'quote-row', `引用：${chatQuote.expression || chatQuote.note || chatQuote.blockIds.join(', ')}`);
-    const remove = el('button', 'chat-tool', '移除引用');
-    remove.addEventListener('click', async () => {const op=operation;const r=await send<{ok:boolean}>({type:'chatTakeQuote',chatId});if(op!==operation)return;if(r?.ok){chatQuote = null;if(chatRecord)chatRecord.pendingQuote=null;renderChat();}else inlineError('移除失败，请重试');});
-    quote.appendChild(remove); head.appendChild(quote);
-  }
   historyList.hidden = !historyOpen;
   historyMeta.hidden = !historyOpen;
   head.append(historyMeta);
   head.append(historyList);
   head.scrollTop = top;
   if (historyOpen) void refreshHistory();
+}
+
+// ---- 附件区（输入框上方）：预览、焦点、超预算分段 -----------------------------------
+
+let attachmentExpanded = false;
+
+/** 当前材料预览摘要：选区显示原文，页面/字幕全文显示标题。 */
+function attachmentSummary(snap: NonNullable<ReturnType<typeof latestSnapshot>>): string {
+  if (SELECTION_MATERIAL_LABELS.has(snap.label)) {
+    const focus = chatQuote?.expression || snap.blocks[0]?.text || '';
+    return focus.replace(/\s+/g, ' ').trim() || snap.label;
+  }
+  return snap.source.title || snap.label;
+}
+
+function renderAttachment(): void {
+  const zone = document.getElementById('chat-attachment')!;
+  const chip = document.getElementById('chat-attachment-chip')!;
+  const summary = document.getElementById('chat-attachment-summary')!;
+  const kind = document.getElementById('chat-attachment-kind')!;
+  const detail = document.getElementById('chat-attachment-detail')!;
+  const focusRow = document.getElementById('chat-attachment-focus')!;
+  const snap = latestSnapshot();
+  if (!snap) {
+    zone.hidden = true;
+    detail.hidden = true;
+    attachmentExpanded = false;
+    renderSegments();
+    return;
+  }
+  zone.hidden = false;
+  kind.textContent = snap.label;
+  summary.textContent = attachmentSummary(snap);
+  summary.title = attachmentSummary(snap);
+  // 焦点（引用）行：当前材料内的关注点与已有释义
+  focusRow.textContent = '';
+  if (chatQuote) {
+    const label = el('span', 'attach-focus-label', `焦点：${chatQuote.expression || chatQuote.note || chatQuote.blockIds.join(', ')}`);
+    const remove = el('button', 'chat-tool', '移除焦点');
+    remove.addEventListener('click', async () => {
+      const op = operation;
+      const r = await send<{ ok: boolean }>({ type: 'chatTakeQuote', chatId });
+      if (op !== operation) return;
+      if (r?.ok) { chatQuote = null; if (chatRecord) chatRecord.pendingQuote = null; renderChat(); }
+      else inlineError('移除失败，请重试');
+    });
+    focusRow.append(label, remove);
+  }
+  // 展开详情：实际材料 + 上下文 + 来源 + 已有释义（长内容有界滚动）
+  if (attachmentExpanded) {
+    detail.textContent = '';
+    const meta = el('div', 'attach-meta');
+    const link = el('a', 'attach-source', snap.source.title || snap.source.url);
+    link.href = snap.source.url; link.target = '_blank'; link.rel = 'noopener';
+    meta.append(el('span', undefined, `${snap.label} · ${snap.blocks.length} 块`), link);
+    if (chatQuote?.definition) meta.append(el('span', undefined, `已有释义：${chatQuote.definition.slice(0, 120)}`));
+    detail.append(meta);
+    const body = el('div', 'attach-blocks');
+    for (const b of snap.blocks) {
+      body.append(el('p', 'attach-block', typeof b.startMs === 'number' ? `${fmtClock(b.startMs)} · ${b.text}` : b.text));
+    }
+    detail.append(body);
+    detail.hidden = false;
+  } else detail.hidden = true;
+  chip.setAttribute('aria-expanded', String(attachmentExpanded));
+  renderSegments();
 }
 
 const historyList = el('div', 'chat-recent-list');
@@ -603,6 +725,7 @@ async function refreshHistory(): Promise<void> {
 }
 
 function renderSegments(): void {
+  // 超预算分段选择放在附件区：预览与发送范围一致
   const box = document.getElementById('chat-segments')!;
   box.textContent = '';
   if (!chatRecord) return;
@@ -658,6 +781,11 @@ function renderMessages(): void {
   const list = document.getElementById('chat-list')!;
   list.textContent = '';
   document.getElementById('view-chat')!.classList.toggle('is-empty', !chatRecord?.messages.length);
+  // 附加成功 / 带入引用后的聚焦：空态（欢迎页）也必须消费
+  if (pendingAskFocus) {
+    pendingAskFocus = false;
+    (document.getElementById('chat-input') as HTMLTextAreaElement)?.focus();
+  }
   const msgs = chatRecord?.messages ?? [];
   if (!msgs.length) {
     const welcome = el('div', 'chat-welcome');
@@ -737,10 +865,6 @@ function renderMessages(): void {
   }
   const listEl = document.getElementById('chat-list')!;
   listEl.scrollTop = autoScroll ? listEl.scrollHeight : messageScrollTop;
-  if (pendingAskFocus) {
-    pendingAskFocus = false;
-    (document.getElementById('chat-input') as HTMLTextAreaElement)?.focus();
-  }
 }
 
 function renderInputState(): void {
@@ -832,14 +956,54 @@ export async function subtitleAskAi(subs: SubViewState, cue: SubtitleCueView): P
   deps?.switchView('chat');
 }
 
+// ---- 附加菜单：按来源显示入口，附加选区显示候选摘要 -----------------------------------
+
+let attachMenuBusy = false;
+async function refreshAttachMenu(): Promise<void> {
+  if (attachMenuBusy) return;
+  attachMenuBusy = true;
+  try {
+    const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+    const tabId = typeof tabs[0]?.id === 'number' ? tabs[0]!.id : null;
+    const info = tabId === null ? null : await tabSend<ChatSourceInfo>(tabId, { type: 'blc-chat-source' });
+    const got = tabId === null ? null : await send<SelectionCandidateResult>({ type: 'selectionCandidateGet', tabId });
+    const sourceType = info?.source?.sourceType;
+    // 菜单按来源显示对应入口：视频页不显示“附加页面”，非视频页不显示“附加视频字幕”
+    (document.getElementById('chat-attach-page') as HTMLElement).hidden = sourceType === 'youtube';
+    (document.getElementById('chat-attach-video') as HTMLElement).hidden = sourceType !== 'youtube';
+    const summary = document.getElementById('chat-attach-selection-summary')!;
+    const candidate = got?.ok ? got.candidate : null;
+    if (candidate && info && !candidateStale(candidate, info)) {
+      summary.textContent = `${candidate.text.replace(/\s+/g, ' ').slice(0, 40)}${candidate.text.length > 40 ? '…' : ''} · ${candidate.source.sourceType === 'youtube' ? '视频字幕' : candidate.source.sourceType === 'x' ? 'X 帖子' : '网页'}`;
+    } else {
+      summary.textContent = candidate ? '选区与当前页面不一致，请重新选择' : selectionMissingReason(info ?? ({ type: 'blc-chat-source-info', source: null, canMaterial: false, hint: '', pageUrl: '' } satisfies ChatSourceInfo));
+    }
+  } finally {
+    attachMenuBusy = false;
+  }
+}
+
 // ---- 生命周期 ---------------------------------------------------------------------
 
 export function initChatView(d: ChatViewDeps): void {
   deps = d;
   const attachments = document.getElementById('chat-attachments') as HTMLDetailsElement;
+  attachments.addEventListener('toggle', () => { if (attachments.open) void refreshAttachMenu(); });
   for (const kind of ['page', 'selection', 'video'] as const) document.getElementById(`chat-attach-${kind}`)?.addEventListener('click', () => { attachments.open = false; void attachMaterial(kind); });
   document.getElementById('view-chat')?.addEventListener('click', e => { if (!attachments.contains(e.target as Node)) attachments.open = false; });
   attachments.addEventListener('keydown', e => { if (e.key === 'Escape') { attachments.open = false; attachments.querySelector('summary')?.focus(); } });
+  // 附件区：预览点击原位展开；× 移除材料及焦点、保留问题
+  document.getElementById('chat-attachment-chip')?.addEventListener('click', () => {
+    attachmentExpanded = !attachmentExpanded;
+    renderAttachment();
+  });
+  document.getElementById('chat-attachment-remove')?.addEventListener('click', async () => {
+    const op = operation;
+    clearInlineError();
+    const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatRemoveMaterial', chatId });
+    if (r?.ok && op === operation) { chatQuote = null; chatSegmentIndex = 0; attachmentExpanded = false; resetCitePanel(); await acceptRecord(r.chat); }
+    else if (op === operation) inlineError('移除失败，请重试');
+  });
   document.getElementById('chat-settings')?.addEventListener('click', () => deps?.switchView('settings'));
   void browser.windows.getCurrent().then(w => {
     chatWindowId = w.id ?? -1;

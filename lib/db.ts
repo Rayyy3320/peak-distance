@@ -28,12 +28,17 @@ import {
   type QuoteRef,
 } from '@/shared/chat';
 import type { EntryView, SaveResult } from '@/shared/messages';
+import { effectiveEntryLanguage, normalizeLangTag, entryKeyOf, parseEntryKey, LANG_UNDETERMINED } from '@/shared/languages';
+import { planLegacyLanguage } from '@/shared/vocab';
+import type { VaultIdentity, VaultPendingWrite, VaultStatus } from '@/shared/vault';
 
 const DB_NAME = 'blc-learning';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const ENTRIES = 'entries';
 const CONTEXTS = 'contexts';
 const CHATS = 'conversations';
+const VAULT = 'vault'; // 目录句柄 + 库身份（仅 background 读写）
+const VAULT_QUEUE = 'vaultQueue'; // 待写入学习库的队列（幂等键 id）
 
 function px<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -76,6 +81,10 @@ function openDb(): Promise<IDBDatabase> {
           };
         }
       }
+      // M11 v5：学习库句柄／身份（out-of-line 键 'handle'/'identity'）与待写入队列。
+      // 不迁移旧词条语言 —— 语言赋值由专门迁移批次按证据执行（spec 第 5 节）。
+      if (!db.objectStoreNames.contains(VAULT)) db.createObjectStore(VAULT);
+      if (!db.objectStoreNames.contains(VAULT_QUEUE)) db.createObjectStore(VAULT_QUEUE, { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -94,7 +103,9 @@ async function withDb<T>(fn: (db: IDBDatabase) => Promise<T>): Promise<T> {
 function toEntryView(e: VocabEntryRecord, contexts: ContextRecord[]): EntryView {
   return {
     key: e.key,
+    language: e.language,
     expression: e.expression,
+    note: e.note,
     kind: e.kind,
     status: e.status,
     createdAt: e.createdAt,
@@ -210,15 +221,21 @@ export async function getEntry(key: string): Promise<EntryView | null> {
   });
 }
 
-export async function listEntries(query?: string): Promise<EntryView[]> {
+export async function listEntries(query?: string, language?: string): Promise<EntryView[]> {
   return withDb(async (db) => {
     const tx = db.transaction([ENTRIES, CONTEXTS], 'readonly');
     const entries = (await px(tx.objectStore(ENTRIES).getAll())) as VocabEntryRecord[];
     const contexts = (await px(tx.objectStore(CONTEXTS).getAll())) as ContextRecord[];
     await txDone(tx);
     const q = query?.trim().toLowerCase() ?? '';
+    // 语言筛选：'all'／缺省 = 全部；'und' = 待确认集合（已迁移、证据不足）。
+    // 迁移前旧记录（无语言）只在全部视图出现，不冒充任何语言。
+    const wantLang = !language || language === 'all' ? null : normalizeLangTag(language);
     return entries
-      .filter((e) => !q || e.key.includes(q) || e.expression.toLowerCase().includes(q))
+      .filter((e) => {
+        if (wantLang && effectiveEntryLanguage(e) !== wantLang) return false;
+        return !q || e.key.includes(q) || e.expression.toLowerCase().includes(q);
+      })
       .map((e) => toEntryView(e, contexts))
       .sort((a, b) => b.updatedAt - a.updatedAt);
   });
@@ -232,10 +249,30 @@ export async function listIndex(): Promise<VocabIndexItem[]> {
     await txDone(tx);
     return entries.map((e) => ({
       key: e.key,
+      language: e.language,
       expression: e.expression,
       status: e.status,
       forms: e.forms ?? [],
     }));
+  });
+}
+
+/** 个人笔记（M11：学习库“我的笔记”同源字段；空串清除）。 */
+export async function setEntryNote(key: string, note: string): Promise<boolean> {
+  return withDb(async (db) => {
+    const tx = db.transaction([ENTRIES], 'readwrite');
+    const store = tx.objectStore(ENTRIES);
+    const entry = (await px(store.get(key))) as VocabEntryRecord | undefined;
+    if (!entry) {
+      await txDone(tx);
+      return false;
+    }
+    if (note.trim()) entry.note = note.slice(0, 4000);
+    else delete entry.note;
+    entry.updatedAt = Date.now();
+    store.put(entry);
+    await txDone(tx);
+    return true;
   });
 }
 
@@ -599,5 +636,357 @@ export async function deleteSentence(id: string): Promise<void> {
     const tx = db.transaction('sentences', 'readwrite');
     tx.objectStore('sentences').delete(id);
     await txDone(tx);
+  });
+}
+
+// ---- M11 学习库：句柄／身份／待写入队列（仅 background 读写） ---------------------
+// 句柄经 structured clone 存入 IDB（具体权限恢复行为以 V 探针实测为准），
+// 类型在 lib/vault/** 边界处收窄，这里按 unknown 保管。
+
+interface VaultStatusMeta {
+  lastCommitAt: number | null;
+  lastError: string | null;
+}
+
+export async function getVaultIdentity(): Promise<VaultIdentity | null> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = (await px(tx.objectStore(VAULT).get('identity'))) as VaultIdentity | undefined;
+    await txDone(tx);
+    return r ?? null;
+  });
+}
+
+export async function setVaultIdentity(identity: VaultIdentity): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(identity, 'identity');
+    await txDone(tx);
+  });
+}
+
+export async function clearVault(): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).clear(); // 断开：句柄与身份移除，不删除文件；待办按库身份保留在队列
+    await txDone(tx);
+  });
+}
+
+export async function getVaultHandle(): Promise<unknown> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = await px(tx.objectStore(VAULT).get('handle'));
+    await txDone(tx);
+    return r ?? null;
+  });
+}
+
+export async function setVaultHandle(handle: unknown): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(handle, 'handle');
+    await txDone(tx);
+  });
+}
+
+/** 本机事务提交成功后入队（幂等：同 id 覆盖，重试不重复导入）。 */
+export async function enqueueVaultWrite(write: VaultPendingWrite): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT_QUEUE, 'readwrite');
+    tx.objectStore(VAULT_QUEUE).put(write);
+    await txDone(tx);
+  });
+}
+
+export async function listVaultQueue(): Promise<VaultPendingWrite[]> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT_QUEUE, 'readonly');
+    const items = (await px(tx.objectStore(VAULT_QUEUE).getAll())) as VaultPendingWrite[];
+    await txDone(tx);
+    return items.sort((a, b) => a.queuedAt - b.queuedAt);
+  });
+}
+
+/** 写入成功后出队。 */
+export async function removeVaultWrite(id: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT_QUEUE, 'readwrite');
+    tx.objectStore(VAULT_QUEUE).delete(id);
+    await txDone(tx);
+  });
+}
+
+export async function markVaultWriteAttempt(id: string, error?: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction([VAULT_QUEUE, VAULT], 'readwrite');
+    const store = tx.objectStore(VAULT_QUEUE);
+    const write = (await px(store.get(id))) as VaultPendingWrite | undefined;
+    if (write) {
+      write.attempts = (write.attempts ?? 0) + 1;
+      write.lastError = error;
+      store.put(write);
+    }
+    const metaStore = tx.objectStore(VAULT);
+    const meta = (await px(metaStore.get('status'))) as VaultStatusMeta | undefined;
+    metaStore.put(
+      {
+        lastCommitAt: error ? (meta?.lastCommitAt ?? null) : Date.now(),
+        lastError: error ?? null,
+      },
+      'status',
+    );
+    await txDone(tx);
+  });
+}
+
+/** 面板／设置页展示的库状态；connected = 已持有句柄（权限在写入时验证）。 */
+export async function getVaultStatus(): Promise<VaultStatus> {
+  return withDb(async db => {
+    const tx = db.transaction([VAULT, VAULT_QUEUE], 'readonly');
+    const handle = await px(tx.objectStore(VAULT).get('handle'));
+    const identity = (await px(tx.objectStore(VAULT).get('identity'))) as
+      | VaultIdentity
+      | undefined;
+    const queue = (await px(tx.objectStore(VAULT_QUEUE).getAll())) as VaultPendingWrite[];
+    const meta = (await px(tx.objectStore(VAULT).get('status'))) as VaultStatusMeta | undefined;
+    await txDone(tx);
+    return {
+      connected: handle != null,
+      identity: identity ?? null,
+      pendingCount: queue.length,
+      lastCommitAt: meta?.lastCommitAt ?? null,
+      lastError: meta?.lastError ?? null,
+    };
+  });
+}
+
+// ---- 学习库读回：外部记录落库与同步快照（三方合并的 base） ------------------------
+
+/** 外部（Obsidian）记录整体落库：词条替换 + 上下文全量重建（单一事务）。 */
+export async function importVaultEntry(
+  entry: VocabEntryRecord,
+  contexts: Omit<ContextRecord, 'id'>[],
+): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction([ENTRIES, CONTEXTS], 'readwrite');
+    const entries = tx.objectStore(ENTRIES);
+    const contextStore = tx.objectStore(CONTEXTS);
+    entries.put(entry);
+    const ids = (await px(contextStore.index('entryKey').getAllKeys(entry.key))) as IDBValidKey[];
+    for (const id of ids) contextStore.delete(id);
+    for (const c of contexts) contextStore.add({ ...c, entryKey: entry.key });
+    await txDone(tx);
+  });
+}
+
+export async function upsertVaultSentence(sentence: SavedSentence): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction('sentences', 'readwrite');
+    tx.objectStore('sentences').put(sentence);
+    await txDone(tx);
+  });
+}
+
+/** 上次同步快照（JSON 字符串）：三方合并的 base；缺失返回 null。 */
+export async function getSyncSnapshot(recordId: string): Promise<string | null> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = (await px(tx.objectStore(VAULT).get(`sync:${recordId}`))) as string | undefined;
+    await txDone(tx);
+    return r ?? null;
+  });
+}
+
+export async function setSyncSnapshot(recordId: string, json: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(json, `sync:${recordId}`);
+    await txDone(tx);
+  });
+}
+
+/** 列出全部同步快照的 recordId（删除检测用）。 */
+export async function listSyncSnapshotIds(): Promise<string[]> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const keys = (await px(tx.objectStore(VAULT).getAllKeys())) as IDBValidKey[];
+    await txDone(tx);
+    return keys.filter((k) => String(k).startsWith('sync:')).map((k) => String(k).slice(5));
+  });
+}
+
+export async function deleteSyncSnapshot(recordId: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).delete(`sync:${recordId}`);
+    await txDone(tx);
+  });
+}
+
+/** 断开时清理同步快照（待办队列保留，按库身份重连后重建）。 */
+export async function clearSyncSnapshots(): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    const keys = (await px(tx.objectStore(VAULT).getAllKeys())) as IDBValidKey[];
+    for (const k of keys) if (String(k).startsWith('sync:')) tx.objectStore(VAULT).delete(k);
+    await txDone(tx);
+  });
+}
+
+/** vault store 的通用键值（冲突记录等小对象）。 */
+export async function putVaultRaw(key: string, value: unknown): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(value, key);
+    await txDone(tx);
+  });
+}
+
+export async function getVaultRaw<T>(key: string): Promise<T | null> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = (await px(tx.objectStore(VAULT).get(key))) as T | undefined;
+    await txDone(tx);
+    return r ?? null;
+  });
+}
+
+
+/** 学习库读回的会话落库：本地不存在则插入；文件较新且本地无进行中生成时替换。
+ *  streaming 本地记录不被动（另一浏览器不接管，spec 4.5）。 */
+export async function upsertChatRecordFromVault(record: ChatRecord): Promise<'inserted' | 'replaced' | 'kept-local'> {
+  return withDb(async db => {
+    const tx = db.transaction([CHATS], 'readwrite');
+    const store = tx.objectStore(CHATS);
+    const local = (await px(store.get(record.id))) as ChatRecord | undefined;
+    if (!local) {
+      store.put(record);
+      await txDone(tx);
+      return 'inserted';
+    }
+    const liveLocal = local.messages.some(m => m.role === 'assistant' && m.state === 'streaming');
+    if (!liveLocal && record.updatedAt > local.updatedAt) {
+      store.put({ ...record, draft: local.draft, pendingQuote: local.pendingQuote });
+      await txDone(tx);
+      return 'replaced';
+    }
+    await txDone(tx);
+    return 'kept-local';
+  });
+}
+
+// ---- M11 语言迁移：旧词条按证据赋语言（spec 第 5 节） ------------------------------
+// 幂等：迁移后不再存在“裸键且无 language”的词条；键冲突时合并（不增副本）。
+// 旧键 → 新键映射存 vault store 'legacyMap'（可追溯）。
+
+export interface LanguageMigrationReport {
+  entriesScanned: number;
+  assigned: number;   // 单一证据语言
+  split: number;      // 跨语言语境拆分
+  undetermined: number; // 无证据 → 待确认
+  merged: number;     // 迁入已存在的同语言词条
+  sentencesBackfilled: number;
+}
+
+export async function migrateLegacyLanguages(): Promise<LanguageMigrationReport> {
+  const report: LanguageMigrationReport = {
+    entriesScanned: 0, assigned: 0, split: 0, undetermined: 0, merged: 0, sentencesBackfilled: 0,
+  };
+  return withDb(async db => {
+    const tx = db.transaction([ENTRIES, CONTEXTS, VAULT, 'sentences'], 'readwrite');
+    const entries = tx.objectStore(ENTRIES);
+    const contexts = tx.objectStore(CONTEXTS);
+    const vault = tx.objectStore(VAULT);
+
+    const allEntries = (await px(entries.getAll())) as VocabEntryRecord[];
+    const allContexts = (await px(contexts.getAll())) as ContextRecord[];
+    const byKey = new Map(allEntries.map(e => [e.key, e]));
+    const ctxsOf = (key: string) => allContexts.filter(c => c.entryKey === key);
+    const legacyMap: Record<string, string[]> = (await px(vault.get('legacyMap'))) as Record<string, string[]> ?? {};
+
+    for (const entry of allEntries) {
+      if (entry.language) continue;
+      if (parseEntryKey(entry.key)) continue; // 已是语言作用域键
+      report.entriesScanned++;
+      const ctxs = ctxsOf(entry.key);
+      const plan = planLegacyLanguage(
+        ctxs.map(c => ({
+          sourceType: c.sourceType ?? 'web',
+          ...(c.video?.trackLang ? { trackLang: c.video.trackLang } : {}),
+          ...(c.result?.kind === 'dictionary' ? { hasDictionaryResult: true } : {}),
+        })),
+      );
+
+      // 目标分组：assign/none 单组；split 多组
+      const groups: { language: string; indexes: number[] }[] =
+        plan.kind === 'split'
+          ? plan.groups.map(g => ({ language: g.language, indexes: g.contextIndexes }))
+          : [{ language: plan.kind === 'assign' ? plan.language : LANG_UNDETERMINED, indexes: ctxs.map((_, i) => i) }];
+      if (plan.kind === 'assign') report.assigned++;
+      else if (plan.kind === 'split') report.split++;
+      else report.undetermined++;
+
+      const newKeys: string[] = [];
+      for (const g of groups) {
+        const newKey = entryKeyOf(g.language, entry.expression);
+        newKeys.push(newKey);
+        const existing = byKey.get(newKey);
+        if (existing && existing !== entry) {
+          // 已有同语言词条：语境迁入，状态取较新的一方（不清空用户操作）
+          for (const i of g.indexes) {
+            const c = ctxs[i]!;
+            c.entryKey = newKey;
+            contexts.put(c);
+          }
+          const newer = existing.updatedAt >= entry.updatedAt ? existing : entry;
+          existing.status = newer.status;
+          existing.updatedAt = Date.now();
+          existing.forms = [...new Set([...existing.forms ?? [], ...(newer.forms ?? [])])];
+          if (entry.note && !existing.note) existing.note = entry.note;
+          entries.put(existing);
+          entries.delete(entry.key);
+          report.merged++;
+          continue;
+        }
+        if (existing === entry) continue; // 目标键恰为自身（不应发生：裸键）
+        const newEntry: VocabEntryRecord = {
+          ...entry,
+          key: newKey,
+          language: g.language,
+          legacyKey: entry.key,
+          updatedAt: Date.now(),
+        };
+        byKey.set(newKey, newEntry);
+        entries.put(newEntry);
+        for (const i of g.indexes) {
+          const c = ctxs[i]!;
+          c.entryKey = newKey;
+          contexts.put(c);
+        }
+        if (groups.length > 1) {
+          // 拆分组除最大组外复制状态；词条本体（forms/note）保留在首组
+          delete (newEntry as Partial<VocabEntryRecord>).forms;
+        }
+      }
+      if (newKeys.length > 1 || newKeys[0] !== entry.key) entries.delete(entry.key);
+      legacyMap[entry.key] = newKeys;
+    }
+
+    // 旧句子收藏：语言 = 轨道语言
+    const sentenceStore = tx.objectStore('sentences');
+    const sentences = (await px(sentenceStore.getAll())) as SavedSentence[];
+    for (const s of sentences) {
+      if (s.language) continue;
+      const primary = (s.video.trackLang ?? '').trim().toLowerCase().split('-')[0] ?? '';
+      if (!/^[a-z]{2,3}$/.test(primary)) continue;
+      s.language = primary;
+      sentenceStore.put(s);
+      report.sentencesBackfilled++;
+    }
+
+    vault.put(legacyMap, 'legacyMap');
+    await txDone(tx);
+    return report;
   });
 }

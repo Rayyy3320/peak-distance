@@ -9,10 +9,13 @@ import type { LearningResult, ContextExplanation } from './vocab';
 // 指定标签页的 content script（字幕视图 / 播放控制），不经过 background。
 
 import type { LookupSnapshot, VocabIndexItem, VocabStatus } from './vocab';
+import type { LanguageTag } from './languages';
+import type { VaultIdentity, VaultStatus } from './vault';
 import type {
   ChatRecordView,
   MaterialPayload,
   QuoteRef,
+  SelectionCandidate,
   SourceDescriptor,
 } from './chat';
 
@@ -26,11 +29,31 @@ export type LookupErrorCode =
   | 'http'
   | 'bad-response';
 
+/**
+ * M11 查询意图（spec 3.3 路由表）：hover / preview / prefetch 一律不触发
+ * AI 兜底；缺省按 active（主动点击）处理（迁移前消息兼容）。
+ */
+export type LookupIntent = 'active' | 'hover' | 'preview' | 'prefetch';
+
 /** content script / 侧栏 / 设置页 → background 的请求。 */
 export type BgcRequest =
-  | { type: 'translateSelection'; text: string; requestId: string }
-  | { type: 'lookup'; snapshot: LookupSnapshot; source?: DictionarySource; requestId?: string }
-  | { type: 'explainContext'; snapshot: LookupSnapshot; requestId?: string }
+  | {
+      type: 'translateSelection';
+      text: string;
+      requestId: string;
+      sourceLang?: LanguageTag;
+      targetLang?: LanguageTag;
+    }
+  | {
+      type: 'lookup';
+      snapshot: LookupSnapshot; // 源语言在 snapshot.lang（'und' = 待确认）
+      source?: DictionarySource;
+      /** 理解语言（目标）；缺省用设置解析 */
+      targetLang?: LanguageTag;
+      intent?: LookupIntent;
+      requestId?: string;
+    }
+  | { type: 'explainContext'; snapshot: LookupSnapshot; targetLang?: LanguageTag; requestId?: string }
   | { type: 'cancelOnline'; requestId: string }
   | { type: 'subtitleMode'; videoId: string; mode?: 'regular' | 'ai'; autoPause?: boolean }
   | { type: 'saveSentence'; sentence: import('./vocab').SavedSentence }
@@ -51,9 +74,10 @@ export type BgcRequest =
   | { type: 'backfillResult'; contextId: number; result?: LearningResult; explanation?: ContextExplanation }
   | { type: 'backfillDefinition'; contextId: number; definition: string }
   | { type: 'setStatus'; key: string; status: VocabStatus } // 落到关联词条
+  | { type: 'setNote'; key: string; note: string } // 个人笔记（学习库“我的笔记”同源）
   | { type: 'deleteEntry'; key: string }
   | { type: 'removeForm'; key: string; form: string }
-  | { type: 'listEntries'; query?: string }
+  | { type: 'listEntries'; query?: string; language?: string } // language: 'all'（缺省）| 语言标签 | 'und'
   | { type: 'vocabIndex' } // 轻量索引：content script 标记用，不含上下文
   | { type: 'getSettings' } // 不含 key
   | { type: 'setSetting'; name: keyof Settings; value: Settings[keyof Settings] }
@@ -63,11 +87,30 @@ export type BgcRequest =
       requestId?: string;
       videoId: string;
       trackId: string;
+      sourceLang?: LanguageTag; // 原文轨道语言
+      targetLang?: LanguageTag; // 译文语言
       items: { id: number; text: string }[];
     }
-  | { type: 'openSettings' };
+  // ---- M11 学习库（页面侧选目录/授权后通知 background；文件操作在 lib/vault） ----
+  | { type: 'vaultConnect' } // 页面 pickVaultDirectoryInPage 成功后调用（也用于重新授权）
+  | { type: 'vaultDisconnect' } // 断开：不删除文件，待办按库身份保留
+  | { type: 'vaultStatus' }
+  | { type: 'vaultFlush' } // 立即尝试提交待写入队列并读回
+  | { type: 'vaultSync' } // 只读回（打开面板/焦点恢复触发）
+  | { type: 'openSettings' }
+  // ---- 选区候选（选区查词 spec） ----
+  | SelectionCandidateSetMessage
+  | SelectionCandidateGetMessage;
 
-export type OnlineLookupResult = { ok: true; result: LearningResult } | BgcError;
+/**
+ * 在线查词结果。degraded 说明结果经过了降级（不掩盖故障）：
+ * - dictionary-failure：词典网络／限流故障，改用免费译文；
+ * - ai-failed：AI 兜底失败，回退免费译文；
+ * - ai-unconfigured：兜底开关开启但未配置 Key，当前查询走免费路径。
+ */
+export type OnlineLookupResult =
+  | { ok: true; result: LearningResult; degraded?: 'dictionary-failure' | 'ai-failed' | 'ai-unconfigured' }
+  | BgcError;
 
 /** 显式 AI 语境解释结果。 */
 export type LookupResult =
@@ -100,9 +143,13 @@ export interface ContextView {
 
 export interface EntryView {
   key: string;
+  /** 缺失 = 迁移前旧记录；'und' = 待确认集合（可筛选／复习） */
+  language?: LanguageTag;
   expression: string;
   kind: 'word' | 'phrase';
   status: VocabStatus;
+  /** 个人笔记（学习库“我的笔记”双向同步） */
+  note?: string;
   createdAt: number;
   updatedAt: number;
   forms: string[];
@@ -132,6 +179,14 @@ export type SettingsView = Settings;
 
 export type GetSettingsResult = { ok: true; settings: SettingsView } | BgcError;
 
+// ---- M11 学习库消息结果 ----------------------------------------------------------
+
+export type VaultStatusResult = { ok: true; status: VaultStatus } | BgcError;
+export type VaultConnectResult =
+  | { ok: true; vault: VaultIdentity | null; imported: boolean } // imported = 首次连接合并了本机持久记录
+  | BgcError;
+export type VaultMutationResult = { ok: true } | BgcError;
+
 /**
  * background → 扩展页面与各标签页 content script 的广播。
  * 扩展页面走 runtime.sendMessage；content script 走 tabs.sendMessage
@@ -141,7 +196,9 @@ export type BroadcastEvent =
   | { type: 'ai-service-changed' }
   | { type: 'vocab-changed' }
   | { type: 'sentences-changed' }
-  | { type: 'settings-changed' };
+  | { type: 'settings-changed' }
+  /** 学习库状态变化：连接／断开、写入回执、读回变更（UI 刷新写入状态） */
+  | { type: 'vault-changed' };
 
 // ---- 标签页直达消息（侧栏 ↔ 视频页 content script） --------------------------
 
@@ -171,6 +228,8 @@ export type TabMessage = SubGetMessage | SubControlMessage;
 /** content script → 侧栏：字幕视图状态（非视频页 videoId 为空）。 */
 export interface SubViewState {
   chineseVisible?: boolean;
+  /** M11：当前译文语言（原文轨道 → 理解语言）；缺省视为中文（迁移前兼容） */
+  translationLang?: LanguageTag;
   type: 'blc-sub-state';
   videoId: string;
   title: string;
@@ -287,7 +346,28 @@ export interface ChatSourceInfo {
   source: SourceDescriptor | null;
   canMaterial: boolean;
   hint: string;
+  /** 当前页面地址（选区候选身份校验用；面板上下文无 tabs 权限读 tab.url）。 */
+  pageUrl: string;
 }
+
+// ---- 选区候选（选区查词 spec） -----------------------------------------------------
+
+/** 内容脚本（隐式 sender 标签页）/ 侧栏（显式 tabId）→ background：固定或清除候选。 */
+export interface SelectionCandidateSetMessage {
+  type: 'selectionCandidateSet';
+  tabId?: number;
+  candidate: SelectionCandidate | null;
+}
+
+/** 侧栏 → background：读取指定标签页的最近选区候选。 */
+export interface SelectionCandidateGetMessage {
+  type: 'selectionCandidateGet';
+  tabId: number;
+}
+
+export type SelectionCandidateResult =
+  | { ok: true; candidate: SelectionCandidate | null }
+  | BgcError;
 
 export interface ChatMaterialInfo {
   type: 'blc-chat-material-info';

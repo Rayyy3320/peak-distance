@@ -4,6 +4,7 @@ import type { Settings } from './settings';
 import type { EntryView } from './messages';
 import { cueWords, fmtClock } from './cues';
 import { sentenceId, type SavedSentence, type VideoRef } from './vocab';
+import { normalizeExpressionInLanguage } from './languages';
 
 export interface WorkspaceState {
   videoId: string;
@@ -16,6 +17,8 @@ export interface WorkspaceState {
   entries: EntryView[];
   notice: string;
   chinese: boolean;
+  /** 当前轨道语言（词次分词与查词边界用；缺省按英文兼容） */
+  trackLang?: string;
 }
 
 const css = `
@@ -99,7 +102,7 @@ export function createYoutubeWorkspace(actions: {
       const top = renderedTab === tab ? body.scrollTop : scrollPositions.get(tab) ?? 0;
       body.replaceChildren();
       if (tab === 'subs') {
-        if (!state.cues.length) empty(state.notice || '正在读取英文字幕…');
+        if (!state.cues.length) empty(state.notice || '正在读取字幕…');
         state.cues.forEach((cue, i) => {
           const row = line(i), tools = meta(row);
           button(tools, fmtClock(cue.start), () => actions.seek(i)).dataset.playback = '';
@@ -109,7 +112,7 @@ export function createYoutubeWorkspace(actions: {
         });
       } else if (tab === 'words') {
         if (!state.cues.length) empty(state.notice || '字幕尚未就绪');
-        for (const item of cueWords(state.cues)) {
+        for (const item of cueWords(state.cues, state.trackLang || undefined)) {
           const row = document.createElement('div'); row.className = 'row';
           const word = button(row, `${item.word} · ${item.count} 次`, () => { details.open = true; actions.lookup(item.word, item.positions[0]!, word); });
           word.className = 'word'; word.dataset.word = item.word;
@@ -154,9 +157,11 @@ export function createYoutubeWorkspace(actions: {
       renderedTab = tab; lastCues = state.cues; lastSentences = state.sentences; lastEntries = state.entries;
     }
     if (rebuild || lastStatuses !== state.statuses) {
+      const lang = (state.trackLang || 'en').split('-')[0]!;
       body.querySelectorAll<HTMLElement>('.w,[data-word]').forEach(el => {
         el.classList.remove('saved', 'learning', 'known');
-        const status = state.statuses.get((el.dataset.word ?? el.textContent ?? '').toLowerCase());
+        const word = el.dataset.word ?? el.textContent ?? '';
+        const status = state.statuses.get(normalizeExpressionInLanguage(word, lang));
         if (status) el.classList.add(status);
       });
       lastStatuses = state.statuses;

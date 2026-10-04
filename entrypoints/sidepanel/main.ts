@@ -4,8 +4,12 @@ import { createYoutubeWorkspace, type WorkspaceState } from '@/shared/youtubeWor
 import { isPanelView, panelStateKey, panelTransportFailure, type SelectionSnapshot, type PanelFrameState } from '@/shared/panel';
 import { createTranslationPopup } from '@/shared/translationPopup';
 import { createLookupPopup } from '@/shared/lookupPopup';
-import { shadowSelection } from '@/shared/selection';
-import { buildSurfaceStatusMap } from '@/shared/vocab';
+import { shadowSelection, rangeOffsetsIn, clampRangeToElement } from '@/shared/selection';
+import { buildMarkBuckets } from '@/shared/marker';
+import { effectiveEntryLanguage, isRtlLanguage, langDisplayName } from '@/shared/languages';
+import { classifySelection, effectiveLookupExpression, segmentWords } from '@/shared/tokenize';
+import { materialFromCandidate, type SelectionCandidate } from '@/shared/chat';
+import { CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
 // 侧栏三个视图：生词本（词条 / 上下文 / 词形关联管理）、字幕（当前标签页
 // 视频的原文列表 + 译文 + 播放控制）、复习（原句回忆，无 AI 调用）。
 // 数据全部来自 background 的 IndexedDB；vocab-changed 广播后刷新。
@@ -16,6 +20,7 @@ import { videoContextUrl, blankExpression, type SavedSentence, type VocabStatus 
 import { buildReviewQueue, refreshQueue, type ReviewItem } from '@/shared/review';
 import { fmtClock } from '@/shared/cues';
 import {
+  attachSelectionCandidate,
   chatViewEnter,
   chatViewLeave,
   initChatView,
@@ -229,9 +234,17 @@ function renderEntry(entry: EntryView): HTMLElement {
 
   const head = el('div', 'entry-head');
   const expr = el('h2', 'expr', entry.expression);
+  const entryLang = effectiveEntryLanguage(entry);
+  if (entryLang && isRtlLanguage(entryLang)) expr.dir = 'rtl';
   head.appendChild(expr);
   const kind = el('span', 'kind', entry.kind === 'word' ? '词' : '短语');
   head.appendChild(kind);
+  // 语言徽标：缺失（迁移前旧记录）不显示，不冒充任何语言
+  if (entryLang) {
+    const chip = el('span', 'kind', langDisplayName(entryLang));
+    chip.title = entryLang;
+    head.appendChild(chip);
+  }
 
   const sel = el('select', 'status') as HTMLSelectElement;
   for (const s of ['saved', 'learning', 'known'] as const) {
@@ -260,8 +273,30 @@ function renderEntry(entry: EntryView): HTMLElement {
   card.appendChild(head);
 
   const first=entry.contexts[0];
-  const meaning=first?.result?.kind==='dictionary'?first.result.entry.senses[0]?.definition:first?.result?.kind==='translation'?first.result.text:first?.definition;
+  const meaning=first?.result?.kind==='dictionary'?first.result.entry.senses[0]?.definition:first?.result?.kind==='translation'?first.result.text:first?.result?.kind==='ai-definition'?first.result.text.split('\n')[0]:first?.definition;
   if(meaning)card.append(el('p','entry-preview',meaning));
+
+  // 个人笔记（学习库“我的笔记”同源；就地编辑，正常保存给就近状态）
+  const noteBox = el('details', 'note-box');
+  const noteSummary = el('summary', undefined, entry.note ? '我的笔记' : '添加笔记');
+  noteBox.appendChild(noteSummary);
+  const noteArea = document.createElement('textarea');
+  noteArea.value = entry.note ?? '';
+  noteArea.placeholder = '写下自己的理解（同步到学习库“我的笔记”，Obsidian 中可直接编辑）';
+  noteArea.setAttribute('aria-label', `${entry.expression} 我的笔记`);
+  const noteState = el('p', 'hint');
+  const noteSave = el('button', 'ghost', '保存笔记');
+  noteSave.addEventListener('click', async () => {
+    noteSave.disabled = true;
+    const r = await send<{ ok: boolean }>({ type: 'setNote', key: entry.key, note: noteArea.value });
+    noteSave.disabled = false;
+    noteState.textContent = r?.ok ? '已保存' : '保存失败，请重试';
+    if (r?.ok) noteSummary.textContent = noteArea.value.trim() ? '我的笔记' : '添加笔记';
+  });
+  const noteRow = el('div', 'note-actions');
+  noteRow.append(noteSave, noteState);
+  noteBox.append(noteArea, noteRow);
+  card.appendChild(noteBox);
 
   // 词形关联：查看 + 移除错误关联
   if (entry.forms.length) {
@@ -291,6 +326,7 @@ function renderEntry(entry: EntryView): HTMLElement {
       const sense = result.entry.senses[result.selectedSense ?? 0];
       if (sense) box.appendChild(el('p', 'definition', `${result.entry.source === 'youdao' ? '有道' : '剑桥英汉'} · ${sense.partOfSpeech ?? ''} ${sense.definition}`));
     } else if (c.result?.kind === 'translation') box.appendChild(el('p', 'definition', `翻译 · ${c.result.text}`));
+    else if (c.result?.kind === 'ai-definition') box.appendChild(el('p', 'definition', `AI 释义 · ${c.result.text}`));
     if (c.explanation) box.appendChild(el('p', 'definition', `AI 语境解释 · ${c.explanation.text}`));
     else if (c.definition) box.appendChild(el('p', 'definition', `已存语境释义 · ${c.definition}`));
     details.appendChild(box);
@@ -312,17 +348,39 @@ async function refresh(): Promise<void> {
     list.appendChild(el('div', 'empty', '加载失败，请重试'));
     return;
   }
-  if (r.entries.length === 0) {
+  // 语言筛选：全部 / 待确认 / 出现过的语言（记住选择，spec 3.4）
+  const filter = document.getElementById('lang-filter') as HTMLSelectElement;
+  const langs = [...new Set(r.entries.map((e) => effectiveEntryLanguage(e)).filter((l): l is string => !!l))].sort();
+  const wanted = localStorage.getItem('blc-lang-filter') ?? 'all';
+  if (filter.dataset.langs !== langs.join(',')) {
+    filter.dataset.langs = langs.join(',');
+    const current = wanted;
+    filter.replaceChildren();
+    const all = el('option', undefined, '全部语言'); all.value = 'all'; filter.appendChild(all);
+    const und = el('option', undefined, '待确认'); und.value = 'und'; filter.appendChild(und);
+    for (const l of langs) {
+      if (l === 'und') continue;
+      const o = el('option', undefined, langDisplayName(l)); o.value = l; filter.appendChild(o);
+    }
+    filter.value = [...filter.options].some((o) => o.value === current) ? current : 'all';
+  }
+  const filtered = filter.value === 'all' ? r.entries : r.entries.filter((e) => effectiveEntryLanguage(e) === filter.value);
+  if (filtered.length === 0) {
     list.appendChild(
-      el('div', 'empty', q ? '没有匹配的表达' : '还没有收藏的表达。在网页上选中一个词或短语，点击“查词”开始。'),
+      el('div', 'empty', q ? '没有匹配的表达' : filter.value !== 'all' ? '该语言暂无词条' : '还没有收藏的表达。在网页上选中一个词或短语，点击“查词”开始。'),
     );
     return;
   }
-  for (const e of r.entries) list.appendChild(renderEntry(e));
+  for (const e of filtered) list.appendChild(renderEntry(e));
   currentMain()?.scrollTo(0,savedScroll[currentView]??0);
 }
 
 document.getElementById('search')!.addEventListener('input', () => void refresh());
+document.getElementById('lang-filter')!.addEventListener('change', () => {
+  const filter = document.getElementById('lang-filter') as HTMLSelectElement;
+  localStorage.setItem('blc-lang-filter', filter.value);
+  void refresh();
+});
 
 // ---- 字幕视图（当前标签页的视频） ---------------------------------------------------
 
@@ -333,24 +391,97 @@ const videoWorkspace=createYoutubeWorkspace({
   bindWords:host=>{
     const events=host.shadowRoot!;
     let selectedAt=0;
+    // 字幕列表选区：单词/短语/句段/跨字幕项统一分类；原文行以外（译文、控件）不取
+    const rowIndexOf=(node:Node|null|undefined):number|null=>{
+      const element=node instanceof Element?node:node?.parentElement??null;
+      const row=element?.closest('[data-cue]');
+      return row?Number(row.getAttribute('data-cue')):null;
+    };
+    const enOf=(index:number):Element|null=>events.querySelector(`[data-cue="${index}"] .en`);
+    function listSelectionInfo(selection:{text:string;range:Range}):{
+      kind:'word'|'phrase'|'sentence'|'cross-cue';raw:string;expression:string|null;
+      firstIndex:number;count:number;hasWord:boolean;rect:DOMRect;
+    }|null{
+      const startIndex=rowIndexOf(selection.range.startContainer);
+      const endIndex=rowIndexOf(selection.range.endContainer);
+      if(startIndex===null&&endIndex===null)return null;
+      const first=startIndex??endIndex!;
+      const last=endIndex??startIndex!;
+      if(first===last){
+        const en=enOf(first);
+        if(!en)return null;
+        const clamped=clampRangeToElement(selection.range,en);
+        const raw=clamped.toString().replace(/\s+/g,' ').trim();
+        if(!raw)return null;
+        const lang=((cachedVideo?.trackLang||subsState?.trackLang)||'en').split('-')[0]!;
+        const cls=classifySelection(raw,lang);
+        let expression:string|null=null;
+        if(cls.kind!=='sentence'){
+          const offsets=rangeOffsetsIn(en,clamped);
+          if(offsets&&offsets.start<=offsets.end&&offsets.end<=offsets.text.length)
+            expression=effectiveLookupExpression(offsets.text,offsets.start,offsets.end,lang)?.expression??null;
+        }
+        return {kind:cls.kind,raw,expression,firstIndex:first,count:1,hasWord:cls.hasWord,rect:selection.range.getBoundingClientRect()};
+      }
+      // 跨字幕项：实际选择的原文（按行收窄到 .en，不含译文/控件文字）
+      const parts:string[]=[];
+      for(let i=Math.min(first,last);i<=Math.max(first,last);i++){
+        const en=enOf(i);
+        if(!en)continue;
+        const clamped=clampRangeToElement(selection.range,en);
+        const part=clamped.toString().replace(/\s+/g,' ').trim();
+        if(part)parts.push(part);
+      }
+      const raw=parts.join(' ').trim();
+      if(!raw)return null;
+      return {kind:'cross-cue',raw,expression:null,firstIndex:Math.min(first,last),count:Math.abs(last-first)+1,hasWord:false,rect:selection.range.getBoundingClientRect()};
+    }
+    function listSelectionCandidate(info:{kind:'word'|'phrase'|'sentence'|'cross-cue';raw:string;expression:string|null;firstIndex:number;count:number}):SelectionCandidate|null{
+      const state=subsState;
+      if(!state?.videoId||!state.trackId||subsTabId===null)return null;
+      const source:SelectionCandidate['source']={
+        sourceType:'youtube',
+        sourceKey:`yt:${state.videoId}`,
+        title:state.title||state.videoId,
+        url:`https://www.youtube.com/watch?v=${state.videoId}`,
+        video:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang},
+      };
+      const cue=state.cues[info.firstIndex];
+      if(info.kind==='cross-cue'){
+        return {at:Date.now(),pageUrl:source.url,text:info.raw,kind:'cross-cue',expression:null,source,
+          crossFromMs:cue?.startMs??0,crossCount:info.count};
+      }
+      if(!cue)return null;
+      return {at:Date.now(),pageUrl:source.url,text:info.raw,kind:info.kind,
+        expression:info.kind==='sentence'?null:info.expression,
+        lang:state.trackLang||undefined,source,
+        cue:{index:info.firstIndex,text:cue.text,startMs:cue.startMs,endMs:cue.endMs}};
+    }
     document.addEventListener('mouseup',e=>{
       if(currentView!=='subs'||e.composedPath().some(n=>n instanceof Element&&n.matches('#panel-selection-actions,#blc-lookup-popup,#pd-translation')))return;
-      const selection=shadowSelection(events),text=selection?.text??'';
-      if(!text||!(/\s/.test(text))||!subsState)return;
+      const selection=shadowSelection(events);
+      if(!selection||!subsState)return;
+      const info=listSelectionInfo(selection);
+      if(!info)return;
       selectedAt=Date.now();e.stopPropagation();
       document.getElementById('panel-selection-actions')?.remove();
       const buttons=el('div','selection-actions');buttons.id='panel-selection-actions';
-      const rect=selection!.range.getBoundingClientRect();buttons.style.left=Math.max(8,Math.min(rect.left,innerWidth-176))+'px';buttons.style.top=Math.min(rect.bottom+4,innerHeight-44)+'px';
-      const node=selection!.range.startContainer;
-      const element=node instanceof Element?node:node.parentElement;
-      const selectedRow=element?.closest('[data-cue]');
-      if(!selectedRow)return;
-      const selectedIndex=Number(selectedRow.getAttribute('data-cue'));
-      const selectedVideo=subsState.videoId,selectedCue=subsState.cues[selectedIndex];
-      if(!selectedCue)return;
-      const snapshot={text,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue.startMs)};
-      const translate=el('button',undefined,'翻译');translate.onmousedown=e=>e.preventDefault();translate.onclick=()=>{buttons.remove();selectionPopup.open(snapshot,rect);};buttons.append(translate);
-      if(text.length<=200){const lookup=el('button',undefined,'查词');lookup.onmousedown=e=>e.preventDefault();lookup.onclick=()=>{buttons.remove();if(subsState?.videoId===selectedVideo)void videoAction('lookup',selectedIndex,text);};buttons.append(lookup);}
+      const rect=info.rect;buttons.style.left=Math.max(8,Math.min(rect.left,innerWidth-220))+'px';buttons.style.top=Math.min(rect.bottom+4,innerHeight-44)+'px';
+      const selectedVideo=subsState.videoId,selectedCue=subsState.cues[info.firstIndex];
+      const candidate=listSelectionCandidate(info);
+      if(candidate)void send({type:'selectionCandidateSet',tabId:subsTabId??undefined,candidate});
+      const snapshot={text:info.raw,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue?.startMs??0)};
+      // 分类表：word=查词+对话；phrase=查词+翻译+对话；sentence/cross-cue=翻译+对话
+      if(info.kind!=='word'){
+        const translate=el('button',undefined,'翻译');translate.onmousedown=e=>e.preventDefault();translate.onclick=()=>{buttons.remove();selectionPopup.open(snapshot,rect);};buttons.append(translate);
+      }
+      if((info.kind==='word'||info.kind==='phrase')&&info.hasWord&&info.raw.length<=200){
+        const lookup=el('button',undefined,'查词');lookup.onmousedown=e=>e.preventDefault();lookup.onclick=()=>{buttons.remove();if(subsState?.videoId===selectedVideo)void videoAction('lookup',info.firstIndex,info.expression??info.raw);};buttons.append(lookup);
+      }
+      const chat=el('button','blc-chat-add');chat.title='添加到对话';chat.setAttribute('aria-label','添加到对话');chat.innerHTML=CHAT_ADD_ICON;
+      chat.onmousedown=e=>e.preventDefault();
+      chat.onclick=()=>{buttons.remove();if(candidate)void attachSelectionCandidate(candidate,{tabId:subsTabId??undefined});};
+      buttons.append(chat);
       const close=el('button',undefined,'×');close.setAttribute('aria-label','关闭选区操作');close.onclick=()=>buttons.remove();buttons.append(close);document.body.append(buttons);
     });
     const wordOf=(e:Event)=>(e.composedPath()[0] as Element)?.closest?.('.w') as HTMLElement|null;
@@ -362,7 +493,7 @@ const videoWorkspace=createYoutubeWorkspace({
     events.addEventListener('focusin',e=>{const w=wordOf(e);if(w&&w!==hoveredWord){hoveredWord=w;openWord(w,true);}});
     events.addEventListener('keydown',e=>{const key=e as KeyboardEvent,w=wordOf(e);if(w&&(key.key==='Enter'||key.key===' ')){key.preventDefault();hoveredWord=w;openWord(w,false);}});
   },
-  words:(parent,text)=>{for(const part of text.split(/([A-Za-z]+(?:['’][A-Za-z]+)*)/)){if(/^[A-Za-z]/.test(part)){const w=el('span','w',part);w.tabIndex=0;w.setAttribute('role','button');w.style.userSelect='text';parent.append(w);}else parent.append(document.createTextNode(part));}},
+  words:(parent,text)=>{const lang=((cachedVideo?.trackLang||subsState?.trackLang)||'en').split('-')[0]!;let last=0;for(const s of segmentWords(text,lang)){if(s.start>last)parent.append(document.createTextNode(text.slice(last,s.start)));const w=el('span','w',s.text);w.tabIndex=0;w.setAttribute('role','button');w.style.userSelect='text';parent.append(w);last=s.end;}if(last<text.length)parent.append(document.createTextNode(text.slice(last)));},
   seek:(i,play)=>void videoAction('seek',i,undefined,play),lookup:(word,i,anchor)=>openPanelWord(word,i,anchor,false),
   save:i=>void videoAction('save',i),remove:id=>void send({type:'deleteSentence',id}),
   ask:i=>{if(subsState?.cues[i])void subtitleAskAi(subsState,subsState.cues[i]!);},open:switchView,
@@ -377,7 +508,7 @@ function openPanelWord(word:string,index:number,anchor:HTMLElement,compact:boole
   let closed=false;
   const resume=()=>void tabSend(tabId,{type:'pd-video-action',videoId:state.videoId,index,action:'resumeLookup',token});
   void tabSend(tabId,{type:'pd-video-action',videoId:state.videoId,index,action:'pauseLookup',token}).then(()=>{if(closed)resume();});
-  lookupPopup.open({snapshot:{source:'video',expression:word,sentence:cue.text,title:state.title,video:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:cue.startMs}},anchor,compact,subLine:`YouTube · ${fmtClock(cue.startMs)}`,onContinueAsk:()=>void subtitleAskAi(state,cue),onClose:()=>{closed=true;resume();}});
+  lookupPopup.open({snapshot:{source:'video',expression:word,sentence:cue.text,title:state.title,lang:state.trackLang||undefined,video:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:cue.startMs}},anchor,compact,subLine:`YouTube · ${fmtClock(cue.startMs)}`,onContinueAsk:()=>void subtitleAskAi(state,cue),onClose:()=>{closed=true;resume();}});
   const card=lookupPopup.host()?.shadowRoot?.querySelector('.card');card?.addEventListener('pointerenter',()=>clearTimeout(closeTimer));card?.addEventListener('pointerleave',()=>{closeTimer=setTimeout(()=>{if(lookupPopup.isCompact()){lookupPopup.close();hoveredWord=null;}},220);});
 }
 async function videoAction(action:string,index:number,word?:string,play?:boolean) {
@@ -412,7 +543,10 @@ async function pollSubs():Promise<void> {
   const cues=state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0}));
   const stable=<T>(old:T,next:T):T=>JSON.stringify(old)===JSON.stringify(next)?old:next;
   cachedVideo={videoId:state.videoId,videoRef:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:0},
-    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),statuses:buildSurfaceStatusMap(index?.items??[]),sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[]),notice:state.notice,chinese:state.chineseVisible!==false};
+    trackLang:state.trackLang||undefined,
+    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),
+    statuses:buildMarkBuckets(index?.items??[]).get((state.trackLang||'en').split('-')[0]!)?.statusByKey??new Map<string,string>(),
+    sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[]),notice:state.notice,chinese:state.chineseVisible!==false};
   videoWorkspace.update(cachedVideo);
 }
 setInterval(()=>void pollSubs(),1000);

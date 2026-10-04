@@ -3,14 +3,24 @@
 // 重复消除、翻译预取窗口都在这里离线回归。
 
 import type { Cue } from './protocol';
+import { segmentWords } from './tokenize';
+import { normalizeExpressionInLanguage } from './languages';
 
-/** 按显示条目计词次；位置去重，不猜词形。 */
-export function cueWords(cues: Cue[]): { word: string; count: number; positions: number[] }[] {
+/**
+ * 按显示条目计词次；位置去重，不猜词形。
+ * M11：提供轨道语言时按该语言分词与规范化（与点击查词、标记同一边界）；
+ * 缺省沿用英文正则（迁移前调用方兼容）。
+ */
+export function cueWords(cues: Cue[], lang?: string): { word: string; count: number; positions: number[] }[] {
   const words = new Map<string, { word: string; count: number; positions: number[] }>();
+  const keyOf = (w: string) => (lang ? normalizeExpressionInLanguage(w, lang) : w.toLowerCase());
   cues.forEach((cue, index) => {
-    for (const match of cue.text.matchAll(/[A-Za-z][A-Za-z'’-]*/g)) {
-      const key = match[0].toLowerCase();
-      const item = words.get(key) ?? { word: match[0], count: 0, positions: [] };
+    const tokens = lang
+      ? segmentWords(cue.text, lang).map((s) => s.text)
+      : Array.from(cue.text.matchAll(/[A-Za-z][A-Za-z'’-]*/g), (m) => m[0]);
+    for (const token of tokens) {
+      const key = keyOf(token);
+      const item = words.get(key) ?? { word: token, count: 0, positions: [] };
       item.count++;
       if (item.positions.at(-1) !== index) item.positions.push(index);
       words.set(key, item);

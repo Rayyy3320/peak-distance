@@ -2,11 +2,13 @@ import {
   appendChatTurn,
   clearChat,
   getChat,
+  getVaultIdentity,
   listChats,
   resetChatTurn,
   saveAssistantProgress,
   setChatRetained,
 } from './db';
+import { enqueueChatWrite, flushVaultWrites } from './vault/sync';
 import { chatCompletionStream } from './aiClient';
 import { getAiConfig } from './aiTransport';
 import { validateAiProfile, type AiConfig } from '@/shared/aiConfig';
@@ -246,6 +248,7 @@ async function runTurn(active: ActiveChat): Promise<void> {
         errorKind,
       });
       if (activeChats.get(chatId) === active) activeChats.delete(chatId);
+      persistChatToVault(chatId);
       broadcast(chatId, {
         type: 'chat-ev',
         chatId,
@@ -328,6 +331,7 @@ async function runTurn(active: ActiveChat): Promise<void> {
         state: 'error',
         errorKind: 'internal',
       }).catch(() => false);
+      persistChatToVault(chatId);
       broadcast(chatId, {
         type: 'chat-ev',
         chatId,
@@ -343,6 +347,21 @@ async function runTurn(active: ActiveChat): Promise<void> {
   }
 }
 
+/** 终态后把完整会话提交学习库（streaming 中间态不写文件；失败保留待办）。 */
+function persistChatToVault(chatId: string): void {
+  void (async () => {
+    try {
+      if (!(await getVaultIdentity())) return;
+      const record = await getChat(chatId);
+      if (!record) return;
+      await enqueueChatWrite(record);
+      await flushVaultWrites();
+    } catch {
+      /* 队列持久化，下次活动补写 */
+    }
+  })();
+}
+
 async function stopChat(chatId: string, reason: string): Promise<void> {
   const active = activeChats.get(chatId);
   if (!active) return;
@@ -353,6 +372,7 @@ async function stopChat(chatId: string, reason: string): Promise<void> {
   if (active.checkpointTimer) clearInterval(active.checkpointTimer);
   await saveAssistantProgress({ chatId, requestId: active.requestId, text: active.text, state: 'stopped' });
   if (activeChats.get(chatId) === active) activeChats.delete(chatId);
+  persistChatToVault(chatId);
   broadcast(chatId, { type: 'chat-ev', chatId, requestId: active.requestId, turnId: active.turnId, kind: 'stopped', text: active.text, saved: true });
   broadcastActive(chatId);
 }

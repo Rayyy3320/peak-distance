@@ -1,13 +1,17 @@
 // M3 跨内容识别：在网页 / X 正文里把已存单词、短语标出状态。
+// M11 起按语言分桶：词条只在与其语言匹配的文本里标记（shared/tokenize 的
+// 文字系统判定），跨语言同形词互不套用；语言无法确定时宁可暂不标记。
 //   - 只读本地词汇索引（vocabIndex 消息），不逐词调用 AI；
-//   - 词边界匹配，短语按完整表达，冲突时最长匹配优先；
+//   - 词边界用 Intl.Segmenter（与点击查词、词次统计共用）；
+//   - 短语按连续词窗口最长匹配；
 //   - 初次处理正文，之后只处理新增 / 变化文本（MutationObserver）；
 //   - 跳过编辑区、代码、隐藏文本和扩展自身 UI；
-//   - 关闭开关（设置）或 stop() 时拆掉全部包装，恢复原文本，
-//     不留重复包装或观察器循环。
+//   - 关闭开关（设置）或 stop() 时拆掉全部包装，恢复原文本。
 // 只做视觉标记，不挂任何页面事件；选区、复制、链接行为不受影响。
 
-import { buildFormIndex, type VocabIndexItem } from '@/shared/vocab';
+import { normalizeExpressionInLanguage, parseEntryKey, primaryOfLang } from '@/shared/languages';
+import { detectTextLanguage, segmentWords } from '@/shared/tokenize';
+import type { VocabIndexItem } from '@/shared/vocab';
 
 const STYLE_ID = 'blc-mark-style';
 const MARK_ATTR = 'data-blc-key';
@@ -41,8 +45,107 @@ function markerLog(fn: () => string): void {
   }
 }
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** 一个语言桶：该语言内规范化 token / 短语 → 状态类名。 */
+export interface MarkBucket {
+  statusByKey: Map<string, string>;
+  phrases: Map<string, string>;
+}
+
+/** 无空格书写的语言：短语窗口同时按去空格形式匹配。 */
+function isSpacelessScript(lang: string): boolean {
+  return lang === 'ja' || lang === 'zh' || lang === 'th';
+}
+
+/**
+ * 词汇索引 → 语言桶（纯函数，marker 与视频字幕词状态共用）。
+ * 无 language 字段的旧记录归入 en 桶（维持迁移前行为，不套用到非拉丁文本）。
+ * 桶内词形关联：一个词形只允许映射到一个词条；被多个词条声明视为冲突，不标。
+ */
+export function buildMarkBuckets(items: VocabIndexItem[]): Map<string, MarkBucket> {
+  const buckets = new Map<string, MarkBucket>();
+  const bucketFor = (lang: string): MarkBucket => {
+    let b = buckets.get(lang);
+    if (!b) {
+      b = { statusByKey: new Map(), phrases: new Map() };
+      buckets.set(lang, b);
+    }
+    return b;
+  };
+  const formOwner = new Map<string, { lang: string; status: string }>();
+  const formConflict = new Set<string>();
+
+  for (const it of items) {
+    const lang = it.language ? primaryOfLang(it.language) : 'en';
+    const bucket = bucketFor(lang);
+    const norm = (t: string) => normalizeExpressionInLanguage(t, lang);
+    // 词条键可能带语言前缀（lang::expr）；标记匹配用表达部分。
+    const expression = parseEntryKey(it.key)?.expression ?? it.key;
+    const key = norm(expression);
+    if (!key) continue;
+    if (/\s/.test(key)) {
+      bucket.phrases.set(key, it.status);
+      if (isSpacelessScript(lang)) bucket.phrases.set(key.replace(/\s+/g, ''), it.status);
+    } else {
+      bucket.statusByKey.set(key, it.status);
+    }
+    for (const f of it.forms ?? []) {
+      const fk = norm(parseEntryKey(f)?.expression ?? f);
+      if (!fk || fk === key) continue;
+      const ownerKey = `${lang}\u0000${fk}`;
+      const prev = formOwner.get(ownerKey);
+      if (prev && prev.status !== it.status) formConflict.add(ownerKey);
+      else if (!prev) formOwner.set(ownerKey, { lang, status: it.status });
+    }
+  }
+  for (const [ownerKey, owner] of formOwner) {
+    if (formConflict.has(ownerKey)) continue;
+    const [lang, fk] = ownerKey.split('\u0000');
+    bucketFor(lang!).statusByKey.set(fk!, owner.status);
+  }
+  return buckets;
+}
+
+/**
+ * 纯逻辑命中扫描（tools/regress.ts 离线覆盖）：
+ * 文字系统判定语言 → 取桶 → Segmenter 词分段 → 短语窗口最长优先。
+ * 语言无法判定或无对应桶时返回空（宁可暂不自动标记，spec 3.4）。
+ */
+export function scanMarkHits(
+  raw: string,
+  buckets: Map<string, MarkBucket>,
+): { start: number; end: number; key: string }[] {
+  const lang = detectTextLanguage(raw);
+  if (!lang) return [];
+  const bucket = buckets.get(lang);
+  if (!bucket) return [];
+
+  const norm = (t: string) => normalizeExpressionInLanguage(t, lang);
+  const words = segmentWords(raw, lang);
+  const hits: { start: number; end: number; key: string }[] = [];
+  let i = 0;
+  while (i < words.length && hits.length <= 400) {
+    // 短语：连续词窗口最长优先（最多 8 词）
+    const maxJ = Math.min(words.length, i + 8);
+    let matched = false;
+    for (let j = maxJ; j >= i + 2 && !matched; j--) {
+      const slice = words.slice(i, j);
+      const joined = slice.map((s) => norm(s.text)).join(' ');
+      const st =
+        bucket.phrases.get(joined) ??
+        (isSpacelessScript(lang) ? bucket.phrases.get(joined.replace(/\s+/g, '')) : undefined);
+      if (st) {
+        hits.push({ start: slice[0]!.start, end: slice.at(-1)!.end, key: st });
+        i = j;
+        matched = true;
+      }
+    }
+    if (matched) continue;
+    const w = words[i]!;
+    const st = bucket.statusByKey.get(norm(w.text));
+    if (st) hits.push({ start: w.start, end: w.end, key: st });
+    i++;
+  }
+  return hits;
 }
 
 export interface VocabMarker {
@@ -60,8 +163,7 @@ export function createMarker(opts: {
   const { send, isOwnUi } = opts;
 
   let items: VocabIndexItem[] = [];
-  let pattern: RegExp | null = null;
-  let statusByKey = new Map<string, string>();
+  let buckets = new Map<string, MarkBucket>();
   let enabled = false;
   let started = false;
   let markCount = 0;
@@ -108,9 +210,9 @@ export function createMarker(opts: {
   }
 
   function markTextNode(node: Text): void {
-    if (!pattern) return;
+    if (!buckets.size) return;
     const raw = node.nodeValue ?? '';
-    if (!raw || raw.length > MAX_NODE_TEXT || !/[A-Za-z]/.test(raw)) return;
+    if (!raw || raw.length > MAX_NODE_TEXT) return;
     const parent = node.parentElement;
     if (
       !parent ||
@@ -121,15 +223,8 @@ export function createMarker(opts: {
       return;
     }
 
-    pattern.lastIndex = 0;
-    const hits: { start: number; end: number; key: string }[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = pattern.exec(raw)) !== null) {
-      const key = statusByKey.get(m[0].toLowerCase().normalize('NFC'));
-      if (key) hits.push({ start: m.index, end: m.index + m[0].length, key });
-      if (m.index === pattern.lastIndex) pattern.lastIndex++;
-      if (hits.length > 200) break; // 单节点防御
-    }
+    // 命中扫描是纯逻辑（scanMarkHits，离线回归覆盖）；这里只做 DOM 包装。
+    const hits = scanMarkHits(raw, buckets);
     if (!hits.length) return;
 
     const frag = document.createDocumentFragment();
@@ -159,14 +254,14 @@ export function createMarker(opts: {
    *（维基 / X 页头导航）上永远推进不到正文。
    */
   function markSubtree(root: Element | Document): void {
-    if (!pattern) return;
+    if (!buckets.size) return;
     const version = markVersion;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (n: Node) =>
         n.parentElement ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT,
     });
     const step = (): void => {
-      if (version !== markVersion || !pattern) return; // 已被重刷 / 关闭取代
+      if (version !== markVersion || !buckets.size) return; // 已被重刷 / 关闭取代
       const batch: Text[] = [];
       try {
         let n: Node | null;
@@ -202,26 +297,7 @@ export function createMarker(opts: {
   // ---- 索引与模式 --------------------------------------------------------------
 
   function rebuild(): void {
-    // 表面词形（含词形关联）→ 状态类名；词形冲突时不标（保留独立表达）
-    statusByKey = new Map();
-    const tokens = new Set<string>();
-    for (const it of items) {
-      statusByKey.set(it.key, it.status);
-      tokens.add(it.key);
-      for (const f of it.forms ?? []) tokens.add(f);
-    }
-    const formIndex = buildFormIndex(items);
-    for (const [form, owner] of formIndex) {
-      const ownerItem = items.find((it) => it.key === owner);
-      if (ownerItem) statusByKey.set(form, ownerItem.status);
-    }
-    if (!tokens.size) {
-      pattern = null;
-      return;
-    }
-    const sorted = Array.from(tokens).sort((a, b) => b.length - a.length);
-    const alternation = sorted.map(escapeRegExp).join('|');
-    pattern = new RegExp(`(?<![A-Za-z0-9])(?:${alternation})(?![A-Za-z0-9])`, 'gi');
+    buckets = buildMarkBuckets(items);
   }
 
   // ---- 观察 / 广播 --------------------------------------------------------------
@@ -232,7 +308,7 @@ export function createMarker(opts: {
       mutateTimer = null;
       const targets = pending;
       pending = new Set();
-      if (!pattern || !markCountLeft()) return;
+      if (!buckets.size || !markCountLeft()) return;
       for (const el of targets) {
         if (!el.isConnected) continue;
         if (el.closest(SKIP_SELECTOR) || isOwnUi(el)) continue;
@@ -284,13 +360,13 @@ export function createMarker(opts: {
     rebuild();
     markerLog(
       () =>
-        `items=${items.length} tokens=${pattern ? pattern.source.length : 0} marks=${markCount} full=${fullRemark}`,
+        `items=${items.length} buckets=${buckets.size} marks=${markCount} full=${fullRemark}`,
     );
     if (fullRemark) {
       markVersion++; // 中止在途的旧扫描（含增量子树扫描），重刷覆盖它们
       unwrapAll();
       ensureStyle();
-      if (pattern && document.body) markSubtree(document.body);
+      if (buckets.size && document.body) markSubtree(document.body);
     }
   }
 
@@ -339,7 +415,7 @@ export function createMarker(opts: {
           enabled,
           started,
           items: items.length,
-          hasPattern: !!pattern,
+          hasPattern: buckets.size > 0,
           wrapped: markCount,
           lastError,
         }),

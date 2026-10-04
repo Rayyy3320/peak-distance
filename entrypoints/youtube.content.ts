@@ -1,7 +1,9 @@
 import { initFloatingPanel } from '@/shared/floatingPanel';
 import { createTranslationPopup } from '@/shared/translationPopup';
-import { shadowSelection } from '@/shared/selection';
-import { brandTokens, brandControls } from '@/shared/brand';
+import { shadowSelection, rangeOffsetsIn, clampRangeToElement } from '@/shared/selection';
+import { brandTokens, brandControls, CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
+import { classifySelection, detectTextLanguage, effectiveLookupExpression } from '@/shared/tokenize';
+import { createSelectionPill } from '@/shared/selectionPill';
 import { DEFAULT_SETTINGS } from '@/shared/settings';
 import type { Settings } from '@/shared/settings';
 // YouTube 隔离世界：字幕、页内学习侧栏、查词与播放控制。
@@ -15,6 +17,8 @@ import type { Settings } from '@/shared/settings';
 //      字幕 ID 对齐，显示开关保留缓存；换视频 / 换轨 / 隐藏时取消旧任务。
 //   4. 悬停 / 点击字幕词就地查释义（拖选短语优先），复用共用弹窗与存储；
 //      查词暂停播放，关闭时仅恢复由本次查词暂停且仍是同一视频的播放；
+//      页面正文（描述 / 评论 / 标题）选区由共用浮条提供 查词/翻译/添加到
+//      对话（shared/selectionPill.ts），字幕栏内选区仍走本脚本操作条；
 //   5. 侧栏直达消息：字幕视图状态（blc-sub-get）与播放控制
 //      （blc-sub-control，携带 videoId 防串页）；
 //   6. 诊断徽标默认隐藏（页面事件 blc-debug-toggle 切换），宿主属性
@@ -35,15 +39,19 @@ import { subtitleFontSize } from '@/shared/youtubeWorkspace';
 import { createLookupPopup } from '@/shared/lookupPopup';
 import {
   sentenceId, type SavedSentence,
-  buildSurfaceStatusMap,
   videoContextUrl,
   type VocabIndexItem,
   type VideoSnapshot,
 } from '@/shared/vocab';
+import { buildMarkBuckets, type MarkBucket } from '@/shared/marker';
+import { segmentWords } from '@/shared/tokenize';
+import { normalizeExpressionInLanguage, langDisplayName } from '@/shared/languages';
+import { comprehensionLangFor } from '@/shared/settings';
 import {
+  materialFromCandidate,
   sourceKeyOf,
   type MaterialPayload,
-  type QuoteRef,
+  type SelectionCandidate,
   type SourceDescriptor,
 } from '@/shared/chat';
 import type { ChatSourceInfo, SubControlMessage, SubViewState } from '@/shared/messages';
@@ -118,7 +126,7 @@ export default defineContentScript({
     let renderQueued = false;
 
     // 词状态（字幕内低强调标记）
-    let surfaceStatus = new Map<string, string>();
+    let markBuckets = new Map<string, MarkBucket>();
     // 查词暂停恢复
     let pausedByUsVideo: string | null = null;
     let externalLookupToken='';
@@ -323,31 +331,25 @@ export default defineContentScript({
       return (s || '').split('-')[0]!.toLowerCase();
     }
 
-    /** 轨道优先级：en manual > en asr > 其它（明确提示，不当英文用）。 */
+    /** 轨道优先级（M11 3.2）：沿用当前可用轨道；同语言人工优先于自动；
+     *  无当前轨道时任选人工轨道，不强制切英语。 */
     function evaluateTrackPreference(): void {
       if (!tracklist.length || preferTried) return;
-      const hasEnManual = tracklist.some((t) => t.lang === 'en' && t.kind === 'manual');
-      const hasEnAsr = tracklist.some((t) => t.lang === 'en' && t.kind === 'asr');
-      const curEn = baseLang(lastTrackLang) === 'en' && cues.length > 0;
-      const curGood = curEn && (lastTrack === 'manual' || !hasEnManual);
-      if (curGood) return;
-      if (hasEnManual) {
+      const cur = baseLang(lastTrackLang);
+      if (cues.length > 0) {
+        // 已有产出：仅当同语言存在人工轨且当前是自动轨时升级
+        const sameManual = tracklist.find((t) => t.kind === 'manual' && baseLang(t.lang) === cur);
+        if (lastTrack === 'manual' || !sameManual) return;
         preferTried = true;
-        sendPrefer('en', 'manual');
-        log('prefer', { lang: 'en', kind: 'manual' });
-      } else if (hasEnAsr) {
+        sendPrefer(sameManual.lang, 'manual');
+        log('prefer', { lang: sameManual.lang, kind: 'manual' });
+        return;
+      }
+      const pick = tracklist.find((t) => t.kind === 'manual') ?? tracklist.find((t) => t.kind === 'asr');
+      if (pick) {
         preferTried = true;
-        sendPrefer('en', 'asr');
-        log('prefer', { lang: 'en', kind: 'asr' });
-      } else if (!curEn) {
-        // 没有任何英文轨道：明确提示，不把其它语言当英文处理
-        if (cues.length) {
-          notice = '该视频没有英文字幕轨道';
-          renderBar();
-        } else {
-          notice = '该视频没有英文字幕轨道';
-        }
-        renderBadge();
+        sendPrefer(pick.lang, pick.kind === 'asr' ? 'asr' : 'manual');
+        log('prefer', { lang: pick.lang, kind: pick.kind });
       }
     }
 
@@ -552,11 +554,11 @@ export default defineContentScript({
       host.addEventListener('mouseup', e => {
         const real = e.composedPath()[0] as Element;
         if (!real?.closest('.en')) return;
-        const phrase = selectionPhraseInBar(window.getSelection(), host.shadowRoot!);
-        if (phrase) {
+        const info = subtitleSelectionInBar();
+        if (info) {
+          // 拖选（单词或短语）后短时间内不触发单词点击查询
           lastPhraseAt = Date.now(); clearTimeout(hoverTimer);
-          const rect = shadowSelection(host.shadowRoot!)?.range.getBoundingClientRect();
-          showPhraseActions(phrase,indexOf(real as HTMLElement),rect);
+          showSelectionActions(info);
         }
       });
       const clickWord = (e: Event) => {
@@ -571,17 +573,91 @@ export default defineContentScript({
       host.addEventListener('keydown', e => { if (e.key === 'Enter') clickWord(e); });
     }
 
-    function showPhraseActions(text:string,index:number,rect?:DOMRect) {
+    interface SubtitleSelectionInfo {
+      raw: string;
+      kind: 'word' | 'phrase' | 'sentence';
+      hasWord: boolean;
+      expression: string | null;
+      cueIndex: number;
+      rect: DOMRect | null;
+    }
+
+    /** 播放器字幕栏选区：收窄到原文行（不含译文/控件文字），本地分类 + 有效表达。 */
+    function subtitleSelectionInBar(): SubtitleSelectionInfo | null {
+      const root = document.getElementById(SUBS_ID)?.shadowRoot;
+      if (!root) return null;
+      const selected = shadowSelection(root);
+      const en = root.querySelector<HTMLElement>('.en');
+      if (!selected || !en) return null;
+      const clamped = clampRangeToElement(selected.range, en);
+      const raw = clamped.toString().replace(/\s+/g, ' ').trim();
+      if (!raw) return null;
+      const cueIndex = Number(en.dataset.cue ?? currentIdx);
+      const cue = cues[cueIndex];
+      if (!cue || !currentVideoId || !lastTrackId) return null;
+      const lang = baseLang(lastTrackLang) || 'en';
+      const cls = classifySelection(raw, lang);
+      let expression: string | null = null;
+      if (cls.kind !== 'sentence') {
+        const offsets = rangeOffsetsIn(en, clamped);
+        if (offsets && offsets.start <= offsets.end && offsets.end <= offsets.text.length) {
+          expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
+        }
+      }
+      let rect: DOMRect | null = null;
+      try { rect = selected.range.getBoundingClientRect(); } catch { /* ignore */ }
+      return { raw, kind: cls.kind, hasWord: cls.hasWord, expression, cueIndex, rect };
+    }
+
+    function subtitleCandidate(info: SubtitleSelectionInfo): SelectionCandidate | null {
+      const source = buildVideoSource();
+      const cue = cues[info.cueIndex];
+      if (!source?.video || !cue) return null;
+      return {
+        at: Date.now(),
+        pageUrl: location.href,
+        text: info.raw,
+        kind: info.kind,
+        expression: info.kind === 'sentence' ? null : info.expression,
+        lang: lastTrackLang || undefined,
+        source,
+        cue: { index: info.cueIndex, text: cue.text, startMs: cue.start, endMs: cue.start + cue.dur },
+      };
+    }
+
+    /** 直接附加到当前聊天并打开面板；不先查词、不自动发送。 */
+    async function attachSubtitleSelection(info: SubtitleSelectionInfo): Promise<void> {
+      const source = buildVideoSource();
+      const candidate = subtitleCandidate(info);
+      const built = candidate ? materialFromCandidate(candidate) : null;
+      if (!source || !candidate || !built) { playerToast('字幕尚未就绪，稍后再试'); return; }
+      const r = await send<{ ok: boolean; panelOpened?: boolean }>({
+        type: 'chatEnsure', source, material: built.material, quote: built.quote, openPanel: true,
+      });
+      if (!r?.ok) { playerToast('附加失败，请重试'); return; }
+      if (!r.panelOpened) playerToast('已附加到当前对话：点扩展图标打开侧栏继续');
+    }
+
+    function showSelectionActions(info: SubtitleSelectionInfo) {
       document.getElementById('pd-phrase-actions')?.remove();
       const host=document.createElement('div');host.id='pd-phrase-actions';
       host.style.cssText='position:fixed;z-index:2147483646';
-      host.style.left=Math.max(12,Math.min(rect?.left??24,innerWidth-180))+'px';host.style.top=Math.min((rect?.bottom??64)+6,innerHeight-60)+'px';
-      const root=host.attachShadow({mode:'open'});root.innerHTML=`<style>${brandTokens}:host{font:14px system-ui}div{display:flex;gap:4px;padding:4px;border-radius:8px;background:var(--pd-paper)}${brandControls}</style><div><button id="lookup">查词</button><button id="translate">翻译</button></div>`;
+      host.style.left=Math.max(12,Math.min(info.rect?.left??24,innerWidth-196))+'px';
+      host.style.top=Math.min((info.rect?.bottom??64)+6,innerHeight-60)+'px';
+      const root=host.attachShadow({mode:'open'});
+      root.innerHTML=`<style>${brandTokens}:host{font:14px system-ui}div{display:flex;gap:4px;padding:4px;border-radius:8px;background:var(--pd-paper)}${brandControls}${CHAT_ADD_BUTTON_STYLE}</style><div><button id="lookup" hidden>查词</button><button id="translate" hidden>翻译</button><button id="chat" class="blc-chat-add" title="添加到对话" aria-label="添加到对话">${CHAT_ADD_ICON}</button></div>`;
       (document.fullscreenElement??document.documentElement).append(host);
-      root.querySelector<HTMLElement>('#lookup')!.hidden=text.length>200;
-      root.querySelector('#lookup')!.addEventListener('click',()=>{host.remove();openLookup(text,index);});
-      root.querySelector('#translate')!.addEventListener('click',()=>{host.remove();popup.close();translationPopup.open({text,url:videoContextUrl(currentVideoId,cues[index]?.start??0),title:document.title},rect);});
+      // 分类表：word=查词+对话；phrase=查词+翻译+对话；sentence=翻译+对话
+      root.querySelector<HTMLElement>('#lookup')!.hidden = info.kind === 'sentence' || !info.hasWord;
+      root.querySelector<HTMLElement>('#translate')!.hidden = info.kind === 'word';
+      const rect = info.rect ?? undefined;
+      root.querySelector('#lookup')!.addEventListener('click',()=>{host.remove();openLookup(info.expression ?? info.raw, info.cueIndex);});
+      root.querySelector('#translate')!.addEventListener('click',()=>{host.remove();popup.close();translationPopup.open({text:info.raw,url:videoContextUrl(currentVideoId,cues[info.cueIndex]?.start??0),title:document.title},rect);});
+      root.querySelector('#chat')!.addEventListener('click',()=>{host.remove();popup.close();void attachSubtitleSelection(info);});
       host.addEventListener('mousedown',e=>e.preventDefault());
+      // 选区形成即固定候选（面板进入/字幕重绘不清空）
+      const candidate = subtitleCandidate(info);
+      if (candidate) void send({ type: 'selectionCandidateSet', candidate });
       const remove=(e:Event)=>{if(!e.composedPath().includes(host)){host.remove();document.removeEventListener('pointerdown',remove,true);}};
       document.addEventListener('pointerdown',remove,true);
     }
@@ -589,12 +665,6 @@ export default defineContentScript({
     function scheduleCardClose(): void {
       clearTimeout(leaveTimer);
       leaveTimer = setTimeout(() => { if (popup.isCompact()) popup.close(); }, 220);
-    }
-
-    function selectionPhraseInBar(sel: Selection | null, root: ShadowRoot): string {
-      if (!sel) return '';
-      const text=shadowSelection(root)?.text??'';
-      return /\s/.test(text)?text:'';
     }
 
     function removeSubsHost(): void {
@@ -630,7 +700,7 @@ export default defineContentScript({
       if (!cues.length) {
         const n = document.createElement('div');
         n.className = 'notice';
-        n.textContent = notice || '正在获取英文字幕…';
+        n.textContent = notice || '正在获取字幕…';
         bar.appendChild(n);
         body.appendChild(bar);
         return;
@@ -650,7 +720,7 @@ export default defineContentScript({
         if (!en.textContent) appendWords(en, cue.text);
         en.querySelectorAll<HTMLElement>('.w').forEach(w => {
           w.classList.remove('saved', 'learning', 'known');
-          const status = surfaceStatus.get(w.textContent!.toLowerCase()); if (status) w.classList.add(status);
+          const status = wordStatus(w.textContent!); if (status) w.classList.add(status);
         });
         bar.appendChild(en);
         if (zhVisible) {
@@ -672,7 +742,7 @@ export default defineContentScript({
             }); bar.appendChild(retry);
           } else {
             const pending = document.createElement('div'); pending.className = 'notice'; pending.setAttribute('role', 'status');
-            pending.textContent = !settingsReady ? '正在读取翻译设置…' : platformState === 'waiting' ? '正在获取中文字幕…' : '正在翻译…';
+            pending.textContent = !settingsReady ? '正在读取翻译设置…' : platformState === 'waiting' ? `正在获取${langDisplayName(targetLangOf())}译文…` : '正在翻译…';
             bar.appendChild(pending);
           }
         }
@@ -680,20 +750,18 @@ export default defineContentScript({
       body.appendChild(bar);
     }
 
-    /** 英文行按词切分为可点击 span，已存词条按状态低强调标出。 */
+    /** 原文行按轨道语言分词为可点击 span（M11：Segmenter 统一边界），已存词条按状态低强调标出。 */
     function appendWords(en: HTMLDivElement, text: string): void {
-      const re = /([A-Za-z][A-Za-z'’-]*)/g;
       let last = 0;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(text)) !== null) {
-        if (m.index > last) en.appendChild(document.createTextNode(text.slice(last, m.index)));
+      for (const s of segmentWords(text, baseLang(lastTrackLang) || 'en')) {
+        if (s.start > last) en.appendChild(document.createTextNode(text.slice(last, s.start)));
         const w = document.createElement('span');
         w.className = 'w'; w.tabIndex = 0; w.setAttribute('role', 'button');
-        w.textContent = m[0];
-        const st = surfaceStatus.get(m[0].toLowerCase().normalize('NFC'));
+        w.textContent = s.text;
+        const st = wordStatus(s.text);
         if (st) w.classList.add(st);
         en.appendChild(w);
-        last = m.index + m[0].length;
+        last = s.end;
       }
       if (last < text.length) en.appendChild(document.createTextNode(text.slice(last)));
     }
@@ -721,6 +789,23 @@ export default defineContentScript({
     }, true);
     const popup = createLookupPopup({ send, mountParent: () => document.fullscreenElement as HTMLElement | null });
 
+    // ---- 页面正文选区浮条（描述 / 评论 / 标题等；字幕栏以内不介入） ---------------
+
+    const selectionPill = createSelectionPill({
+      send,
+      lookup: popup,
+      translation: translationPopup,
+      buildSource: buildPageArticleSource,
+      toast: playerToast,
+      onContinueAsk: (ctx) => void continueAskFromPageBody(ctx),
+      skipSelection: (sel) => {
+        // 字幕栏 / 字幕选区操作条 / 词卡 / 翻译卡都在 Shadow DOM 内：
+        // 选区根节点不是 document 就属于插件自身 UI，页面浮条不介入
+        const node = sel.anchorNode;
+        return !!node && node.getRootNode() !== document;
+      },
+    });
+
     function videoRef(index = currentIdx) {
       return { videoId:currentVideoId, trackId:lastTrackId, trackKind:lastTrack === 'asr' ? 'asr' as const : 'manual' as const,
         trackLang:lastTrackLang, startMs:cues[index]?.start ?? 0 };
@@ -734,6 +819,7 @@ export default defineContentScript({
       const video = videoRef(index), id = sentenceId(video, cue.text);
       const r = await send<{ ok:boolean }>(sentences.some(s => s.id === id) ? { type:'deleteSentence', id } : {
         type:'saveSentence', sentence:{ id, video, text:cue.text, zh:translations.get(index), translationSource:translationSources.get(index),
+          ...(lastTrackLang ? { language: lastTrackLang } : {}),
           endMs:cue.start + cue.dur, title:document.title, createdAt:Date.now() },
       });
       if (!r?.ok) playerToast('收藏失败，请重试');
@@ -767,6 +853,16 @@ export default defineContentScript({
       return source;
     }
 
+    /** 页面正文选区（描述 / 评论 / 标题）来源：当前地址的 article 源（与视频源区分）。 */
+    function buildPageArticleSource(): SourceDescriptor {
+      return {
+        sourceType: 'article',
+        sourceKey: sourceKeyOf({ sourceType: 'article', url: location.href }),
+        title: document.title,
+        url: location.href,
+      };
+    }
+
     /** 材料仅在打开问答 / 更新材料 / 带入新引用时构建一次（不随播放重建）。 */
     function buildVideoMaterial(): MaterialPayload | null {
       if (!cues.length || !lastTrackId || !currentVideoId) return null;
@@ -789,6 +885,7 @@ export default defineContentScript({
           source: null,
           canMaterial: false,
           hint: '当前不是视频页',
+          pageUrl: location.href,
         };
       }
       return {
@@ -796,6 +893,7 @@ export default defineContentScript({
         source,
         canMaterial: !!buildVideoMaterial(),
         hint: cues.length ? '' : '字幕尚未就绪，稍后再试',
+        pageUrl: location.href,
       };
     }
 
@@ -813,35 +911,82 @@ export default defineContentScript({
       setTimeout(() => host.remove(), 3200);
     }
 
+    /** 词卡「继续问」：附加词卡表达与可靠原字幕（可带已有释义），不发新查询。 */
     async function continueAskFromVideo(ctx: {
       snapshot: { expression: string; sentence?: string; video?: { startMs: number } };
       definition: string | null;
     }): Promise<void> {
       const source = buildVideoSource();
-      const material = buildVideoMaterial();
-      if (!source || !material) {
+      if (!source) {
         playerToast('字幕尚未就绪，等字幕出现后再继续问');
         return;
       }
+      const expression = ctx.snapshot.expression.trim();
+      if (!expression) return;
       const idx = ctx.snapshot.video ? cues.findIndex(c => c.start === ctx.snapshot.video!.startMs) : currentIdx;
       const cue = cues[idx];
-      const quote: QuoteRef = {
-        blockIds: cue ? [`p${idx + 1}`] : [],
-        expression: ctx.snapshot.expression,
-        definition: ctx.definition ?? undefined,
-        note: cue ? `${fmtClock(cue.start)} · ${cue.text.slice(0, 80)}` : undefined,
+      const candidate: SelectionCandidate = {
+        at: Date.now(),
+        pageUrl: location.href,
+        text: expression,
+        kind: 'word',
+        expression,
+        lang: lastTrackLang || undefined,
+        source,
+        ...(cue ? { cue: { index: idx, text: cue.text, startMs: cue.start, endMs: cue.start + cue.dur } } : {}),
+        ...(ctx.definition ? { definition: ctx.definition } : {}),
       };
+      const built = materialFromCandidate(candidate);
+      if (!built) { playerToast('字幕尚未就绪，等字幕出现后再继续问'); return; }
       const r = await send<{ ok: boolean; panelOpened?: boolean }>({
         type: 'chatEnsure',
         source,
-        material,
-        quote,
+        material: built.material,
+        quote: built.quote,
         openPanel: true,
       });
       popup.close(); // 沿用弹窗关闭后的播放恢复规则
-      if (!r?.ok || !r.panelOpened) {
+      if (!r?.ok) { playerToast('附加失败，请重试'); return; }
+      if (!r.panelOpened) {
         // Chrome 不总允许从内容脚本消息代开侧栏；全屏时同样如此。
         // 引用已保存，退出全屏点扩展图标即可续上。
+        playerToast('已带入引用：点浏览器工具栏的扩展图标打开侧栏继续');
+      }
+    }
+
+    /** 词卡「继续问」（页面正文）：附加表达与可靠原句（可带已有释义），按 article 源入对话。 */
+    async function continueAskFromPageBody(ctx: {
+      snapshot: { expression: string; sentence?: string };
+      definition: string | null;
+    }): Promise<void> {
+      const source = buildPageArticleSource();
+      const expression = ctx.snapshot.expression.trim();
+      const sentence = (ctx.snapshot.sentence ?? '').replace(/\s+/g, ' ').trim();
+      if (!expression) return;
+      // 页面正文词/短语：表达为焦点、可靠原句为背景；没有可靠原句只附加表达
+      const candidate: SelectionCandidate = {
+        at: Date.now(),
+        pageUrl: location.href,
+        text: expression,
+        kind: 'word',
+        expression,
+        lang: detectTextLanguage(expression) ?? undefined,
+        ...(sentence && sentence !== expression ? { sentence } : {}),
+        source,
+        ...(ctx.definition ? { definition: ctx.definition } : {}),
+      };
+      const built = materialFromCandidate(candidate);
+      if (!built) { playerToast('无法提取材料：先在正文里选中一段文字'); return; }
+      const r = await send<{ ok: boolean; panelOpened?: boolean }>({
+        type: 'chatEnsure',
+        source,
+        material: built.material,
+        quote: built.quote,
+        openPanel: true,
+      });
+      popup.close();
+      if (!r?.ok) { playerToast('附加失败，请重试'); return; }
+      if (!r.panelOpened) {
         playerToast('已带入引用：点浏览器工具栏的扩展图标打开侧栏继续');
       }
     }
@@ -872,6 +1017,7 @@ export default defineContentScript({
         sentence: cue.text,
         neighbors: neighborsText(index) || undefined,
         title: document.title,
+        lang: lastTrackLang || undefined,
         video: {
           videoId: currentVideoId,
           trackId: lastTrackId,
@@ -973,11 +1119,18 @@ export default defineContentScript({
       renderBar();
     }
 
+    /** 当前内容的理解语言（M11：按源语言覆盖优先；轨道语言缺省用全局默认）。 */
+    function targetLangOf(): string {
+      return comprehensionLangFor(settings, lastTrackLang || undefined);
+    }
+
     function captionCacheKey(): string {
+      // 缓存随目标语言区分（默认 zh 与旧 'youtube-zh' 键一致，老缓存继续可用）
+      const target = baseLang(targetLangOf());
       try {
         const p = new URL(lastTrackId).searchParams;
-        return JSON.stringify([currentVideoId, p.get('lang'), p.get('kind'), p.get('name'), p.get('vssId'), 'youtube-zh']);
-      } catch { return `${currentVideoId}|${lastTrackId}|youtube-zh`; }
+        return JSON.stringify([currentVideoId, p.get('lang'), p.get('kind'), p.get('name'), p.get('vssId'), `youtube-${target}`]);
+      } catch { return `${currentVideoId}|${lastTrackId}|youtube-${target}`; }
     }
 
     function requestPlatform(): void {
@@ -991,7 +1144,7 @@ export default defineContentScript({
           applyPlatformCues(r.cues); platformState = 'done'; scheduleTranslate(); return;
         }
         platformRequest = crypto.randomUUID();
-        postToInject({ type: 'translation-request', requestId: platformRequest, videoId: currentVideoId, trackId: lastTrackId });
+        postToInject({ type: 'translation-request', requestId: platformRequest, videoId: currentVideoId, trackId: lastTrackId, targetLang: targetLangOf() });
         platformTimer = setTimeout(() => {
           if (epoch !== translationEpoch) return;
           postToInject({ type: 'translation-cancel' }); platformRequest = null; platformState = 'done'; scheduleTranslate();
@@ -1001,7 +1154,8 @@ export default defineContentScript({
 
     function applyPlatformCues(translated: Cue[]): void {
       const byTime = new Map(translated.filter(c => c.zh).map(c => [`${c.start}|${c.text}`, c.zh!]));
-      cues.forEach((cue, id) => { const zh = byTime.get(`${cue.start}|${cue.text}`); if (zh) { translations.set(id, zh); translationSources.set(id, 'YouTube 中文字幕 / 平台翻译'); } });
+      const sourceLabel = `YouTube ${langDisplayName(targetLangOf())}译文 / 平台翻译`;
+      cues.forEach((cue, id) => { const zh = byTime.get(`${cue.start}|${cue.text}`); if (zh) { translations.set(id, zh); translationSources.set(id, sourceLabel); } });
       queueRender();
     }
 
@@ -1025,6 +1179,7 @@ export default defineContentScript({
       requestId = crypto.randomUUID();
       void send<{ ok: boolean; translations?: { id: number; text: string }[] }>({
         type: 'translateCues', mode: translationMode, requestId, videoId: currentVideoId, trackId: lastTrackId,
+        sourceLang: lastTrackLang || undefined, targetLang: targetLangOf(),
         items: win.map(id => ({ id, text: cues[id]!.text })),
       }).then(r => {
         if (epoch !== translationEpoch) return;
@@ -1083,6 +1238,7 @@ export default defineContentScript({
             title: document.title,
             trackKind: lastTrack === 'asr' ? 'asr' : cues.length ? 'manual' : '',
             trackLang: lastTrackLang,
+            translationLang: targetLangOf(),
             trackId: lastTrackId,
             cues: cues.map((c, i) => ({
               id: i,
@@ -1158,9 +1314,18 @@ export default defineContentScript({
         type: 'vocabIndex',
       });
       if (r?.ok && Array.isArray(r.items)) {
-        surfaceStatus = buildSurfaceStatusMap(r.items) as Map<string, string>;
+        // 与页面标记共用语言桶：词条只在同语言轨道文本上标状态
+        markBuckets = buildMarkBuckets(r.items);
         queueRender();
       }
+    }
+
+    /** 轨道语言下的词状态（按语言规范化；跨语言同形词互不套用）。 */
+    function wordStatus(text: string): string | undefined {
+      const lang = baseLang(lastTrackLang) || 'en';
+      return markBuckets
+        .get(lang)
+        ?.statusByKey.get(normalizeExpressionInLanguage(text, lang));
     }
 
     browser.runtime.onMessage.addListener((msg: unknown) => {
@@ -1179,11 +1344,13 @@ export default defineContentScript({
       if (!to) restoreNativeCaptions();
       else nativeCaptionsWereOn = null;
       stopTranslation();
+      // 换视频：旧选区候选立即失效（读取侧另有身份校验兜底）
+      void send({ type: 'selectionCandidateSet', candidate: null });
       platformState = 'idle'; failedCues.clear();
       translationMode = settings.translationMode;
       currentVideoId = to;
       modeReady = false; modeBusy = false; autoPause = false; apIndex = -1; apHeld = false; apLastStopped = -1;
-      floatingPanel.hide(); translationPopup.close();
+      floatingPanel.hide(); translationPopup.close(); selectionPill.reset();
       void updateVideoSession();
       navSeq++;
       cues = [];
@@ -1273,7 +1440,8 @@ export default defineContentScript({
 
         if (d.type === 'cues' && Array.isArray(d.cues)) {
           const kind = d.trackKind === 'asr' ? 'asr' : 'manual';
-          const lang = baseLang(String(d.trackLang || ''));
+          // 保留轨道完整语言标签（含变体，如 pt-BR）；匹配用 primary。
+          const lang = String(d.trackLang || '').toLowerCase();
           const newTrackId = String(d.trackId || '');
           // 同轨道重复产出（如 nocues 重试后的 config）不丢已取得的译文
           if (lastTrackId !== newTrackId) {
@@ -1290,22 +1458,9 @@ export default defineContentScript({
           nocuesRetries = 0;
           currentIdx = -1;
           if (typeof d.seen === 'number') sawTimedtext = d.seen;
-          if (lang !== 'en') {
-            // 不把其它语言当英文处理：丢弃内容并尝试切英文轨道。
-            // 新捕获的非英文轨（如用户中途改了 CC 语言）允许再次发起偏好切换。
-            cues = [];
-            preferTried = false;
-            evaluateTrackPreference();
-            notice = preferTried
-              ? '正在切换英文轨道…'
-              : tracklist.length
-                ? '该视频没有英文字幕轨道'
-                : '当前字幕非英文，等待轨道信息…';
-            log('drop-non-english', { lang });
-          } else {
-            notice = '';
-            evaluateTrackPreference();
-          }
+          // M11：非英文原文字幕是合法轨道，按实际语言继续（不强切英语）
+          notice = '';
+          evaluateTrackPreference();
           log('cues', {
             videoId: d.videoId,
             track: `${lastTrackLang}(${lastTrack})`,

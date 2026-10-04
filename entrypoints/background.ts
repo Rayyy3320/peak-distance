@@ -1,9 +1,10 @@
-import { lookupOnline } from '@/lib/lookupService';
+import { lookupOnline, type LookupRequestContext } from '@/lib/lookupService';
 import { handlePanelMessage, openPanel, startNativePanel, initPanelLifecycle } from '@/lib/panelService';
+import { handleSelectionCandidateMessage, initSelectionCandidateStore } from '@/lib/selectionCandidates';
 import { selectionError } from '@/shared/panel';
 import { translateRegularText } from '@/lib/regularTranslation';
 import { cached, cacheGet, cachePut, trimCache } from '@/lib/onlineCache';
-import { DEFAULT_SETTINGS, validSetting } from '@/shared/settings';
+import { comprehensionLangFor, DEFAULT_SETTINGS, validSetting } from '@/shared/settings';
 import type { LearningResult, ContextExplanation } from '@/shared/vocab';
 // background：词汇 / 翻译消息路由、IndexedDB 存取、AI 请求、广播。
 // 凭据仅在本上下文读取；content script 只传查词材料与词汇操作，
@@ -22,12 +23,26 @@ import {
   removeForm,
   resolveEntry,
   saveSnapshot,
+  setEntryNote,
   setStatus,
 } from '@/lib/db';
 import { lookupExpression, translateSentences } from '@/lib/aiClient';
 import { getAiConfig } from '@/lib/aiTransport';
 import { aiCacheScope, isAiProvider, validateAiProfile } from '@/shared/aiConfig';
 import { handleChatRequest, initChatService } from '@/lib/chatService';
+import { getVaultIdentity, getVaultStatus, migrateLegacyLanguages } from '@/lib/db';
+import {
+  adoptVault,
+  disconnectVault,
+  enqueuePreferenceWrite,
+  enqueueSentenceWrite,
+  enqueueVocabWrite,
+  entryViewToVaultRecord,
+  flushVaultWrites,
+  sentenceToVaultRecord,
+  syncFromVault,
+} from '@/lib/vault/sync';
+import { isLanguageTag, normalizeLangTag } from '@/shared/languages';
 import {
   sentenceId,
   isVocabStatus,
@@ -59,6 +74,26 @@ function bad(error: string, detail?: string): BgcError {
   return { ok: false, error, detail };
 }
 
+/** M11 可选语言字段：undefined = 未提供（迁移前兼容）；null = 非法。 */
+function parseLangField(v: unknown): string | undefined | null {
+  if (v === undefined) return undefined;
+  return isLanguageTag(v) ? normalizeLangTag(v) : null;
+}
+
+/** 本机保存成功后（已连接库时）排队写入学库并尝试提交；结果经 vault-changed 广播。 */
+function queueVaultWriteAfterSave(task: () => Promise<void>): void {
+  void (async () => {
+    try {
+      if (!(await getVaultIdentity())) return;
+      await task();
+      await flushVaultWrites();
+      broadcast({ type: 'vault-changed' });
+    } catch {
+      /* 写库失败保留待办（队列持久化），下次活动补写 */
+    }
+  })();
+}
+
 function parseVideoRef(v: unknown): VideoRef | null {
   if (!v || typeof v !== 'object') return null;
   const s = v as Record<string, unknown>;
@@ -84,9 +119,16 @@ function parseSnapshot(v: unknown): LookupSnapshot | null {
   const s = v as Record<string, unknown>;
   if (typeof s.expression !== 'string' || !s.expression.trim()) return null;
   if (typeof s.sentence !== 'string') return null;
+  // M11：快照可带源语言（'und' = 待确认）；缺省 = 迁移前调用方。
+  let lang: string | undefined;
+  if (s.lang !== undefined) {
+    if (!isLanguageTag(s.lang)) return null;
+    lang = normalizeLangTag(s.lang);
+  }
   const base = {
     expression: s.expression.slice(0, MAX_EXPRESSION),
     sentence: s.sentence.slice(0, MAX_SENTENCE),
+    ...(lang ? { lang } : {}),
   };
   if (s.source === 'video') {
     if (typeof s.title !== 'string') return null;
@@ -140,6 +182,9 @@ function parseResult(v: unknown): LearningResult | undefined {
   if (r.kind === 'translation' && r.source === 'google-gtx' && typeof r.text === 'string') return r;
   if (r.kind === 'dictionary' && ['youdao', 'cambridge'].includes(r.entry?.source) && /^https:\/\//.test(r.entry.url) &&
       Array.isArray(r.entry.senses) && r.entry.senses.length && r.entry.senses.every(s => typeof s.definition === 'string')) return r;
+  // M11：AI 查词兜底结果（主动查词、词典明确未命中时；与语境解释区分）
+  if (r.kind === 'ai-definition' && r.source === 'ai' && typeof r.text === 'string' && r.text.length <= 6000 &&
+      isLanguageTag(r.lang?.source) && isLanguageTag(r.lang?.target)) return r;
   return undefined;
 }
 function parseExplanation(v: unknown): ContextExplanation | undefined {
@@ -158,6 +203,9 @@ async function handle(
   const panelResult = await handlePanelMessage(msg, sender,nativeOpen);
   if (panelResult !== undefined) return panelResult;
 
+  const candidateResult = await handleSelectionCandidateMessage(msg, sender);
+  if (candidateResult !== undefined) return candidateResult;
+
   const m = msg as Partial<BgcRequest>;
   // M5 问答：CRUD / 打开面板统一走 chatService（含载荷校验）
   if (typeof m.type === 'string' && m.type.startsWith('chat')) {
@@ -168,11 +216,17 @@ async function handle(
     case 'translateSelection': {
       const error = selectionError(m.text);
       if (error || typeof m.requestId !== 'string') return bad('bad-payload', error ?? 'requestId');
+      const sourceLang = parseLangField(m.sourceLang);
+      const targetLang = parseLangField(m.targetLang);
+      if (sourceLang === null || targetLang === null) return bad('bad-payload', 'lang');
       const text = m.text!;
       const controller = new AbortController();
       const key = `${sender.tab?.id ?? sender.url}|${m.requestId}`;
       onlineRequests.set(key, controller);
-      try { return await cached(JSON.stringify(['translation','google-gtx','en-zh',text]), signal => translateRegularText(text,signal),controller.signal); }
+      // 缓存身份随语言对区分；未提供时沿用旧 'en-zh' 作用域（迁移前缓存兼容）。
+      const scope = sourceLang && targetLang ? `${sourceLang}|${targetLang}` : 'en-zh';
+      const selLangs = { source: sourceLang ?? 'en', target: targetLang ?? 'zh-Hans' };
+      try { return await cached(JSON.stringify(['translation','google-gtx',scope,text]), signal => translateRegularText(text,signal,selLangs),controller.signal); }
       finally { if(onlineRequests.get(key)===controller) onlineRequests.delete(key); }
     }
     case 'cancelOnline': {
@@ -195,12 +249,31 @@ async function handle(
     case 'saveSentence': {
       const s = m.sentence;
       const video = parseVideoRef(s?.video);
+      const language = parseLangField(s?.language);
       if (!s || !video || typeof s.text !== 'string' || !s.text.trim() || s.text.length > MAX_SENTENCE ||
-          typeof s.title !== 'string' || !Number.isFinite(s.endMs) || s.endMs < video.startMs) return bad('bad-payload');
-      await saveSentence({ id: sentenceId(video, s.text), video, text: s.text, endMs: s.endMs, title: s.title.slice(0, MAX_TITLE),
+          typeof s.title !== 'string' || !Number.isFinite(s.endMs) || s.endMs < video.startMs || language === null) return bad('bad-payload');
+      const savedSentence = { id: sentenceId(video, s.text), video, text: s.text, endMs: s.endMs, title: s.title.slice(0, MAX_TITLE),
         zh: typeof s.zh === 'string' ? s.zh.slice(0, MAX_SENTENCE) : undefined,
-        translationSource: typeof s.translationSource === 'string' ? s.translationSource.slice(0, 80) : undefined, createdAt: Date.now() });
+        translationSource: typeof s.translationSource === 'string' ? s.translationSource.slice(0, 80) : undefined,
+        ...(language ? { language } : {}),
+        createdAt: Date.now() };
+      await saveSentence(savedSentence);
       broadcast({ type: 'sentences-changed' });
+      if (language) {
+        queueVaultWriteAfterSave(async () => {
+          await enqueueSentenceWrite({
+            id: savedSentence.id,
+            language: savedSentence.language ?? video.trackLang ?? 'und',
+            text: savedSentence.text,
+            ...(savedSentence.zh ? { translation: savedSentence.zh } : {}),
+            ...(savedSentence.translationSource ? { translationSource: savedSentence.translationSource } : {}),
+            video,
+            endMs: savedSentence.endMs,
+            title: savedSentence.title,
+            createdAt: savedSentence.createdAt,
+          });
+        });
+      }
       return { ok: true };
     }
     case 'deleteSentence': {
@@ -226,20 +299,45 @@ async function handle(
     case 'lookup': {
       const snapshot = parseSnapshot(m.snapshot);
       if (!snapshot) return bad('bad-payload', 'snapshot');
+      // M11：理解语言与查询意图（路由表见 M11 spec 3.3；实际路由随 L 线程接入）。
+      if (m.targetLang !== undefined && !isLanguageTag(m.targetLang)) return bad('bad-payload', 'targetLang');
+      const intent = m.type === 'lookup' ? m.intent : undefined;
+      if (intent !== undefined && !['active', 'hover', 'preview', 'prefetch'].includes(intent)) {
+        return bad('bad-payload', 'intent');
+      }
       const controller = new AbortController();
       const requestKey = `${sender.tab?.id ?? sender.url}|${m.requestId}`;
       onlineRequests.set(requestKey, controller);
       try {
         if (m.type === 'lookup') {
           if (m.source && m.source !== 'youdao' && m.source !== 'cambridge') return bad('bad-payload');
-          return await lookupOnline(snapshot.expression, await getSettings(), m.source, controller.signal);
+          const settings = await getSettings();
+          // 快照语言缺省按 en（迁移前调用方）；目标 = 调用方指定或按设置解析。
+          const sourceLang = snapshot.lang ?? 'en';
+          const targetLang = m.targetLang ?? comprehensionLangFor(settings, sourceLang);
+          // AI 兜底授权仅主动查词携带；配置快照固定在本次请求（spec 3.3）。
+          let aiFallback: LookupRequestContext['aiFallback'];
+          if (settings.aiLookupFallback && (intent ?? 'active') === 'active') {
+            const config = await getAiConfig();
+            aiFallback = { enabled: true, config: config.apiKey ? config : null };
+          }
+          return await lookupOnline(snapshot.expression, settings, m.source, controller.signal, {
+            lang: { source: sourceLang, target: targetLang },
+            intent,
+            aiFallback,
+            sentence: snapshot.sentence,
+            neighbors: snapshot.source === 'video' ? snapshot.neighbors : undefined,
+          });
         }
         const neighbors = snapshot.source === 'video' ? snapshot.neighbors : undefined;
         const config = await getAiConfig();
         if (!config.apiKey) return bad('no-key');
         if (validateAiProfile(config)) return bad('invalid-config');
-        return await cached(JSON.stringify(['ai-context', aiCacheScope(config), 'en-zh', snapshot.expression, snapshot.sentence, neighbors]),
-          signal => lookupExpression(config, { expression: snapshot.expression, sentence: snapshot.sentence, neighbors }, signal), controller.signal);
+        const settings = await getSettings();
+        const sourceLang = snapshot.lang ?? 'en';
+        const targetLang = m.targetLang ?? comprehensionLangFor(settings, sourceLang);
+        return await cached(JSON.stringify(['ai-context', aiCacheScope(config), `${sourceLang}|${targetLang}`, snapshot.expression, snapshot.sentence, neighbors]),
+          signal => lookupExpression(config, { expression: snapshot.expression, sentence: snapshot.sentence, neighbors, langs: { source: sourceLang, target: targetLang } }, signal), controller.signal);
       } finally { if (onlineRequests.get(requestKey) === controller) onlineRequests.delete(requestKey); }
     }
     case 'getEntry': {
@@ -268,6 +366,13 @@ async function handle(
       if (!r) return bad('bad-payload', 'empty-expression');
       const out: SaveResult = r;
       broadcast({ type: 'vocab-changed' });
+      if (snapshot.lang || r.key.includes('::')) {
+        // M11 语言作用域词条：连接学习库时排队写入（旧键词条待语言迁移批次）
+        queueVaultWriteAfterSave(async () => {
+          const entry = await getEntry(r.key);
+          if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
+        });
+      }
       return out;
     }
     case 'backfillResult': {
@@ -300,6 +405,24 @@ async function handle(
       const ok = await setStatus(target, m.status);
       if (!ok) return bad('not-found');
       broadcast({ type: 'vocab-changed' });
+      // 状态是学习库受管字段：连接时排队写回
+      queueVaultWriteAfterSave(async () => {
+        const entry = await getEntry(target);
+        if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
+      });
+      return { ok: true };
+    }
+    case 'setNote': {
+      const key = typeof m.key === 'string' ? normalizeExpression(m.key) : '';
+      if (!key || typeof m.note !== 'string' || m.note.length > 4000) return bad('bad-payload');
+      const target = (await resolveEntry(key))?.key ?? key;
+      const ok = await setEntryNote(target, m.note);
+      if (!ok) return bad('not-found');
+      broadcast({ type: 'vocab-changed' });
+      queueVaultWriteAfterSave(async () => {
+        const entry = await getEntry(target);
+        if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
+      });
       return { ok: true };
     }
     case 'deleteEntry': {
@@ -323,7 +446,11 @@ async function handle(
       if (m.query !== undefined && typeof m.query !== 'string') {
         return bad('bad-payload', 'query');
       }
-      return { ok: true, entries: await listEntries(m.query) };
+      // 语言筛选：'all'／缺省 = 全部；'und' = 待确认集合；其余为语言标签。
+      if (m.language !== undefined && m.language !== 'all' && !isLanguageTag(m.language)) {
+        return bad('bad-payload', 'language');
+      }
+      return { ok: true, entries: await listEntries(m.query, m.language) };
     }
     case 'vocabIndex': {
       const r: VocabIndexResult = { ok: true, items: await listIndex() };
@@ -338,6 +465,10 @@ async function handle(
         return bad('bad-payload', 'setting');
       }
       await browser.storage.local.set({ [m.name]: m.value });
+      // 语言偏好双向生效：连接学习库时排队写回 偏好.md
+      if (m.name === 'defaultComprehensionLang' || m.name === 'comprehensionOverrides') {
+        queueVaultWriteAfterSave(() => enqueuePreferenceWrite());
+      }
       return { ok: true };
     }
     case 'translateCues': {
@@ -361,6 +492,10 @@ async function handle(
         }
         items.push({ id: x.id, text: x.text.slice(0, MAX_CUE_TEXT) });
       }
+      const sourceLang = parseLangField(m.sourceLang);
+      const targetLang = parseLangField(m.targetLang);
+      if (sourceLang === null || targetLang === null) return bad('bad-payload', 'lang');
+      const langScope = sourceLang && targetLang ? `${sourceLang}|${targetLang}` : 'en-zh';
       const controller = new AbortController();
       const requestKey = `${sender.tab?.id ?? sender.url}|${m.requestId}`;
       onlineRequests.set(requestKey, controller);
@@ -372,7 +507,7 @@ async function handle(
           if (!config.apiKey) return bad('no-key');
           if (validateAiProfile(config)) return bad('invalid-config');
           const scope = aiCacheScope(config);
-          const textKey = (text: string) => JSON.stringify(['translation', scope, 'en-zh', text]);
+          const textKey = (text: string) => JSON.stringify(['translation', scope, langScope, text]);
           const translations: { id: number; text: string }[] = [];
           const missing: typeof items = [];
           for (const item of items) {
@@ -380,8 +515,8 @@ async function handle(
             if (hit) translations.push({ id: item.id, text: hit }); else missing.push(item);
           }
           if (missing.length) {
-            const key = JSON.stringify(['translation-batch', scope, 'en-zh', missing.map(i => i.text)]);
-            const r = await cached(key, signal => translateSentences(config, missing.map(i => i.text), signal), controller.signal);
+            const key = JSON.stringify(['translation-batch', scope, langScope, missing.map(i => i.text)]);
+            const r = await cached(key, signal => translateSentences(config, missing.map(i => i.text), signal, { source: sourceLang ?? 'en', target: targetLang ?? 'zh-Hans' }), controller.signal);
             if (!r.ok && !translations.length) return r;
             if (r.ok) for (const t of r.translations) {
               const item = missing[t.id];
@@ -391,12 +526,45 @@ async function handle(
           return { ok: true, translations };
         }
         const translations: { id: number; text: string }[] = [];
+        const cueLangs = { source: sourceLang ?? 'en', target: targetLang ?? 'zh-Hans' };
         for (const item of items) {
-          const r = await cached(JSON.stringify(['translation', 'google-gtx', 'en-zh', item.text]), signal => translateRegularText(item.text, signal), controller.signal);
+          const r = await cached(JSON.stringify(['translation', 'google-gtx', langScope, item.text]), signal => translateRegularText(item.text, signal, cueLangs), controller.signal);
           if (r.ok) translations.push({ id: item.id, text: r.text });
         }
         return { ok: true, translations };
       } finally { if (onlineRequests.get(requestKey) === controller) onlineRequests.delete(requestKey); }
+    }
+    // ---- M11 学习库 -------------------------------------------------------------
+    case 'vaultStatus': {
+      return { ok: true, status: await getVaultStatus() };
+    }
+    case 'vaultConnect': {
+      // 页面侧已完成选目录/授权（pickVaultDirectoryInPage 把句柄写入 IDB），
+      // 重新授权 = 页面再次选同一目录后重发本消息。
+      const r = await adoptVault();
+      if (!r.ok) return bad(r.error);
+      broadcast({ type: 'vault-changed' });
+      broadcast({ type: 'vocab-changed' });
+      return { ok: true, vault: (await getVaultIdentity()) ?? null, imported: r.imported };
+    }
+    case 'vaultDisconnect': {
+      await disconnectVault();
+      broadcast({ type: 'vault-changed' });
+      return { ok: true };
+    }
+    case 'vaultFlush': {
+      const r = await flushVaultWrites();
+      await syncFromVault();
+      broadcast({ type: 'vault-changed' });
+      broadcast({ type: 'vocab-changed' });
+      return { ok: true, ...r };
+    }
+    case 'vaultSync': {
+      const r = await syncFromVault();
+      if (r.error) return bad(r.error);
+      broadcast({ type: 'vault-changed' });
+      if (r.updated || r.deleted) broadcast({ type: 'vocab-changed' });
+      return { ok: true, ...r };
     }
     case 'openSettings': {
       return handlePanelMessage({type:'panelOpen',view:'settings'},sender,nativeOpen);
@@ -412,15 +580,39 @@ export default defineBackground(() => {
     .setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
     .catch(() => {});
 
+  // M11 语言迁移（幂等）：旧词条按证据赋语言；有变化时补写学习库。
+  void (async () => {
+    try {
+      const report = await migrateLegacyLanguages();
+      if (report.entriesScanned || report.sentencesBackfilled) {
+        broadcast({ type: 'vocab-changed' });
+        broadcast({ type: 'sentences-changed' });
+        if (await getVaultIdentity()) {
+          for (const e of await listEntries()) await enqueueVocabWrite(entryViewToVaultRecord(e));
+          for (const s of await listSentences()) await enqueueSentenceWrite(sentenceToVaultRecord(s));
+          await flushVaultWrites();
+          broadcast({ type: 'vault-changed' });
+        }
+      }
+    } catch (e) {
+      console.warn('[blc] language migration failed', e);
+    }
+  })();
+
   // M5 问答：侧栏长连接（发送 / 停止 / 重试 / 流事件广播）
   initChatService();
   initPanelLifecycle();
+  initSelectionCandidateStore();
 
   // 设置页直接写 storage 时经 onChanged 广播给页面与各标签页。
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     if ('cacheLimit' in changes) void trimCache();
     if (Object.keys(changes).some(k => k in DEFAULT_SETTINGS)) broadcast({ type: 'settings-changed' });
+    // 语言偏好双向生效：设置变化即排队写回 偏好.md（幂等键，重复无害）
+    if ('defaultComprehensionLang' in changes || 'comprehensionOverrides' in changes) {
+      queueVaultWriteAfterSave(() => enqueuePreferenceWrite());
+    }
     const activeProfile = (raw: unknown) => {const value=raw as {active?:string;profiles?:Record<string,unknown>}|undefined;return [value?.active,value?.profiles?.[value?.active??'']];};
     if (changes.deepseekApiKey || changes.aiServices && JSON.stringify(activeProfile(changes.aiServices.oldValue)) !== JSON.stringify(activeProfile(changes.aiServices.newValue))) broadcast({type:'ai-service-changed'});
   });

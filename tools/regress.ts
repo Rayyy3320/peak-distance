@@ -3,6 +3,20 @@ import { lookupDictionarySource } from '../lib/onlineDictionary';
 import { translateSentences } from '../lib/aiClient';
 import { defaultAiProfile } from '../shared/aiConfig';
 import { alignTranslatedCues } from '../shared/cues';
+import { lookupOnline } from '../lib/lookupService';
+import { DEFAULT_SETTINGS } from '../shared/settings';
+import {
+  entryKeyOf,
+  parseEntryKey,
+  effectiveEntryLanguage,
+  normalizeExpressionInLanguage,
+} from '../shared/languages';
+import { wordAt, detectTextLanguage, classifySelection, effectiveLookupExpression, sentenceContaining } from '../shared/tokenize';
+import { planLegacyLanguage } from '../shared/vocab';
+import { serializeChatRecord, parseChatDocument, serializeMaterialSnapshot, parseMaterialDocument, materialIdOf } from '../lib/vault/chatFormat';
+import type { ChatMessageRecord, MaterialSnapshotRecord } from '../shared/chat';
+import { materialFromCandidate, candidateMatchesPage, type SelectionCandidate } from '../shared/chat';
+import { scanMarkHits, type MarkBucket } from '../shared/marker';
 // 离线回归检查（node 运行，无需浏览器）：
 //   1. M0 时序 A/B：捕获归属、换视频重置、跨视频旧响应丢弃。
 //   2. M1 词汇逻辑：规范化去重、上下文追加 / 去重、状态保持与显式更新。
@@ -659,5 +673,266 @@ const m7Cues = [
 const m7Words = cueWords(m7Cues);
 check('词次按实际出现计数，字幕位置去重', m7Words[0]?.count === 2 && m7Words[0]?.positions.length === 1 && m7Words[1]?.count === 2);
 check('AP 使用显示结束边界，重叠在下一句开始结束', cueEnd(m7Cues, 0) === 2000 && cueEnd(m7Cues, 1) === 3000);
+
+// M11 语言身份与词条稳定键（纯逻辑）。
+console.log('M11 语言身份与词条键');
+{
+  check('土耳其语 I 折叠为 ı（不与 i 合并）', normalizeExpressionInLanguage('DIŞARI', 'tr') === 'dışarı');
+  check('英语折叠保持点化 i', normalizeExpressionInLanguage('DIŞARI', 'en') === 'dişari');
+  check('日语键保留原形', entryKeyOf('ja', '学ぶ') === 'ja::学ぶ');
+  check('键往返', parseEntryKey('zh-Hant::繁體')?.lang === 'zh-Hant' && parseEntryKey('zh-Hant::繁體')?.expression === '繁體');
+  check('旧格式键无语言', parseEntryKey('pain') === null);
+  check('有效语言字段优先', effectiveEntryLanguage({ key: 'pain', language: 'fr' }) === 'fr');
+  check('无语言旧记录不猜语言', effectiveEntryLanguage({ key: 'pain' }) === null);
+  check('重音保留', normalizeExpressionInLanguage('École', 'fr') === 'école');
+  check('同形词不同语言是不同词条', entryKeyOf('en', 'pain') !== entryKeyOf('fr', 'pain'));
+}
+
+console.log('M11 planSave 语言身份');
+{
+  const jaSnap = {
+    source: 'web' as const, expression: '学ぶ', sentence: '私は日本語を学ぶ。',
+    url: 'https://example.com/ja', title: 'Example', lang: 'ja',
+  };
+  const saved = planSave(undefined, [], jaSnap, {});
+  check('语言作用域键', saved?.entry.key === 'ja::学ぶ');
+  check('词条携带语言', saved?.entry.language === 'ja');
+  const undSaved = planSave(undefined, [], { ...jaSnap, expression: 'pain', lang: 'und' }, {});
+  check('待确认语言仍可收藏', undSaved?.entry.key === 'und::pain' && undSaved?.entry.language === 'und');
+  const noLang = planSave(undefined, [], { source: 'web' as const, expression: 'pain', sentence: 's', url: 'https://a.com', title: 't' }, {});
+  check('无语言快照沿用旧键（迁移前兼容）', noLang?.entry.key === 'pain');
+}
+
+console.log('M11 查询路由：语言对、词典门控与 AI 兜底');
+{
+  const originalFetch = globalThis.fetch;
+  const aiConfig = { ...defaultAiProfile('deepseek'), provider: 'deepseek' as const, apiKey: 'test-only-key' };
+  const seenUrls: string[] = [];
+  const stubFetch = (urls: string[]) => {
+    globalThis.fetch = (async (input: any) => {
+      const url = String(input instanceof URL ? input : input?.url ?? input);
+      seenUrls.push(url);
+      if (url.includes('dict.youdao.com/jsonapi')) return Response.json({});
+      if (url.includes('dictionary.cambridge.org')) return new Response('<html><body></body></html>', { status: 200 });
+      if (url.includes('translate.googleapis.com')) return Response.json([[['译文']]]);
+      if (url.includes('/chat/completions')) return Response.json({ choices: [{ message: { content: '释义：学习\n语境：表示学习的动作' }, finish_reason: 'stop' }] });
+      return new Response('{}', { status: 404 });
+    }) as typeof fetch;
+    urls.length = 0;
+  };
+  try {
+    // 非英语源：词典完全不适用 → 免费译文，已知源传实际代码，目标 zh-CN
+    stubFetch(seenUrls);
+    const ja = await lookupOnline('学ぶ', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'ja', target: 'zh-Hans' }, sentence: '私は日本語を学ぶ。',
+    });
+    check('日语走免费译文', ja.ok && ja.result.kind === 'translation');
+    check('已知源传实际语言代码', seenUrls.some(u => u.includes('sl=ja') && u.includes('tl=zh-CN')));
+
+    // 待确认源（und）：交给端点自动检测，不猜英语
+    stubFetch(seenUrls);
+    const und = await lookupOnline('pain', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'und', target: 'zh-Hans' }, sentence: 'Le pain est bon.',
+    });
+    check('待确认源交给自动检测', und.ok && seenUrls.some(u => u.includes('sl=auto')) && !seenUrls.some(u => u.includes('sl=en')));
+
+    // 英语源 + 词典明确未命中 + 开关关 → 免费译文（不是失败）
+    stubFetch(seenUrls);
+    const missWord = await lookupOnline('flumberration', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, sentence: 'A flumberration of options.',
+    });
+    check('词典未命中回退免费译文', missWord.ok && missWord.result.kind === 'translation');
+    check('词典请求按 en 源发出', seenUrls.some(u => u.includes('youdao.com/jsonapi')));
+
+    // 悬停意图：开关开 + 已配置也绝不触发 LLM
+    stubFetch(seenUrls);
+    const hover = await lookupOnline('flumberration2', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, intent: 'hover',
+      aiFallback: { enabled: true, config: aiConfig },
+    });
+    check('悬停零 LLM 调用', !seenUrls.some(u => u.includes('/chat/completions')));
+    check('悬停仍得免费译文', hover.ok && hover.result.kind === 'translation');
+
+    // 主动查词 + 开关开 + 已配置 + 词典未命中 → AI 释义
+    stubFetch(seenUrls);
+    const ai = await lookupOnline('flumberration3', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' },
+      aiFallback: { enabled: true, config: aiConfig }, sentence: 'A flumberration of options.',
+    });
+    check('主动兜底命中 AI 释义', ai.ok && ai.result.kind === 'ai-definition');
+    if (ai.ok && ai.result.kind === 'ai-definition') {
+      check('AI 结果区分于词典与译文', ai.result.lang.source === 'en' && ai.result.text.includes('学习'));
+    }
+
+    // 主动 + 开关开但未配置 → 免费路径 + ai-unconfigured 提示
+    stubFetch(seenUrls);
+    const uncfg = await lookupOnline('flumberration4', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, aiFallback: { enabled: true, config: null }, sentence: 's',
+    });
+    check('未配置 AI 继续免费路径并提示', uncfg.ok && uncfg.result.kind === 'translation' && uncfg.degraded === 'ai-unconfigured');
+
+    // 词典限流（restricted）：不算未命中 → 不触发 AI，标明故障并尝试免费译文
+    globalThis.fetch = (async (input: any) => {
+      const url = String(input instanceof URL ? input : input?.url ?? input);
+      seenUrls.push(url);
+      if (url.includes('translate.googleapis.com')) return Response.json([[['译文']]]);
+      if (url.includes('/chat/completions')) return Response.json({ choices: [{ message: { content: 'x' }, finish_reason: 'stop' }] });
+      return new Response('{}', { status: 429 });
+    }) as typeof fetch;
+    seenUrls.length = 0;
+    const restricted = await lookupOnline('flumberration5', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, aiFallback: { enabled: true, config: aiConfig }, sentence: 's',
+    });
+    check('词典故障不触发 AI', !seenUrls.some(u => u.includes('/chat/completions')));
+    check('词典故障标明降级仍给译文', restricted.ok && restricted.result.kind === 'translation' && restricted.degraded === 'dictionary-failure');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+console.log('M11 分词与标记命中');
+{
+  const jaRaw = '私は毎日日本語を学ぶ。';
+  const manabu = jaRaw.indexOf('学ぶ');
+  check('点击定位日语词', wordAt(jaRaw, manabu, 'ja')?.text === '学ぶ');
+  check('点击定位土耳其语词', wordAt('DIŞARI çıkmak', 0, 'tr')?.text === 'DIŞARI');
+  check('点击落在词间取紧邻词', !!wordAt('hello world', 5, 'en'));
+  check('纯数字不判语言', detectTextLanguage('123 456') === null);
+  check('假名判日语', detectTextLanguage('これはペンです') === 'ja');
+  check('无假名汉字判中文', detectTextLanguage('我们学习中文') === 'zh');
+  check('波斯语特有字符判 fa', detectTextLanguage('زبان فارسی') === 'fa');
+  check('阿拉伯语判 ar', detectTextLanguage('اللغة العربية') === 'ar');
+  check('拉丁保守判英语桶', detectTextLanguage('Le pain est bon') === 'en');
+
+  const mkBucket = (tokens: Record<string, string>, phrases: Record<string, string> = {}): MarkBucket => ({
+    statusByKey: new Map(Object.entries(tokens)),
+    phrases: new Map(Object.entries(phrases)),
+  });
+  const buckets = new Map<string, MarkBucket>([
+    ['ja', mkBucket({ 学ぶ: 'learning' })],
+    ['zh', mkBucket({ 中文: 'known' })],
+    ['en', mkBucket({ constrained: 'saved' }, { 'take off': 'learning' })],
+    ['fr', mkBucket({ pain: 'saved' })],
+  ]);
+  const jaHits = scanMarkHits(jaRaw, buckets);
+  check('日语词条命中且范围正确', jaHits.length === 1 && jaRaw.slice(jaHits[0]!.start, jaHits[0]!.end) === '学ぶ');
+  check('法语词条不套用到拉丁默认桶', scanMarkHits('Le pain est bon', buckets).length === 0);
+  check('英语桶命中词条', scanMarkHits('The constrained design', buckets).length === 1);
+  const phHits = scanMarkHits('Take off now', buckets);
+  check('英语短语窗口命中', phHits.length === 1 && phHits[0]!.end - phHits[0]!.start === 'Take off'.length);
+  check('中文词条命中', scanMarkHits('我们学习中文。', buckets).length === 1);
+  check('无语言文本零标记', scanMarkHits('123', buckets).length === 0);
+}
+
+console.log('M11 旧数据语言迁移决策');
+{
+  const videoEn = { sourceType: 'video' as const, trackLang: 'en' };
+  const videoJa = { sourceType: 'video' as const, trackLang: 'ja' };
+  const webDict = { sourceType: 'web' as const, hasDictionaryResult: true };
+  const webPlain = { sourceType: 'web' as const };
+  const assign = planLegacyLanguage([videoEn, webPlain]);
+  check('轨道语言证据归属（无证据语境随词条）', assign.kind === 'assign' && assign.language === 'en');
+  const viaDict = planLegacyLanguage([webDict]);
+  check('词典命中是英语证据', viaDict.kind === 'assign' && viaDict.language === 'en');
+  const none = planLegacyLanguage([webPlain, { sourceType: 'web' as const }]);
+  check('无证据归待确认', none.kind === 'none');
+  const split = planLegacyLanguage([videoEn, videoJa, webPlain, videoJa]);
+  check('跨语言语境拆分成两组', split.kind === 'split' && split.groups.length === 2);
+  if (split.kind === 'split') {
+    const ja = split.groups.find(g => g.language === 'ja')!;
+    check('无证据语境随最大组', ja.contextIndexes.length === 3 && ja.contextIndexes.includes(2));
+  }
+  check('旧请求固定语言不是证据', planLegacyLanguage([{ sourceType: 'web' as const }]).kind === 'none');
+}
+
+console.log('M11 聊天/材料序列化往返');
+{
+  const record: {
+    id: string; title: string;
+    source: { sourceType: 'article'; sourceKey: string; title: string; url: string } | null;
+    sourceKey: string; snapshots: MaterialSnapshotRecord[]; activeSnapshotVersion: number;
+    messages: ChatMessageRecord[]; updatedAt: number;
+  } = {
+    id: 'chat-1', title: 'Language and the world',
+    source: { sourceType: 'article', sourceKey: 'web:x', title: 'Language', url: 'https://example.com/a' },
+    sourceKey: 'web:x', snapshots: [], activeSnapshotVersion: 0,
+    messages: [
+      { id: 'u1', role: 'user', turnId: 't1', text: 'What does constrained mean here?', at: 1700000000000, snapshotVersion: 1, segmentIndex: 0, scopeLabel: '已加载正文', quote: { blockIds: ['p1', 'p2'], expression: 'constrained' } },
+      { id: 'a1', role: 'assistant', turnId: 't1', text: '受控回答：受限制的。', at: 1700000001000, state: 'stopped' },
+    ],
+    updatedAt: 1700000002000,
+  };
+  const md = serializeChatRecord(record);
+  const parsed = parseChatDocument(md);
+  check('会话往返：身份与来源', !('error' in parsed) && parsed.id === 'chat-1' && parsed.sourceType === 'article');
+  if (!('error' in parsed)) {
+    check('会话往返：全部消息保序', parsed.messages.length === 2 && parsed.messages[0]!.text.includes('constrained'));
+    check('会话往返：终态与材料引用', parsed.messages[1]!.state === 'stopped' && parsed.messages[0]!.snapshotVersion === 1 && parsed.messages[0]!.segmentIndex === 0);
+    check('会话往返：引用块与表达', (parsed.messages[0]!.quote?.blockIds ?? []).join(',') === 'p1,p2');
+  }
+  const snapshot: MaterialSnapshotRecord = {
+    source: { sourceType: 'article', sourceKey: '', title: 'T', url: '' },
+    version: 2, createdAt: 1700000000000, label: '当前轨道完整字幕',
+    blocks: [
+      { id: 'p1', text: '第一句', startMs: 0, endMs: 2000 },
+      { id: 'p2', text: '第二句' },
+    ],
+  };
+  const mat = parseMaterialDocument(serializeMaterialSnapshot('chat-1', snapshot));
+  check('材料往返：版本与块', !('error' in mat) && mat.version === 2 && mat.snapshot.blocks.length === 2 && mat.snapshot.blocks[0]!.startMs === 0);
+  check('材料 ID 稳定', materialIdOf('chat-1', 2) === 'chat-1::v2');
+  check('坏会话输入报格式错误', 'error' in parseChatDocument('not a doc'));
+}
+
+// ---- 选区查词与添加到对话（selection-chat-actions spec） ----------------------------
+
+{
+  const cls = (raw: string, lang = 'en', opts: { crossesBlock?: boolean } = {}) => classifySelection(raw, lang, opts);
+  check('选区分类：单词', cls('learning').kind === 'word');
+  check('选区分类：词内撇号/连字符各算一个词', cls("don't").kind === 'word' && cls('well-known').kind === 'word');
+  check('选区分类：2–5 词短语', cls('take off').kind === 'phrase' && cls('in terms of').kind === 'phrase');
+  check('选区分类：超过 5 词隐藏查词', cls('one two three four five six').kind === 'sentence');
+  check('选区分类：跨正文块落入句段', cls('take off', 'en', { crossesBlock: true }).kind === 'sentence');
+  check('选区分类：内部句界落入句段', cls('Go home. Take rest').kind === 'sentence');
+  check('选区分类：中日文按分词器计（无空格≠单词）', cls('这是测试', 'zh').kind === 'phrase' && cls('学习', 'zh').kind === 'word');
+  check('选区分类：长中日句段无查词', cls('今天的会议讨论了三个重要问题并且形成最终结论', 'zh').kind === 'sentence');
+
+  const block = 'They are learning English together. Take off your shoes!';
+  check('有效表达：learnin 补齐 learning', effectiveLookupExpression(block, 10, 16, 'en')?.expression === 'learning');
+  check('有效表达：外围引号/逗号剥离', effectiveLookupExpression('“learning, fast', 1, 10, 'en')?.expression === 'learning');
+  check('有效表达：词尾撇号补齐', effectiveLookupExpression("they are goin' now", 10, 13, 'en')?.expression === "goin'");
+  check('有效表达：撇号后无字母不吞词', effectiveLookupExpression("they are goin' now", 10, 13, 'en')?.expression !== "goin' now");
+  check('有效表达：所有格 s 保留', effectiveLookupExpression("Paris's streets", 0, 7, 'en')?.expression === "Paris's");
+  check('有效表达：短语残缺补齐', effectiveLookupExpression('take off your shoes', 0, 7, 'en')?.expression === 'take off');
+  check('有效表达：配对引号整体剥离', effectiveLookupExpression('“learning” done', 0, 11, 'en')?.expression === 'learning');
+  check('有效表达：无法定位不猜', effectiveLookupExpression('!! ,,', 0, 5, 'en') === null);
+  check('原句提取：选区所在句', sentenceContaining(block, 10, 17) === 'They are learning English together.');
+  check('原句提取：跨句不兜底', sentenceContaining(block, 10, 45) === null);
+
+  const webSource = { sourceType: 'article' as const, sourceKey: 'web:https://a.example/x', title: 'A', url: 'https://a.example/x' };
+  const ytSource = {
+    sourceType: 'youtube' as const, sourceKey: 'yt:v1', title: 'V', url: 'https://www.youtube.com/watch?v=v1',
+    video: { videoId: 'v1', trackId: 't1', trackKind: 'manual' as const, trackLang: 'en' },
+  };
+  const base = { at: 1, pageUrl: 'https://a.example/x' };
+  const wordCand: SelectionCandidate = { ...base, text: 'learning', kind: 'word', expression: 'learning', sentence: 'They are learning English together.', source: webSource };
+  const wordBuilt = materialFromCandidate(wordCand);
+  check('材料构建：网页词=焦点+原句背景', !!wordBuilt && wordBuilt.material.blocks.length === 2 && wordBuilt.material.blocks[0]!.text === 'learning' && wordBuilt.quote.blockIds.join() === 'p1' && wordBuilt.quote.expression === 'learning');
+  const sentCand: SelectionCandidate = { ...base, text: 'They are learning English together.', kind: 'sentence', expression: null, source: webSource };
+  check('材料构建：句段只附加选区', materialFromCandidate(sentCand)?.material.blocks.length === 1);
+  const cueCand: SelectionCandidate = { ...base, pageUrl: ytSource.url, text: 'take off', kind: 'phrase', expression: 'take off', source: ytSource, cue: { index: 3, text: 'Take off your shoes!', startMs: 15000, endMs: 18000 } };
+  const cueBuilt = materialFromCandidate(cueCand);
+  check('材料构建：字幕词=焦点+字幕项背景带时间', !!cueBuilt && cueBuilt.material.blocks.length === 2 && cueBuilt.material.blocks[1]!.text === 'Take off your shoes!' && cueBuilt.material.blocks[1]!.startMs === 15000);
+  const crossCand: SelectionCandidate = { ...base, pageUrl: ytSource.url, text: 'end of one cue start of next', kind: 'cross-cue', expression: null, source: ytSource, crossFromMs: 32000, crossCount: 2 };
+  const crossBuilt = materialFromCandidate(crossCand);
+  check('材料构建：跨字幕项带起始位置', !!crossBuilt && crossBuilt.material.blocks.length === 1 && crossBuilt.material.blocks[0]!.startMs === 32000 && !!crossBuilt.quote.note?.includes('2'));
+  const defCand: SelectionCandidate = { ...base, text: 'learning', kind: 'word', expression: 'learning', source: webSource, definition: '学习' };
+  check('材料构建：已有释义随焦点', materialFromCandidate(defCand)?.quote.definition === '学习');
+  check('材料构建：空文本拒绝', materialFromCandidate({ ...base, text: '  ', kind: 'word', expression: null, source: webSource }) === null);
+
+  check('候选身份：同页有效', candidateMatchesPage({ ...wordCand }, 'https://a.example/x#section') === true);
+  check('候选身份：换页失效', candidateMatchesPage({ ...wordCand }, 'https://a.example/y') === false);
+}
+
 console.log(`\n通过 ${passed}，失败 ${failed}`);
 if (failed > 0) process.exit(1);

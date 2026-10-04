@@ -287,19 +287,28 @@ export default defineContentScript({
       }
     }
 
-    async function produceChinese(requestId: string, trackId: string, nonce: number): Promise<void> {
+    /** 目标语言 → timedtext tlang 代码（zh 保留简繁区分）。 */
+    function tlangCode(tag: string): string {
+      const t = (tag || 'zh-Hans').toLowerCase();
+      const primary = t.split('-')[0]!;
+      if (primary === 'zh') return /^zh-hant/.test(t) ? 'zh-Hant' : 'zh-Hans';
+      return primary;
+    }
+
+    async function produceChinese(requestId: string, trackId: string, nonce: number, targetTag = 'zh-Hans'): Promise<void> {
       chineseController?.abort();
       const controller = new AbortController();
       chineseController = controller;
       const source = englishSource;
       if (!source || source.videoId !== videoIdFromLocation() || source.trackId !== trackId) return;
+      const targetPrimary = tlangCode(targetTag).split('-')[0]!.toLowerCase();
       let normalized = source.kind === 'asr' ? normalizeAsrCues(source.cues) : source.cues.map(c => ({ ...c }));
       try {
         const tracks = captionTracksOf(activePlayer()) ?? [];
-        const chinese = tracks.filter(t => /^zh(?:-|$)/.test(t.languageCode ?? '')).sort((a, b) => Number(a.kind === 'asr') - Number(b.kind === 'asr'))[0];
-        if (chinese) {
+        const target = tracks.filter(t => t.languageCode?.toLowerCase().split('-')[0] === targetPrimary).sort((a, b) => Number(a.kind === 'asr') - Number(b.kind === 'asr'))[0];
+        if (target) {
           // 上游捕获 URL 的有效 pot 保留；独立轨道自身签名优先。
-          const url = new URL(chinese.baseUrl || buildVariantUrl(source.src, { lang: chinese.languageCode, kind: chinese.kind === 'asr' ? 'asr' : 'manual' }));
+          const url = new URL(target.baseUrl || buildVariantUrl(source.src, { lang: target.languageCode, kind: target.kind === 'asr' ? 'asr' : 'manual' }));
           const pot = new URL(source.src).searchParams.get('pot');
           if (pot && !url.searchParams.has('pot')) url.searchParams.set('pot', pot);
           url.searchParams.delete('tlang'); url.searchParams.set('fmt', 'json3');
@@ -307,7 +316,7 @@ export default defineContentScript({
         }
         if (normalized.some(c => !c.zh) && !controller.signal.aborted) {
           // yt-dual-subs inject.js buildUrl：保留签名及 pot，仅设置 fmt/tlang。
-          const url = new URL(source.src); url.searchParams.set('fmt', 'json3'); url.searchParams.set('tlang', 'zh-Hans');
+          const url = new URL(source.src); url.searchParams.set('fmt', 'json3'); url.searchParams.set('tlang', tlangCode(targetTag));
           try {
             const translated = parseJson3(await fetchJson3(url.toString(), controller.signal));
             const byStart = new Map(translated.map(c => [c.start, c.text]));
@@ -483,7 +492,7 @@ export default defineContentScript({
 
         if (d.type === 'translation-cancel') { chineseController?.abort(); return; }
         if (d.type === 'translation-request') {
-          if (d.videoId === videoIdFromLocation() && typeof d.requestId === 'string' && typeof d.trackId === 'string') void produceChinese(d.requestId, d.trackId, reqNonce);
+          if (d.videoId === videoIdFromLocation() && typeof d.requestId === 'string' && typeof d.trackId === 'string') void produceChinese(d.requestId, d.trackId, reqNonce, typeof d.targetLang === 'string' ? d.targetLang : 'zh-Hans');
           return;
         }
         if (d.type === 'bye') {
