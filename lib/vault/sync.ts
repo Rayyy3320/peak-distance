@@ -152,7 +152,10 @@ export async function flushVaultWrites(): Promise<FlushResult> {
   for (const w of queue) {
     try {
       if (w.kind === 'vocab') {
-        await writeVocabToVault(handle, w.payload as VaultVocabRecord);
+        const record = w.payload as VaultVocabRecord;
+        await writeVocabToVault(handle, record);
+        // 我们刚写的内容即“上次共同内容”（下次读回的三方合并 base）
+        await setSyncSnapshot(record.id, JSON.stringify(record));
       } else if (w.kind === 'sentence') {
         await writeSentenceToVault(handle, w.payload as VaultSentenceRecord);
       } else if (w.kind === 'preference') {
@@ -231,7 +234,8 @@ export async function syncFromVault(): Promise<SyncResult & { error?: 'not-conne
     }
     const localRecord = entryViewToVaultRecord(localEntry);
     const fileRecord: VaultVocabRecord & { note?: string } = { ...record, note };
-    const outcome = mergeVocabRecord(base, localRecord, fileRecord);
+    // 无快照（旧数据/首次）时本地即上次共同内容：外部-only 修改直接采纳
+    const outcome = mergeVocabRecord(base ?? localRecord, localRecord, fileRecord);
     if (outcome.kind === 'conflict') {
       const conflict: VaultConflictRecord = {
         kind: 'vocab',
