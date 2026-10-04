@@ -25,6 +25,9 @@
 | `entrypoints/background.ts`、`lib/chatService.ts` | 扩展消息、网络请求与问答生命周期 |
 | `lib/db.ts` | 扩展源下的 IndexedDB，集中读写与增量升级 |
 | `shared/vocab.ts`、`shared/cues.ts`、`shared/review.ts`、`shared/chat.ts` | 词汇、时间轴、复习、材料与对话纯逻辑 |
+| `shared/languages.ts`、`shared/tokenize.ts` | M11 语言身份（标签、稳定键、按语言规范化）与统一分词边界（点击 / 标记 / 词次共用） |
+| `lib/lookupService.ts` | M11 查询路由表唯一实现：词典语言对门控 → 免费译文 → 主动 AI 兜底（悬停零 LLM） |
+| `lib/vault/format.ts`、`lib/vault/chatFormat.ts`、`lib/vault/fs.ts`、`lib/vault/sync.ts` | M11 学习库：Markdown 往返与三方合并、会话/材料序列化、目录访问、同步编排（写前检查 + 冲突保留） |
 | `shared/messages.ts`、`shared/protocol.ts` | 扩展内部消息；YouTube 页面桥协议 |
 
 ## 持续约束
