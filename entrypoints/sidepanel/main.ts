@@ -178,7 +178,13 @@ document.getElementById('panel-mode')!.addEventListener('click',async()=>{
 document.getElementById('panel-close')!.addEventListener('click',async()=>{lookupPopup.close();await persistPanel();setChatActive(false);activePanel=false;ready=false;const r=await send<{ok:boolean}>({type:'panelClose'});if(!r?.ok){activePanel=true;ready=true;setChatActive(true);feedback('关闭失败，请重试');}});
 document.addEventListener('pointerdown',()=>void send({type:'panelOutsideClick',at:performance.timeOrigin+performance.now()}),true);
 document.addEventListener('click',()=>setTimeout(()=>void persistPanel(),0));
-document.addEventListener('scroll',()=>void persistPanel(),true);
+// 滚动以帧率触发，尾沿节流到 ≥400ms 一次持久化；点击路径保持立即
+let scrollPersistQueued=false,scrollPersistAt=0;
+document.addEventListener('scroll',()=>{
+  if(scrollPersistQueued)return;
+  scrollPersistQueued=true;
+  setTimeout(()=>{scrollPersistQueued=false;scrollPersistAt=Date.now();void persistPanel();},Math.max(0,scrollPersistAt+400-Date.now()));
+},true);
 
 
 async function refreshSentences(): Promise<void> {
