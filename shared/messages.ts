@@ -97,7 +97,15 @@ export type BgcRequest =
   | { type: 'vaultFlush' } // 立即尝试提交待写入队列
   | { type: 'openSettings' };
 
-export type OnlineLookupResult = { ok: true; result: LearningResult } | BgcError;
+/**
+ * 在线查词结果。degraded 说明结果经过了降级（不掩盖故障）：
+ * - dictionary-failure：词典网络／限流故障，改用免费译文；
+ * - ai-failed：AI 兜底失败，回退免费译文；
+ * - ai-unconfigured：兜底开关开启但未配置 Key，当前查询走免费路径。
+ */
+export type OnlineLookupResult =
+  | { ok: true; result: LearningResult; degraded?: 'dictionary-failure' | 'ai-failed' | 'ai-unconfigured' }
+  | BgcError;
 
 /** 显式 AI 语境解释结果。 */
 export type LookupResult =

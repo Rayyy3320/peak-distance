@@ -3,6 +3,14 @@ import { lookupDictionarySource } from '../lib/onlineDictionary';
 import { translateSentences } from '../lib/aiClient';
 import { defaultAiProfile } from '../shared/aiConfig';
 import { alignTranslatedCues } from '../shared/cues';
+import { lookupOnline } from '../lib/lookupService';
+import { DEFAULT_SETTINGS } from '../shared/settings';
+import {
+  entryKeyOf,
+  parseEntryKey,
+  effectiveEntryLanguage,
+  normalizeExpressionInLanguage,
+} from '../shared/languages';
 // 离线回归检查（node 运行，无需浏览器）：
 //   1. M0 时序 A/B：捕获归属、换视频重置、跨视频旧响应丢弃。
 //   2. M1 词汇逻辑：规范化去重、上下文追加 / 去重、状态保持与显式更新。
@@ -659,5 +667,122 @@ const m7Cues = [
 const m7Words = cueWords(m7Cues);
 check('词次按实际出现计数，字幕位置去重', m7Words[0]?.count === 2 && m7Words[0]?.positions.length === 1 && m7Words[1]?.count === 2);
 check('AP 使用显示结束边界，重叠在下一句开始结束', cueEnd(m7Cues, 0) === 2000 && cueEnd(m7Cues, 1) === 3000);
+
+// M11 语言身份与词条稳定键（纯逻辑）。
+console.log('M11 语言身份与词条键');
+{
+  check('土耳其语 I 折叠为 ı（不与 i 合并）', normalizeExpressionInLanguage('DIŞARI', 'tr') === 'dışarı');
+  check('英语折叠保持点化 i', normalizeExpressionInLanguage('DIŞARI', 'en') === 'dişari');
+  check('日语键保留原形', entryKeyOf('ja', '学ぶ') === 'ja::学ぶ');
+  check('键往返', parseEntryKey('zh-Hant::繁體')?.lang === 'zh-Hant' && parseEntryKey('zh-Hant::繁體')?.expression === '繁體');
+  check('旧格式键无语言', parseEntryKey('pain') === null);
+  check('有效语言字段优先', effectiveEntryLanguage({ key: 'pain', language: 'fr' }) === 'fr');
+  check('无语言旧记录不猜语言', effectiveEntryLanguage({ key: 'pain' }) === null);
+  check('重音保留', normalizeExpressionInLanguage('École', 'fr') === 'école');
+  check('同形词不同语言是不同词条', entryKeyOf('en', 'pain') !== entryKeyOf('fr', 'pain'));
+}
+
+console.log('M11 planSave 语言身份');
+{
+  const jaSnap = {
+    source: 'web' as const, expression: '学ぶ', sentence: '私は日本語を学ぶ。',
+    url: 'https://example.com/ja', title: 'Example', lang: 'ja',
+  };
+  const saved = planSave(undefined, [], jaSnap, {});
+  check('语言作用域键', saved?.entry.key === 'ja::学ぶ');
+  check('词条携带语言', saved?.entry.language === 'ja');
+  const undSaved = planSave(undefined, [], { ...jaSnap, expression: 'pain', lang: 'und' }, {});
+  check('待确认语言仍可收藏', undSaved?.entry.key === 'und::pain' && undSaved?.entry.language === 'und');
+  const noLang = planSave(undefined, [], { source: 'web' as const, expression: 'pain', sentence: 's', url: 'https://a.com', title: 't' }, {});
+  check('无语言快照沿用旧键（迁移前兼容）', noLang?.entry.key === 'pain');
+}
+
+console.log('M11 查询路由：语言对、词典门控与 AI 兜底');
+{
+  const originalFetch = globalThis.fetch;
+  const aiConfig = { ...defaultAiProfile('deepseek'), provider: 'deepseek' as const, apiKey: 'test-only-key' };
+  const seenUrls: string[] = [];
+  const stubFetch = (urls: string[]) => {
+    globalThis.fetch = (async (input: any) => {
+      const url = String(input instanceof URL ? input : input?.url ?? input);
+      seenUrls.push(url);
+      if (url.includes('dict.youdao.com/jsonapi')) return Response.json({});
+      if (url.includes('dictionary.cambridge.org')) return new Response('<html><body></body></html>', { status: 200 });
+      if (url.includes('translate.googleapis.com')) return Response.json([[['译文']]]);
+      if (url.includes('/chat/completions')) return Response.json({ choices: [{ message: { content: '释义：学习\n语境：表示学习的动作' }, finish_reason: 'stop' }] });
+      return new Response('{}', { status: 404 });
+    }) as typeof fetch;
+    urls.length = 0;
+  };
+  try {
+    // 非英语源：词典完全不适用 → 免费译文，已知源传实际代码，目标 zh-CN
+    stubFetch(seenUrls);
+    const ja = await lookupOnline('学ぶ', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'ja', target: 'zh-Hans' }, sentence: '私は日本語を学ぶ。',
+    });
+    check('日语走免费译文', ja.ok && ja.result.kind === 'translation');
+    check('已知源传实际语言代码', seenUrls.some(u => u.includes('sl=ja') && u.includes('tl=zh-CN')));
+
+    // 待确认源（und）：交给端点自动检测，不猜英语
+    stubFetch(seenUrls);
+    const und = await lookupOnline('pain', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'und', target: 'zh-Hans' }, sentence: 'Le pain est bon.',
+    });
+    check('待确认源交给自动检测', und.ok && seenUrls.some(u => u.includes('sl=auto')) && !seenUrls.some(u => u.includes('sl=en')));
+
+    // 英语源 + 词典明确未命中 + 开关关 → 免费译文（不是失败）
+    stubFetch(seenUrls);
+    const missWord = await lookupOnline('flumberration', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, sentence: 'A flumberration of options.',
+    });
+    check('词典未命中回退免费译文', missWord.ok && missWord.result.kind === 'translation');
+    check('词典请求按 en 源发出', seenUrls.some(u => u.includes('youdao.com/jsonapi')));
+
+    // 悬停意图：开关开 + 已配置也绝不触发 LLM
+    stubFetch(seenUrls);
+    const hover = await lookupOnline('flumberration2', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, intent: 'hover',
+      aiFallback: { enabled: true, config: aiConfig },
+    });
+    check('悬停零 LLM 调用', !seenUrls.some(u => u.includes('/chat/completions')));
+    check('悬停仍得免费译文', hover.ok && hover.result.kind === 'translation');
+
+    // 主动查词 + 开关开 + 已配置 + 词典未命中 → AI 释义
+    stubFetch(seenUrls);
+    const ai = await lookupOnline('flumberration3', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' },
+      aiFallback: { enabled: true, config: aiConfig }, sentence: 'A flumberration of options.',
+    });
+    check('主动兜底命中 AI 释义', ai.ok && ai.result.kind === 'ai-definition');
+    if (ai.ok && ai.result.kind === 'ai-definition') {
+      check('AI 结果区分于词典与译文', ai.result.lang.source === 'en' && ai.result.text.includes('学习'));
+    }
+
+    // 主动 + 开关开但未配置 → 免费路径 + ai-unconfigured 提示
+    stubFetch(seenUrls);
+    const uncfg = await lookupOnline('flumberration4', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, aiFallback: { enabled: true, config: null }, sentence: 's',
+    });
+    check('未配置 AI 继续免费路径并提示', uncfg.ok && uncfg.result.kind === 'translation' && uncfg.degraded === 'ai-unconfigured');
+
+    // 词典限流（restricted）：不算未命中 → 不触发 AI，标明故障并尝试免费译文
+    globalThis.fetch = (async (input: any) => {
+      const url = String(input instanceof URL ? input : input?.url ?? input);
+      seenUrls.push(url);
+      if (url.includes('translate.googleapis.com')) return Response.json([[['译文']]]);
+      if (url.includes('/chat/completions')) return Response.json({ choices: [{ message: { content: 'x' }, finish_reason: 'stop' }] });
+      return new Response('{}', { status: 429 });
+    }) as typeof fetch;
+    seenUrls.length = 0;
+    const restricted = await lookupOnline('flumberration5', DEFAULT_SETTINGS, undefined, undefined, {
+      lang: { source: 'en', target: 'zh-Hans' }, aiFallback: { enabled: true, config: aiConfig }, sentence: 's',
+    });
+    check('词典故障不触发 AI', !seenUrls.some(u => u.includes('/chat/completions')));
+    check('词典故障标明降级仍给译文', restricted.ok && restricted.result.kind === 'translation' && restricted.degraded === 'dictionary-failure');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 console.log(`\n通过 ${passed}，失败 ${failed}`);
 if (failed > 0) process.exit(1);

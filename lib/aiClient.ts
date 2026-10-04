@@ -1,6 +1,7 @@
 import type { AiConfig } from '@/shared/aiConfig';
 import { parseAiResponse, parseAiStreamEvent, requestAi } from './aiTransport';
 import { parseFormsLine } from '@/shared/vocab';
+import { langDisplayName, LANG_UNDETERMINED } from '@/shared/languages';
 import {
   feedSSE,
   type ChatCompletionMessage,
@@ -16,18 +17,31 @@ const RETRY_TOKENS_CAP = 12000;
 // 问答流式：回答较长，预算单独给足
 const MAX_TOKENS_CHAT = 8000;
 
-const SYSTEM_PROMPT = [
-  '你是英语学习助手。用户正在阅读英文并查询一个词或短语。',
-  '请用中文回答，输出纯文本，不要使用 Markdown、HTML 或代码块。',
-  '第一行以“释义：”开头，给出该表达的核心中文释义（简洁，通常一行）；',
-  '第二行以“语境：”开头，说明它在这句话里的具体含义或用法（一到两句）；',
-].join('');
+/** M11：提示按实际源／理解语言组织；语言待确认时按原文处理。 */
+function sourceNameOf(lang: string): string {
+  return lang === LANG_UNDETERMINED || !lang ? '原文（语言待确认）' : `${langDisplayName(lang)}（${lang}）`;
+}
 
-const SYSTEM_PROMPT_TRANSLATE = [
-  '你是视频字幕翻译引擎。把用户给出的每行英文字幕翻译成自然的简体中文。',
-  '只输出一个 JSON 数组，长度与输入行数相同，每项是对应行译文的字符串，',
-  '不要输出任何其它内容、解释或代码块标记。',
-].join('');
+function definitionSystemPrompt(source: string, target: string): string {
+  return [
+    `你是语言学习助手。用户正在阅读${sourceNameOf(source)}内容并查询其中的一个词或短语。`,
+    `请用${langDisplayName(target)}回答，输出纯文本，不要使用 Markdown、HTML 或代码块。`,
+    `第一行以“释义：”开头，给出该表达的核心${langDisplayName(target)}释义（简洁，通常一行）；`,
+    `第二行以“语境：”开头，说明它在这句话里的具体含义或用法（一到两句）；`,
+  ].join('');
+}
+
+function translateSystemPrompt(source: string, target: string): string {
+  return [
+    `你是视频字幕翻译引擎。把用户给出的每行${sourceNameOf(source)}字幕翻译成自然的${langDisplayName(target)}。`,
+    '只输出一个 JSON 数组，长度与输入行数相同，每项是对应行译文的字符串，',
+    '不要输出任何其它内容、解释或代码块标记。',
+  ].join('');
+}
+
+/** 兼容缺省：未提供语言对时沿用英语学习／简体中文行为（迁移前调用方）。 */
+const SYSTEM_PROMPT = definitionSystemPrompt('en', 'zh-Hans');
+const SYSTEM_PROMPT_TRANSLATE = translateSystemPrompt('en', 'zh-Hans');
 
 interface ChatError {
   ok: false;
@@ -144,7 +158,7 @@ export function parseDefinitionReply(content: string): {
 
 export async function lookupExpression(
   config: AiConfig,
-  input: { expression: string; sentence: string; neighbors?: string },
+  input: { expression: string; sentence: string; neighbors?: string; langs?: { source: string; target: string } },
   signal?: AbortSignal,
 ): Promise<LookupResult> {
   if (!config.apiKey) return { ok: false, error: 'no-key' };
@@ -155,7 +169,10 @@ export async function lookupExpression(
   ]
     .filter(Boolean)
     .join('\n');
-  const r = await chat(config, SYSTEM_PROMPT, user, MAX_TOKENS, signal);
+  const system = input.langs
+    ? definitionSystemPrompt(input.langs.source, input.langs.target)
+    : SYSTEM_PROMPT;
+  const r = await chat(config, system, user, MAX_TOKENS, signal);
   if ('error' in r) return r.error as LookupResult;
   const { definition, note } = parseDefinitionReply(r.content);
   return { ok: true, definition, note, provider: config.provider, model: config.model };
@@ -184,12 +201,14 @@ export async function translateSentences(
   config: AiConfig,
   lines: string[],
   signal?: AbortSignal,
+  langs?: { source: string; target: string },
 ): Promise<TranslateSentencesResult> {
   if (!config.apiKey) return { ok: false, error: 'no-key' };
   if (!lines.length) return { ok: true, translations: [] };
   const numbered = lines.map((l, i) => `${i + 1}. ${l}`).join('\n');
+  const system = langs ? translateSystemPrompt(langs.source, langs.target) : SYSTEM_PROMPT_TRANSLATE;
   let content: string | null = null;
-  const r1 = await chat(config, SYSTEM_PROMPT_TRANSLATE, numbered, MAX_TOKENS_TRANSLATE, signal);
+  const r1 = await chat(config, system, numbered, MAX_TOKENS_TRANSLATE, signal);
   if ('error' in r1) return r1.error as TranslateSentencesResult;
   content = r1.content;
   let arr = parseJsonArray(content);
@@ -197,7 +216,7 @@ export async function translateSentences(
     // JSON 被截断（推理 + 长回答超出预算）时加倍预算重试一次
     const r2 = await chat(
       config,
-      SYSTEM_PROMPT_TRANSLATE,
+      system,
       numbered,
       Math.min(MAX_TOKENS_TRANSLATE * 2, RETRY_TOKENS_CAP),
       signal,

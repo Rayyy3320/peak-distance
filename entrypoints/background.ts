@@ -1,9 +1,9 @@
-import { lookupOnline } from '@/lib/lookupService';
+import { lookupOnline, type LookupRequestContext } from '@/lib/lookupService';
 import { handlePanelMessage, openPanel, startNativePanel, initPanelLifecycle } from '@/lib/panelService';
 import { selectionError } from '@/shared/panel';
 import { translateRegularText } from '@/lib/regularTranslation';
 import { cached, cacheGet, cachePut, trimCache } from '@/lib/onlineCache';
-import { DEFAULT_SETTINGS, validSetting } from '@/shared/settings';
+import { comprehensionLangFor, DEFAULT_SETTINGS, validSetting } from '@/shared/settings';
 import type { LearningResult, ContextExplanation } from '@/shared/vocab';
 // background：词汇 / 翻译消息路由、IndexedDB 存取、AI 请求、广播。
 // 凭据仅在本上下文读取；content script 只传查词材料与词汇操作，
@@ -195,7 +195,8 @@ async function handle(
       onlineRequests.set(key, controller);
       // 缓存身份随语言对区分；未提供时沿用旧 'en-zh' 作用域（迁移前缓存兼容）。
       const scope = sourceLang && targetLang ? `${sourceLang}|${targetLang}` : 'en-zh';
-      try { return await cached(JSON.stringify(['translation','google-gtx',scope,text]), signal => translateRegularText(text,signal),controller.signal); }
+      const selLangs = { source: sourceLang ?? 'en', target: targetLang ?? 'zh-Hans' };
+      try { return await cached(JSON.stringify(['translation','google-gtx',scope,text]), signal => translateRegularText(text,signal,selLangs),controller.signal); }
       finally { if(onlineRequests.get(key)===controller) onlineRequests.delete(key); }
     }
     case 'cancelOnline': {
@@ -264,15 +265,33 @@ async function handle(
       try {
         if (m.type === 'lookup') {
           if (m.source && m.source !== 'youdao' && m.source !== 'cambridge') return bad('bad-payload');
-          return await lookupOnline(snapshot.expression, await getSettings(), m.source, controller.signal);
+          const settings = await getSettings();
+          // 快照语言缺省按 en（迁移前调用方）；目标 = 调用方指定或按设置解析。
+          const sourceLang = snapshot.lang ?? 'en';
+          const targetLang = m.targetLang ?? comprehensionLangFor(settings, sourceLang);
+          // AI 兜底授权仅主动查词携带；配置快照固定在本次请求（spec 3.3）。
+          let aiFallback: LookupRequestContext['aiFallback'];
+          if (settings.aiLookupFallback && (intent ?? 'active') === 'active') {
+            const config = await getAiConfig();
+            aiFallback = { enabled: true, config: config.apiKey ? config : null };
+          }
+          return await lookupOnline(snapshot.expression, settings, m.source, controller.signal, {
+            lang: { source: sourceLang, target: targetLang },
+            intent,
+            aiFallback,
+            sentence: snapshot.sentence,
+            neighbors: snapshot.source === 'video' ? snapshot.neighbors : undefined,
+          });
         }
         const neighbors = snapshot.source === 'video' ? snapshot.neighbors : undefined;
         const config = await getAiConfig();
         if (!config.apiKey) return bad('no-key');
         if (validateAiProfile(config)) return bad('invalid-config');
-        const aiScope = snapshot.lang && m.targetLang ? `${snapshot.lang}|${m.targetLang}` : 'en-zh';
-        return await cached(JSON.stringify(['ai-context', aiCacheScope(config), aiScope, snapshot.expression, snapshot.sentence, neighbors]),
-          signal => lookupExpression(config, { expression: snapshot.expression, sentence: snapshot.sentence, neighbors }, signal), controller.signal);
+        const settings = await getSettings();
+        const sourceLang = snapshot.lang ?? 'en';
+        const targetLang = m.targetLang ?? comprehensionLangFor(settings, sourceLang);
+        return await cached(JSON.stringify(['ai-context', aiCacheScope(config), `${sourceLang}|${targetLang}`, snapshot.expression, snapshot.sentence, neighbors]),
+          signal => lookupExpression(config, { expression: snapshot.expression, sentence: snapshot.sentence, neighbors, langs: { source: sourceLang, target: targetLang } }, signal), controller.signal);
       } finally { if (onlineRequests.get(requestKey) === controller) onlineRequests.delete(requestKey); }
     }
     case 'getEntry': {
@@ -422,7 +441,7 @@ async function handle(
           }
           if (missing.length) {
             const key = JSON.stringify(['translation-batch', scope, langScope, missing.map(i => i.text)]);
-            const r = await cached(key, signal => translateSentences(config, missing.map(i => i.text), signal), controller.signal);
+            const r = await cached(key, signal => translateSentences(config, missing.map(i => i.text), signal, { source: sourceLang ?? 'en', target: targetLang ?? 'zh-Hans' }), controller.signal);
             if (!r.ok && !translations.length) return r;
             if (r.ok) for (const t of r.translations) {
               const item = missing[t.id];
@@ -432,8 +451,9 @@ async function handle(
           return { ok: true, translations };
         }
         const translations: { id: number; text: string }[] = [];
+        const cueLangs = { source: sourceLang ?? 'en', target: targetLang ?? 'zh-Hans' };
         for (const item of items) {
-          const r = await cached(JSON.stringify(['translation', 'google-gtx', langScope, item.text]), signal => translateRegularText(item.text, signal), controller.signal);
+          const r = await cached(JSON.stringify(['translation', 'google-gtx', langScope, item.text]), signal => translateRegularText(item.text, signal, cueLangs), controller.signal);
           if (r.ok) translations.push({ id: item.id, text: r.text });
         }
         return { ok: true, translations };
