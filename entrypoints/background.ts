@@ -1,5 +1,6 @@
 import { lookupOnline, type LookupRequestContext } from '@/lib/lookupService';
 import { handlePanelMessage, openPanel, startNativePanel, initPanelLifecycle } from '@/lib/panelService';
+import { handleSelectionCandidateMessage, initSelectionCandidateStore } from '@/lib/selectionCandidates';
 import { selectionError } from '@/shared/panel';
 import { translateRegularText } from '@/lib/regularTranslation';
 import { cached, cacheGet, cachePut, trimCache } from '@/lib/onlineCache';
@@ -201,6 +202,9 @@ async function handle(
 
   const panelResult = await handlePanelMessage(msg, sender,nativeOpen);
   if (panelResult !== undefined) return panelResult;
+
+  const candidateResult = await handleSelectionCandidateMessage(msg, sender);
+  if (candidateResult !== undefined) return candidateResult;
 
   const m = msg as Partial<BgcRequest>;
   // M5 问答：CRUD / 打开面板统一走 chatService（含载荷校验）
@@ -598,6 +602,7 @@ export default defineBackground(() => {
   // M5 问答：侧栏长连接（发送 / 停止 / 重试 / 流事件广播）
   initChatService();
   initPanelLifecycle();
+  initSelectionCandidateStore();
 
   // 设置页直接写 storage 时经 onChanged 广播给页面与各标签页。
   browser.storage.onChanged.addListener((changes, area) => {

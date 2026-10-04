@@ -13,6 +13,12 @@ export function initFloatingPanel() {
   let readyCallbacks: Array<(ok:boolean)=>void>=[];
   let observedSubs:Element|null=null;
   const subtitlesResize=new ResizeObserver(()=>place());
+  // 通知类上报：扩展重载后残留宿主的页面事件仍会触发，此时
+  // runtime.sendMessage 同步抛 Extension context invalidated（.catch 挂不上），
+  // 按无处可上报处理
+  const notify = (msg: Record<string, unknown>) => {
+    try { void browser.runtime.sendMessage(msg).catch(() => {}); } catch { /* ignore */ }
+  };
   const hide = () => { if(host) host.hidden = true; document.dispatchEvent(new Event('pd-panel-layout')); };
   const status = (text: string, failed = false) => {
     const root = host?.shadowRoot;
@@ -47,10 +53,10 @@ export function initFloatingPanel() {
     const parent = document.fullscreenElement ?? document.documentElement;
     const subs=document.getElementById('blc-subs');
     if(subs!==observedSubs){subtitlesResize.disconnect();if(subs)subtitlesResize.observe(subs);observedSubs=subs;}
+    // 全屏内为字幕安全区避让；非全屏可在整个视口内移动（不钳在播放器上方）
     const reserved=document.fullscreenElement?Math.max(160,(document.getElementById('blc-subs')?.offsetHeight??80)+88):12;
-    const player=document.getElementById('movie_player')?.getBoundingClientRect();
-    const safeBottom=document.fullscreenElement?innerHeight-reserved:player&&player.bottom>260&&player.top<innerHeight?Math.min(innerHeight-12,player.bottom-64):innerHeight-12;
-    host.style.maxHeight=`${Math.max(180,safeBottom-24)}px`;
+    const safeBottom=document.fullscreenElement?innerHeight-reserved:innerHeight-12;
+    host.style.maxHeight=`${Math.max(180,safeBottom-12)}px`;
     if (host.parentElement !== parent) {
       const movable = parent as Element & {moveBefore?:(node:Node,child:Node|null)=>void};
       if(host.isConnected && movable.moveBefore) movable.moveBefore(host,null); else parent.append(host);
@@ -89,7 +95,7 @@ export function initFloatingPanel() {
         drag.addEventListener('pointermove',move);drag.addEventListener('pointerup',stop);
       });
       drag.addEventListener('keydown', e => {if(e.key.startsWith('Arrow')) {e.preventDefault(); const r=host!.getBoundingClientRect();x=r.left+(e.key==='ArrowRight'?16:e.key==='ArrowLeft'?-16:0);y=r.top+(e.key==='ArrowDown'?16:e.key==='ArrowUp'?-16:0);place();}});
-      host.addEventListener('keydown', e=>{e.stopPropagation();if(e.key==='Escape')void browser.runtime.sendMessage({type:'panelClose'}).catch(()=>{});});
+      host.addEventListener('keydown', e=>{e.stopPropagation();if(e.key==='Escape')notify({type:'panelClose'});});
     }
     host.hidden = false; place();
     if(await probe('show'))return {ok:true,hostId};
@@ -107,13 +113,13 @@ export function initFloatingPanel() {
     if(msg.type==='pd-panel-show') {void show(msg.view).then(reply);return true;}
   });
   document.addEventListener('fullscreenchange',()=>{
-    void browser.runtime.sendMessage({type:'panelFullscreen',fullscreen:!!document.fullscreenElement}).catch(()=>{});
+    notify({type:'panelFullscreen',fullscreen:!!document.fullscreenElement});
     if(document.fullscreenElement) {normalOpen=!!host&&!host.hidden;hide();place();}
     else {place();if(normalOpen&&host)host.hidden=false;else hide();document.dispatchEvent(new Event('pd-panel-layout'));}
   });
   window.addEventListener('resize',place);
   const healthTimer=setInterval(()=>{if(host&&!host.hidden&&document.visibilityState==='visible')void probe('probe');},10000);
-  document.addEventListener('pointerdown', () => { void browser.runtime.sendMessage({ type: 'panelOutsideClick', at:performance.timeOrigin+performance.now() }).catch(() => {}); }, true);
-  window.addEventListener('pagehide',()=>{void browser.runtime.sendMessage({type:'panelHostClosed',hostId}).catch(()=>{});clearInterval(healthTimer);clearTimeout(readyTimer);subtitlesResize.disconnect();host?.remove();});
+  document.addEventListener('pointerdown', () => { notify({ type:'panelOutsideClick', at:performance.timeOrigin+performance.now() }); }, true);
+  window.addEventListener('pagehide',()=>{notify({type:'panelHostClosed',hostId});clearInterval(healthTimer);clearTimeout(readyTimer);subtitlesResize.disconnect();host?.remove();});
   return {show,hide,isOpen:()=>!!host&&!host.hidden};
 }

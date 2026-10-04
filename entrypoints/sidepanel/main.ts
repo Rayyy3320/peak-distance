@@ -4,10 +4,12 @@ import { createYoutubeWorkspace, type WorkspaceState } from '@/shared/youtubeWor
 import { isPanelView, panelStateKey, panelTransportFailure, type SelectionSnapshot, type PanelFrameState } from '@/shared/panel';
 import { createTranslationPopup } from '@/shared/translationPopup';
 import { createLookupPopup } from '@/shared/lookupPopup';
-import { shadowSelection } from '@/shared/selection';
+import { shadowSelection, rangeOffsetsIn, clampRangeToElement } from '@/shared/selection';
 import { buildMarkBuckets } from '@/shared/marker';
 import { effectiveEntryLanguage, isRtlLanguage, langDisplayName } from '@/shared/languages';
-import { segmentWords } from '@/shared/tokenize';
+import { classifySelection, effectiveLookupExpression, segmentWords } from '@/shared/tokenize';
+import { materialFromCandidate, type SelectionCandidate } from '@/shared/chat';
+import { CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
 // 侧栏三个视图：生词本（词条 / 上下文 / 词形关联管理）、字幕（当前标签页
 // 视频的原文列表 + 译文 + 播放控制）、复习（原句回忆，无 AI 调用）。
 // 数据全部来自 background 的 IndexedDB；vocab-changed 广播后刷新。
@@ -18,6 +20,7 @@ import { videoContextUrl, blankExpression, type SavedSentence, type VocabStatus 
 import { buildReviewQueue, refreshQueue, type ReviewItem } from '@/shared/review';
 import { fmtClock } from '@/shared/cues';
 import {
+  attachSelectionCandidate,
   chatViewEnter,
   chatViewLeave,
   initChatView,
@@ -388,24 +391,97 @@ const videoWorkspace=createYoutubeWorkspace({
   bindWords:host=>{
     const events=host.shadowRoot!;
     let selectedAt=0;
+    // 字幕列表选区：单词/短语/句段/跨字幕项统一分类；原文行以外（译文、控件）不取
+    const rowIndexOf=(node:Node|null|undefined):number|null=>{
+      const element=node instanceof Element?node:node?.parentElement??null;
+      const row=element?.closest('[data-cue]');
+      return row?Number(row.getAttribute('data-cue')):null;
+    };
+    const enOf=(index:number):Element|null=>events.querySelector(`[data-cue="${index}"] .en`);
+    function listSelectionInfo(selection:{text:string;range:Range}):{
+      kind:'word'|'phrase'|'sentence'|'cross-cue';raw:string;expression:string|null;
+      firstIndex:number;count:number;hasWord:boolean;rect:DOMRect;
+    }|null{
+      const startIndex=rowIndexOf(selection.range.startContainer);
+      const endIndex=rowIndexOf(selection.range.endContainer);
+      if(startIndex===null&&endIndex===null)return null;
+      const first=startIndex??endIndex!;
+      const last=endIndex??startIndex!;
+      if(first===last){
+        const en=enOf(first);
+        if(!en)return null;
+        const clamped=clampRangeToElement(selection.range,en);
+        const raw=clamped.toString().replace(/\s+/g,' ').trim();
+        if(!raw)return null;
+        const lang=((cachedVideo?.trackLang||subsState?.trackLang)||'en').split('-')[0]!;
+        const cls=classifySelection(raw,lang);
+        let expression:string|null=null;
+        if(cls.kind!=='sentence'){
+          const offsets=rangeOffsetsIn(en,clamped);
+          if(offsets&&offsets.start<=offsets.end&&offsets.end<=offsets.text.length)
+            expression=effectiveLookupExpression(offsets.text,offsets.start,offsets.end,lang)?.expression??null;
+        }
+        return {kind:cls.kind,raw,expression,firstIndex:first,count:1,hasWord:cls.hasWord,rect:selection.range.getBoundingClientRect()};
+      }
+      // 跨字幕项：实际选择的原文（按行收窄到 .en，不含译文/控件文字）
+      const parts:string[]=[];
+      for(let i=Math.min(first,last);i<=Math.max(first,last);i++){
+        const en=enOf(i);
+        if(!en)continue;
+        const clamped=clampRangeToElement(selection.range,en);
+        const part=clamped.toString().replace(/\s+/g,' ').trim();
+        if(part)parts.push(part);
+      }
+      const raw=parts.join(' ').trim();
+      if(!raw)return null;
+      return {kind:'cross-cue',raw,expression:null,firstIndex:Math.min(first,last),count:Math.abs(last-first)+1,hasWord:false,rect:selection.range.getBoundingClientRect()};
+    }
+    function listSelectionCandidate(info:{kind:'word'|'phrase'|'sentence'|'cross-cue';raw:string;expression:string|null;firstIndex:number;count:number}):SelectionCandidate|null{
+      const state=subsState;
+      if(!state?.videoId||!state.trackId||subsTabId===null)return null;
+      const source:SelectionCandidate['source']={
+        sourceType:'youtube',
+        sourceKey:`yt:${state.videoId}`,
+        title:state.title||state.videoId,
+        url:`https://www.youtube.com/watch?v=${state.videoId}`,
+        video:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang},
+      };
+      const cue=state.cues[info.firstIndex];
+      if(info.kind==='cross-cue'){
+        return {at:Date.now(),pageUrl:source.url,text:info.raw,kind:'cross-cue',expression:null,source,
+          crossFromMs:cue?.startMs??0,crossCount:info.count};
+      }
+      if(!cue)return null;
+      return {at:Date.now(),pageUrl:source.url,text:info.raw,kind:info.kind,
+        expression:info.kind==='sentence'?null:info.expression,
+        lang:state.trackLang||undefined,source,
+        cue:{index:info.firstIndex,text:cue.text,startMs:cue.startMs,endMs:cue.endMs}};
+    }
     document.addEventListener('mouseup',e=>{
       if(currentView!=='subs'||e.composedPath().some(n=>n instanceof Element&&n.matches('#panel-selection-actions,#blc-lookup-popup,#pd-translation')))return;
-      const selection=shadowSelection(events),text=selection?.text??'';
-      if(!text||!(/\s/.test(text))||!subsState)return;
+      const selection=shadowSelection(events);
+      if(!selection||!subsState)return;
+      const info=listSelectionInfo(selection);
+      if(!info)return;
       selectedAt=Date.now();e.stopPropagation();
       document.getElementById('panel-selection-actions')?.remove();
       const buttons=el('div','selection-actions');buttons.id='panel-selection-actions';
-      const rect=selection!.range.getBoundingClientRect();buttons.style.left=Math.max(8,Math.min(rect.left,innerWidth-176))+'px';buttons.style.top=Math.min(rect.bottom+4,innerHeight-44)+'px';
-      const node=selection!.range.startContainer;
-      const element=node instanceof Element?node:node.parentElement;
-      const selectedRow=element?.closest('[data-cue]');
-      if(!selectedRow)return;
-      const selectedIndex=Number(selectedRow.getAttribute('data-cue'));
-      const selectedVideo=subsState.videoId,selectedCue=subsState.cues[selectedIndex];
-      if(!selectedCue)return;
-      const snapshot={text,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue.startMs)};
-      const translate=el('button',undefined,'翻译');translate.onmousedown=e=>e.preventDefault();translate.onclick=()=>{buttons.remove();selectionPopup.open(snapshot,rect);};buttons.append(translate);
-      if(text.length<=200){const lookup=el('button',undefined,'查词');lookup.onmousedown=e=>e.preventDefault();lookup.onclick=()=>{buttons.remove();if(subsState?.videoId===selectedVideo)void videoAction('lookup',selectedIndex,text);};buttons.append(lookup);}
+      const rect=info.rect;buttons.style.left=Math.max(8,Math.min(rect.left,innerWidth-220))+'px';buttons.style.top=Math.min(rect.bottom+4,innerHeight-44)+'px';
+      const selectedVideo=subsState.videoId,selectedCue=subsState.cues[info.firstIndex];
+      const candidate=listSelectionCandidate(info);
+      if(candidate)void send({type:'selectionCandidateSet',tabId:subsTabId??undefined,candidate});
+      const snapshot={text:info.raw,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue?.startMs??0)};
+      // 分类表：word=查词+对话；phrase=查词+翻译+对话；sentence/cross-cue=翻译+对话
+      if(info.kind!=='word'){
+        const translate=el('button',undefined,'翻译');translate.onmousedown=e=>e.preventDefault();translate.onclick=()=>{buttons.remove();selectionPopup.open(snapshot,rect);};buttons.append(translate);
+      }
+      if((info.kind==='word'||info.kind==='phrase')&&info.hasWord&&info.raw.length<=200){
+        const lookup=el('button',undefined,'查词');lookup.onmousedown=e=>e.preventDefault();lookup.onclick=()=>{buttons.remove();if(subsState?.videoId===selectedVideo)void videoAction('lookup',info.firstIndex,info.expression??info.raw);};buttons.append(lookup);
+      }
+      const chat=el('button','blc-chat-add');chat.title='添加到对话';chat.setAttribute('aria-label','添加到对话');chat.innerHTML=CHAT_ADD_ICON;
+      chat.onmousedown=e=>e.preventDefault();
+      chat.onclick=()=>{buttons.remove();if(candidate)void attachSelectionCandidate(candidate,{tabId:subsTabId??undefined});};
+      buttons.append(chat);
       const close=el('button',undefined,'×');close.setAttribute('aria-label','关闭选区操作');close.onclick=()=>buttons.remove();buttons.append(close);document.body.append(buttons);
     });
     const wordOf=(e:Event)=>(e.composedPath()[0] as Element)?.closest?.('.w') as HTMLElement|null;

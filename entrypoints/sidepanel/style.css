@@ -39,6 +39,8 @@ main {min-height:0;min-width:0;overflow:auto;padding:20px 16px;flex:1;overscroll
 #settings-back:hover {background:var(--pd-selected);color:var(--pd-blue)}
 #settings-back svg {width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 .selection-actions {position:fixed;z-index:10;display:flex;gap:4px;padding:4px;background:var(--pd-paper);border:1px solid var(--pd-line);border-radius:8px;box-shadow:var(--pd-shadow)}
+.selection-actions .blc-chat-add {display:inline-flex;align-items:center;justify-content:center;min-width:32px;padding-inline:6px}
+.selection-actions .blc-chat-add svg {width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 @media(max-width:359px){.brand-row{display:grid;grid-template-columns:1fr repeat(3,40px);gap:6px;margin-bottom:12px}.brand-name{grid-column:1;font-size:22px}.brand-row #panel-mode{grid-column:2}.brand-row #open-settings{grid-column:3}.brand-row #panel-close{grid-column:4}}
 @media(min-width:560px){body{grid-template-columns:184px minmax(0,1fr);grid-template-rows:minmax(0,1fr)}.app-header{padding:24px 12px 0;border-right:1px solid var(--pd-line);border-bottom:0;position:relative;overflow:hidden;display:flex;flex-direction:column}.brand-row{flex-wrap:wrap;gap:4px;position:relative;z-index:1}.brand-name{font-size:20px;flex:1 1 100%}.brand-name small{font-size:9px;letter-spacing:0}.brand-row button{margin-top:8px}#views{flex-direction:column;background:transparent;padding:0;position:relative;z-index:1}#views button{text-align:left;padding:8px 12px}#views button.active{background:var(--pd-selected);box-shadow:none}.brand-landscape{display:block;flex:1;min-height:100px;margin:24px -12px 0;background:url('/brand/mountain-coast.png') center bottom/auto 100%;opacity:.85}.app-content{background:#fffdfaab}main{padding:24px}#library-tools{padding:24px}.entry-head{flex-wrap:nowrap}}
 @media(prefers-reduced-motion:no-preference){button{transition:background .12s,color .12s}}
@@ -97,8 +99,27 @@ main {min-height:0;min-width:0;overflow:auto;padding:20px 16px;flex:1;overscroll
 #chat-attachments summary {display:flex;align-items:center;gap:5px;padding:4px 8px;cursor:pointer;list-style:none;border-radius:7px;color:var(--pd-muted)}
 #chat-attachments summary::-webkit-details-marker {display:none}
 #chat-attachments summary:hover,#chat-attachments[open] summary {background:var(--pd-paper);color:var(--pd-ink)}
-.chat-attachment-menu {position:absolute;bottom:calc(100% + 8px);left:0;z-index:2;min-width:170px;display:flex;flex-direction:column;padding:6px;background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:10px}
+.chat-attachment-menu {position:absolute;bottom:calc(100% + 8px);left:0;z-index:2;min-width:210px;display:flex;flex-direction:column;padding:6px;background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:10px}
 #view-chat .chat-attachment-menu button {text-align:left;min-height:38px}
+#chat-attach-selection {display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding-block:7px}
+#chat-attach-selection small {font-size:11px;color:var(--pd-muted);max-width:190px;white-space:normal;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+/* 附件区：当前材料只在输入框上方展示（预览两行，展开有界滚动） */
+#chat-attachment {margin-bottom:8px}
+.chat-attachment-row {display:flex;gap:4px;align-items:stretch}
+#chat-attachment-chip {flex:1;min-width:0;display:flex;gap:8px;align-items:baseline;padding:6px 10px;background:var(--pd-paper);border:1px solid var(--pd-line);border-radius:9px;text-align:left}
+#chat-attachment-chip:hover {border-color:var(--pd-mist)}
+#chat-attachment-kind {flex:none;font-size:11px;color:var(--pd-blue)}
+#chat-attachment-summary {min-width:0;font-size:13px;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+#chat-attachment-remove {flex:none;border:0;background:transparent;color:var(--pd-muted);min-width:32px;padding:0}
+#chat-attachment-remove:hover {background:#eae6dd;color:var(--pd-ink)}
+.chat-attachment-focus {display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:4px;font-size:12px;color:var(--pd-muted)}
+.chat-attachment-focus:empty {display:none}
+.chat-attachment-focus .attach-focus-label {min-width:0;overflow-wrap:anywhere;flex:1}
+#chat-attachment-detail {margin-top:6px;background:var(--pd-paper);border:1px solid var(--pd-line);border-radius:9px;padding:8px 10px}
+#chat-attachment-detail .attach-meta {display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--pd-muted);align-items:baseline}
+#chat-attachment-detail .attach-source {color:var(--pd-blue);text-decoration:underline;text-underline-offset:3px}
+#chat-attachment-detail .attach-blocks {max-height:180px;overflow:auto;margin-top:6px;scrollbar-width:thin}
+#chat-attachment-detail .attach-block {margin:0 0 6px;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
 #chat-send,#chat-stop {margin-left:auto;display:flex;align-items:center;justify-content:center;flex:none;min-width:36px;height:36px;padding:6px;border-radius:9px;background:var(--pd-blue);color:white;border:0}
 #chat-send:hover {background:#154fa6}
 #chat-stop {background:var(--pd-ink)}

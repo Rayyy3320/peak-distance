@@ -58,8 +58,12 @@ export async function renderM6({ browser, port, content, inject, installStub, ch
       // 改轨后留下一个可取消的中文请求，隐藏中文必须 abort 且保留英文。
       await page.evaluate(() => { window.__hold = true; void fetch(window.__source + '&name=new'); });
       await page.waitForFunction(() => window.__held === true);
-      await page.getByText('正在获取中文字幕…', { exact: true }).waitFor();
-      check('等待中文时显示明确加载状态', true); 
+      // M11 起加载文案按目标语言显示（默认中文）
+      await page.waitForFunction(() =>
+        (document.getElementById('blc-subs')?.shadowRoot?.querySelector('.notice')?.textContent ?? '').startsWith('正在获取') &&
+        (document.getElementById('blc-subs')?.shadowRoot?.querySelector('.notice')?.textContent ?? '').endsWith('译文…'),
+      );
+      check('等待中文时显示明确加载状态', true);
       await page.locator('#blc-subs-switch #chinese').uncheck();
       await page.waitForFunction(() => window.__aborted > 0);
       check('隐藏中文中止 MAIN 在途请求，英文仍显示', await page.locator('#blc-subs .en').count() === 1);

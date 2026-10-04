@@ -11,10 +11,11 @@ import {
   effectiveEntryLanguage,
   normalizeExpressionInLanguage,
 } from '../shared/languages';
-import { wordAt, detectTextLanguage } from '../shared/tokenize';
+import { wordAt, detectTextLanguage, classifySelection, effectiveLookupExpression, sentenceContaining } from '../shared/tokenize';
 import { planLegacyLanguage } from '../shared/vocab';
 import { serializeChatRecord, parseChatDocument, serializeMaterialSnapshot, parseMaterialDocument, materialIdOf } from '../lib/vault/chatFormat';
 import type { ChatMessageRecord, MaterialSnapshotRecord } from '../shared/chat';
+import { materialFromCandidate, candidateMatchesPage, type SelectionCandidate } from '../shared/chat';
 import { scanMarkHits, type MarkBucket } from '../shared/marker';
 // 离线回归检查（node 运行，无需浏览器）：
 //   1. M0 时序 A/B：捕获归属、换视频重置、跨视频旧响应丢弃。
@@ -881,6 +882,56 @@ console.log('M11 聊天/材料序列化往返');
   check('材料往返：版本与块', !('error' in mat) && mat.version === 2 && mat.snapshot.blocks.length === 2 && mat.snapshot.blocks[0]!.startMs === 0);
   check('材料 ID 稳定', materialIdOf('chat-1', 2) === 'chat-1::v2');
   check('坏会话输入报格式错误', 'error' in parseChatDocument('not a doc'));
+}
+
+// ---- 选区查词与添加到对话（selection-chat-actions spec） ----------------------------
+
+{
+  const cls = (raw: string, lang = 'en', opts: { crossesBlock?: boolean } = {}) => classifySelection(raw, lang, opts);
+  check('选区分类：单词', cls('learning').kind === 'word');
+  check('选区分类：词内撇号/连字符各算一个词', cls("don't").kind === 'word' && cls('well-known').kind === 'word');
+  check('选区分类：2–5 词短语', cls('take off').kind === 'phrase' && cls('in terms of').kind === 'phrase');
+  check('选区分类：超过 5 词隐藏查词', cls('one two three four five six').kind === 'sentence');
+  check('选区分类：跨正文块落入句段', cls('take off', 'en', { crossesBlock: true }).kind === 'sentence');
+  check('选区分类：内部句界落入句段', cls('Go home. Take rest').kind === 'sentence');
+  check('选区分类：中日文按分词器计（无空格≠单词）', cls('这是测试', 'zh').kind === 'phrase' && cls('学习', 'zh').kind === 'word');
+  check('选区分类：长中日句段无查词', cls('今天的会议讨论了三个重要问题并且形成最终结论', 'zh').kind === 'sentence');
+
+  const block = 'They are learning English together. Take off your shoes!';
+  check('有效表达：learnin 补齐 learning', effectiveLookupExpression(block, 10, 16, 'en')?.expression === 'learning');
+  check('有效表达：外围引号/逗号剥离', effectiveLookupExpression('“learning, fast', 1, 10, 'en')?.expression === 'learning');
+  check('有效表达：词尾撇号补齐', effectiveLookupExpression("they are goin' now", 10, 13, 'en')?.expression === "goin'");
+  check('有效表达：撇号后无字母不吞词', effectiveLookupExpression("they are goin' now", 10, 13, 'en')?.expression !== "goin' now");
+  check('有效表达：所有格 s 保留', effectiveLookupExpression("Paris's streets", 0, 7, 'en')?.expression === "Paris's");
+  check('有效表达：短语残缺补齐', effectiveLookupExpression('take off your shoes', 0, 7, 'en')?.expression === 'take off');
+  check('有效表达：配对引号整体剥离', effectiveLookupExpression('“learning” done', 0, 11, 'en')?.expression === 'learning');
+  check('有效表达：无法定位不猜', effectiveLookupExpression('!! ,,', 0, 5, 'en') === null);
+  check('原句提取：选区所在句', sentenceContaining(block, 10, 17) === 'They are learning English together.');
+  check('原句提取：跨句不兜底', sentenceContaining(block, 10, 45) === null);
+
+  const webSource = { sourceType: 'article' as const, sourceKey: 'web:https://a.example/x', title: 'A', url: 'https://a.example/x' };
+  const ytSource = {
+    sourceType: 'youtube' as const, sourceKey: 'yt:v1', title: 'V', url: 'https://www.youtube.com/watch?v=v1',
+    video: { videoId: 'v1', trackId: 't1', trackKind: 'manual' as const, trackLang: 'en' },
+  };
+  const base = { at: 1, pageUrl: 'https://a.example/x' };
+  const wordCand: SelectionCandidate = { ...base, text: 'learning', kind: 'word', expression: 'learning', sentence: 'They are learning English together.', source: webSource };
+  const wordBuilt = materialFromCandidate(wordCand);
+  check('材料构建：网页词=焦点+原句背景', !!wordBuilt && wordBuilt.material.blocks.length === 2 && wordBuilt.material.blocks[0]!.text === 'learning' && wordBuilt.quote.blockIds.join() === 'p1' && wordBuilt.quote.expression === 'learning');
+  const sentCand: SelectionCandidate = { ...base, text: 'They are learning English together.', kind: 'sentence', expression: null, source: webSource };
+  check('材料构建：句段只附加选区', materialFromCandidate(sentCand)?.material.blocks.length === 1);
+  const cueCand: SelectionCandidate = { ...base, pageUrl: ytSource.url, text: 'take off', kind: 'phrase', expression: 'take off', source: ytSource, cue: { index: 3, text: 'Take off your shoes!', startMs: 15000, endMs: 18000 } };
+  const cueBuilt = materialFromCandidate(cueCand);
+  check('材料构建：字幕词=焦点+字幕项背景带时间', !!cueBuilt && cueBuilt.material.blocks.length === 2 && cueBuilt.material.blocks[1]!.text === 'Take off your shoes!' && cueBuilt.material.blocks[1]!.startMs === 15000);
+  const crossCand: SelectionCandidate = { ...base, pageUrl: ytSource.url, text: 'end of one cue start of next', kind: 'cross-cue', expression: null, source: ytSource, crossFromMs: 32000, crossCount: 2 };
+  const crossBuilt = materialFromCandidate(crossCand);
+  check('材料构建：跨字幕项带起始位置', !!crossBuilt && crossBuilt.material.blocks.length === 1 && crossBuilt.material.blocks[0]!.startMs === 32000 && !!crossBuilt.quote.note?.includes('2'));
+  const defCand: SelectionCandidate = { ...base, text: 'learning', kind: 'word', expression: 'learning', source: webSource, definition: '学习' };
+  check('材料构建：已有释义随焦点', materialFromCandidate(defCand)?.quote.definition === '学习');
+  check('材料构建：空文本拒绝', materialFromCandidate({ ...base, text: '  ', kind: 'word', expression: null, source: webSource }) === null);
+
+  check('候选身份：同页有效', candidateMatchesPage({ ...wordCand }, 'https://a.example/x#section') === true);
+  check('候选身份：换页失效', candidateMatchesPage({ ...wordCand }, 'https://a.example/y') === false);
 }
 
 console.log(`\n通过 ${passed}，失败 ${failed}`);

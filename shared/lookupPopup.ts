@@ -23,6 +23,11 @@ import {
 
 export const POPUP_ID = 'blc-lookup-popup';
 
+// 纸纹背景地址在注入期解析一次并复用：扩展重载/更新后，残留旧标签页里的
+// content script 在事件期（首次打开词卡）再调 runtime.getURL 会抛
+// Extension context invalidated；地址本身不变，注入期上下文必然有效。
+const PAPER_TILE_URL = browser.runtime.getURL('/brand/paper-tile.png');
+
 export interface PopupOpenArgs {
   snapshot: LookupSnapshot;
   anchor?: HTMLElement;
@@ -145,7 +150,7 @@ export function createLookupPopup(opts: {
         .card {
           position: fixed; top: 64px; right: 16px; width: min(420px, calc(100vw - 32px));
           max-height: min(70vh, 560px); overflow: auto;
-          background: linear-gradient(#f7f4ecd9,#f7f4ecd9),url('${browser.runtime.getURL('/brand/paper-tile.png')}') center/620px; color: var(--pd-ink); border-radius: 12px;
+          background: linear-gradient(#f7f4ecd9,#f7f4ecd9),url('${PAPER_TILE_URL}') center/620px; color: var(--pd-ink); border-radius: 12px;
           box-shadow: var(--pd-shadow);
           font: 14px/1.6 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
           padding: 20px; box-sizing: border-box;

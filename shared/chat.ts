@@ -234,6 +234,87 @@ export interface QuoteRef {
   note?: string;
 }
 
+// ---- 选区候选（选区查词 spec：临时保留，不写会话历史或学习库） ---------------------
+
+export type SelectionKind = 'word' | 'phrase' | 'sentence' | 'cross-cue';
+
+/** 选区所在单条字幕（背景块，带时间）。 */
+export interface SelectionCueRef {
+  index: number;
+  text: string;
+  startMs: number;
+  endMs: number;
+}
+
+/** 有效阅读选区形成时固定的快照：文本、来源、位置与局部上下文。 */
+export interface SelectionCandidate {
+  at: number;
+  /** 选择时的页面地址（导航/切页后候选失效的身份依据）。 */
+  pageUrl: string;
+  /** 原始选区（翻译与附加用原文，不改写）。 */
+  text: string;
+  kind: SelectionKind;
+  /** 有效查词表达（word/phrase；无法定位为 null）。 */
+  expression: string | null;
+  lang?: string;
+  /** 词/短语的背景原句（网页/X；无可靠原句缺省）。 */
+  sentence?: string;
+  /** 选择时来源（X 绑定被选帖子；视频带轨道）。 */
+  source: SourceDescriptor;
+  /** 单条字幕选区：所在字幕项。 */
+  cue?: SelectionCueRef;
+  /** 跨字幕项：起始毫秒与跨过的条数。 */
+  crossFromMs?: number;
+  crossCount?: number;
+  /** 词卡继续问带入的已有释义。 */
+  definition?: string;
+}
+
+/** 候选与当前页面身份是否一致（导航、切视频、换原文字幕轨道后失效）。 */
+export function candidateMatchesPage(candidate: SelectionCandidate, pageUrl: string): boolean {
+  return normalizeArticleUrl(candidate.pageUrl) === normalizeArticleUrl(pageUrl);
+}
+
+/** 依据来源表构建附件材料与焦点引用；无有效文本返回 null。 */
+export function materialFromCandidate(c: SelectionCandidate): { material: MaterialPayload; quote: QuoteRef } | null {
+  const text = c.text.trim();
+  if (!text) return null;
+  if (c.kind === 'cross-cue') {
+    const startMs = c.crossFromMs ?? c.cue?.startMs ?? 0;
+    const material: MaterialPayload = {
+      label: '跨字幕选段',
+      blocks: [{ id: 'p1', text, ...(Number.isFinite(startMs) && startMs >= 0 ? { startMs, endMs: startMs } : {}) }],
+    };
+    return { material, quote: { blockIds: ['p1'], note: c.crossCount ? `跨 ${c.crossCount} 条字幕 · ${fmtClock(startMs)}` : fmtClock(startMs) } };
+  }
+  const subtitle = !!c.cue;
+  const focusOnly = c.kind === 'sentence';
+  const blocks: MaterialBlock[] = [{ id: 'p1', text }];
+  if (subtitle) {
+    const cue = c.cue!;
+    // 词/短语：字幕项为背景；句段：选区本身（均带视频与时间）
+    if (!focusOnly) blocks.push({ id: 'p2', text: cue.text, startMs: cue.startMs, endMs: cue.endMs });
+    blocks[0] = { ...blocks[0]!, startMs: cue.startMs, endMs: cue.endMs };
+  } else if (!focusOnly && c.sentence && c.sentence.replace(/\s+/g, '') !== text.replace(/\s+/g, '')) {
+    blocks.push({ id: 'p2', text: c.sentence });
+  }
+  const material: MaterialPayload = {
+    label: subtitle ? (focusOnly ? '选中字幕' : '词句与字幕') : focusOnly ? '选中句段' : '词句与原句',
+    blocks,
+  };
+  const quote: QuoteRef = {
+    blockIds: ['p1'],
+    ...(focusOnly ? { note: subtitle ? `${fmtClock(c.cue!.startMs)} · ${text.slice(0, 60)}` : text.slice(0, 60) } : { expression: c.expression ?? text }),
+    ...(c.definition ? { definition: c.definition } : {}),
+    ...(subtitle && !focusOnly ? { note: `${fmtClock(c.cue!.startMs)} · ${text.slice(0, 60)}` } : {}),
+  };
+  return { material, quote };
+}
+
+/** 附件预览摘要：选区显示原文，页面/字幕全文显示标题。 */
+export const SELECTION_MATERIAL_LABELS = new Set(['选中片段', '词句与原句', '选中句段', '词句与字幕', '选中字幕', '跨字幕选段']);
+
+
 export interface ChatTurnRequest {
   question: string;
   quote: QuoteRef | null;

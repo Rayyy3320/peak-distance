@@ -34,11 +34,22 @@
 
     <main id="view-chat" hidden>
       <div id="chat-head"></div>
-      <div id="chat-segments"></div>
       <div id="chat-cite-panel" hidden></div>
       <div id="chat-list"></div>
       <button id="chat-latest" type="button" hidden>↓ 回到最新</button>
       <div id="chat-input-row">
+        <div id="chat-attachment" hidden>
+          <div class="chat-attachment-row">
+            <button id="chat-attachment-chip" type="button" aria-expanded="false">
+              <span id="chat-attachment-kind"></span>
+              <span id="chat-attachment-summary"></span>
+            </button>
+            <button id="chat-attachment-remove" type="button" aria-label="移除材料" title="移除材料（保留问题）">×</button>
+          </div>
+          <div id="chat-attachment-focus" class="chat-attachment-focus"></div>
+          <div id="chat-attachment-detail" hidden></div>
+          <div id="chat-segments"></div>
+        </div>
         <div id="chat-starters"></div>
         <textarea
           id="chat-input"
@@ -51,7 +62,7 @@
             <summary><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>附加材料</summary>
             <div class="chat-attachment-menu">
               <button id="chat-attach-page" class="chat-tool">附加页面</button>
-              <button id="chat-attach-selection" class="chat-tool">附加选区</button>
+              <button id="chat-attach-selection" class="chat-tool"><span>附加选区</span><small id="chat-attach-selection-summary"></small></button>
               <button id="chat-attach-video" class="chat-tool">附加视频字幕</button>
             </div>
           </details>

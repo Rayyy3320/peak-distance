@@ -144,6 +144,18 @@ try {
   await page.locator('#blc-subs-switch #learning').click();await page.locator('#blc-subs-switch #panel').click();await page.locator('#pd-floating-panel').waitFor({state:'visible'});
   await page.frameLocator('#pd-floating-panel iframe').locator('.brand-name').waitFor();
   const videoFrame=page.frames().find(f=>f.url().includes('/sidepanel.html'));await videoFrame.locator('#blc-learning-panel .row').first().waitFor();
+  // 非全屏：浮动面板可向下移动到播放器以下（不被钳在播放器上方）。
+  // 受控 headless 中指针捕获跨扩展 iframe 派发不全，用产品自带的方向键移动验证同一钳制路径。
+  {
+    const panelBox=page.locator('#pd-floating-panel');
+    const handle=page.locator('#pd-floating-panel .drag');
+    const before=await panelBox.evaluate(el=>el.getBoundingClientRect().top);
+    await handle.click();
+    for(let i=0;i<14;i++) await handle.press('ArrowDown');
+    const after=await panelBox.evaluate(el=>el.getBoundingClientRect().top);
+    check('浮动面板非全屏可向下移动到播放器下方',after>before+80&&after>100,`before=${before} after=${after}`);
+    for(let i=0;i<12;i++) await handle.press('ArrowLeft');
+  }
   const sentenceBounds=await videoFrame.locator('#blc-learning-panel .row').nth(1).locator('.en').boundingBox();
   await page.mouse.move(sentenceBounds.x+1,sentenceBounds.y+sentenceBounds.height/2);await page.mouse.down();await page.mouse.move(sentenceBounds.x+sentenceBounds.width-2,sentenceBounds.y+sentenceBounds.height/2,{steps:15});await page.mouse.up();
   await videoFrame.locator('#panel-selection-actions').getByRole('button',{name:'翻译',exact:true}).click();await videoFrame.locator('#pd-translation #result').filter({hasText:'学习语言'}).waitFor();check('面板字幕选区绑定所选句时间',(await videoFrame.locator('#pd-translation #source').getAttribute('href')).includes('t=3'));
@@ -152,12 +164,12 @@ try {
   await videoFrame.locator('#blc-learning-panel .w').first().click();await page.mouse.click(10,10);await videoFrame.locator('#blc-lookup-popup').waitFor({state:'detached'});check('网页点击关闭自有 iframe 内词卡',true);await page.waitForFunction(()=>!document.querySelector('video').paused);check('关闭面板词卡恢复插件造成的暂停',true);await page.evaluate(()=>{document.querySelector('video').pause();document.querySelector('video').currentTime=0;});
   await videoFrame.getByRole('button',{name:'词语',exact:true}).click();await videoFrame.getByRole('button',{name:'Run · 2 次',exact:true}).waitFor();check('视频全部词汇与词次仍可用',true);
   await videoFrame.getByRole('button',{name:'字幕',exact:true}).click();await videoFrame.getByRole('button',{name:'收藏整句',exact:true}).first().click();
-  await videoFrame.getByRole('button',{name:'问 AI',exact:true}).first().click();const quoteRow=videoFrame.locator('.quote-row').filter({hasText:'引用：'});await quoteRow.waitFor();const quoteText=await quoteRow.textContent();await videoFrame.locator('#chat-input').fill('Temporary input with material and quote.');await videoFrame.getByRole('button',{name:'生词本',exact:true}).click();await videoFrame.getByRole('button',{name:'AI 问答',exact:true}).click();check('模块往返保留输入材料与引用',await videoFrame.locator('#chat-input').inputValue()==='Temporary input with material and quote.'&&await quoteRow.textContent()===quoteText);
+  await videoFrame.getByRole('button',{name:'问 AI',exact:true}).first().click();const quoteRow=videoFrame.locator('#chat-attachment-focus').filter({hasText:'焦点：'});await quoteRow.waitFor();const quoteText=await quoteRow.textContent();await videoFrame.locator('#chat-input').fill('Temporary input with material and quote.');await videoFrame.getByRole('button',{name:'生词本',exact:true}).click();await videoFrame.getByRole('button',{name:'AI 问答',exact:true}).click();check('模块往返保留输入材料与引用',await videoFrame.locator('#chat-input').inputValue()==='Temporary input with material and quote.'&&await quoteRow.textContent()===quoteText);
   await videoFrame.getByRole('button',{name:'切换为固定侧栏'}).click();
   let quoteTarget;for(let i=0;i<40&&!quoteTarget;i++){quoteTarget=(await cdp.send('Target.getTargets')).targetInfos.find(t=>t.type==='page'&&t.url===panelUrl);if(!quoteTarget)await new Promise(r=>setTimeout(r,100));}
   assert.ok(quoteTarget);sessionId=(await cdp.send('Target.attachToTarget',{targetId:quoteTarget.targetId,flatten:false})).sessionId;
-  for(let i=0;i<40;i++){if(await nativeEval('document.body&&!document.body.inert&&[...document.querySelectorAll(".quote-row")].some(n=>n.textContent.includes("引用："))'))break;await new Promise(r=>setTimeout(r,100));}
-  const nativeQuote=await nativeEval('[...document.querySelectorAll(".quote-row")].find(n=>n.textContent.includes("引用："))?.textContent');
+  for(let i=0;i<40;i++){if(await nativeEval('document.body&&!document.body.inert&&[...document.querySelectorAll("#chat-attachment-focus")].some(n=>n.textContent.includes("焦点："))'))break;await new Promise(r=>setTimeout(r,100));}
+  const nativeQuote=await nativeEval('[...document.querySelectorAll("#chat-attachment-focus")].find(n=>n.textContent.includes("焦点："))?.textContent');
 
   check('输入材料引用一起跨模式保留',nativeQuote===quoteText&&await nativeEval('document.querySelector("#chat-input").value')==='Temporary input with material and quote.');
   await nativeEval('document.querySelector("#panel-mode").click()');await page.locator('#pd-floating-panel').waitFor({state:'visible'});await videoFrame.getByRole('button',{name:'当前内容',exact:true}).click();

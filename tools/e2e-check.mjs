@@ -123,7 +123,10 @@ try {
   if (originalKey) await sw.evaluate(key => chrome.storage.local.set({ deepseekApiKey: key }), originalKey);
   for (const expression of ['run', 'bank', 'went', 'take off', 'in spite of', 'a surprisingly good result', 'zzzxxyynotaword']) {
     const r = await send({ type: 'lookup', snapshot: snapshot(expression), requestId: expression });
-    const expected = expression === 'zzzxxyynotaword' ? !r.ok && r.error === 'not-found' : r.ok && r.result.kind === (expression === 'a surprisingly good result' ? 'translation' : 'dictionary');
+    // M11 路由：词典未命中可回退免费译文（zzz… 无词典词条但允许免费译文兜底）
+    const expected = expression === 'zzzxxyynotaword'
+      ? r.ok || r.error === 'not-found'
+      : r.ok && r.result.kind === (expression === 'a surprisingly good result' ? 'translation' : 'dictionary');
     check(`真实在线查询 ${expression}`, expected, r.ok ? JSON.stringify(r.result.kind === 'dictionary' ? { source: r.result.entry.source, head: r.result.entry.headword, sense: r.result.entry.senses[0].definition } : r.result) : r.error);
   }
   const before = await sw.evaluate(() => __network.length);
@@ -197,14 +200,14 @@ try {
   check('不可注入页面可发送普通问题', await sw.evaluate(() => __network.filter(n => n.llm).at(-1).body.messages.at(-1).content) === '不可注入页面问题');
   const materialA = { sourceType: 'article', sourceKey: 'web:a', title: 'Material A', url: 'https://example.com/a' };
   await send({ type: 'chatEnsure', chatId: id, windowId, source: materialA, material: { label: 'A', blocks: [{ id: 'p1', text: 'MATERIAL_A_SECRET_TEST' }] }, quote: { blockIds: ['p1'] } });
-  await panel.waitForFunction(() => document.getElementById('chat-head').innerText.includes('Material A'));
+  await panel.waitForFunction(() => document.getElementById('chat-attachment-summary')?.innerText.includes('Material A'));
   await uiSend('材料 A 问题'); await waitChat(id);
   await panel.getByRole('button', { name: '移除材料', exact: true }).click();
   await uiSend('移除后问题'); await waitChat(id);
   let lastBody = await sw.evaluate(() => __network.filter(n => n.llm).at(-1).body);
   check('移除材料后实际请求没有原文、引用和材料问答', !JSON.stringify(lastBody).includes('MATERIAL_A_SECRET_TEST') && !JSON.stringify(lastBody).includes('材料 A 问题') && !lastBody.messages.at(-1).content.includes('材料：'));
   await send({ type: 'chatEnsure', chatId: id, windowId, source: { ...materialA, sourceKey: 'web:b', title: 'Material B' }, material: { label: 'B', blocks: [{ id: 'p1', text: 'MATERIAL_B_TEXT' }] }, quote: { blockIds: ['p1'] } });
-  await panel.waitForFunction(() => document.getElementById('chat-head').innerText.includes('Material B'));
+  await panel.waitForFunction(() => document.getElementById('chat-attachment-summary')?.innerText.includes('Material B'));
   await uiSend('材料 B 问题'); await waitChat(id);
   await panel.locator('.cite').first().click();
   check('同名引用块按原消息快照解析', (await panel.locator('#chat-cite-panel').innerText()).includes('MATERIAL_A_SECRET_TEST'));
@@ -226,7 +229,7 @@ try {
   await originalRow.getByRole('button',{name:'Cancel delete'}).click();
   await originalRow.locator('.chat-tool').click();
   await panel.waitForFunction(()=>document.getElementById('chat-input').value==='');
-  check('成功换会话丢弃未发送材料引用并恢复已提交材料', !(await panel.locator('#chat-head').innerText()).includes('引用：') && (await send({type:'chatActive',windowId})).chat.source.title==='Material B');
+  check('成功换会话丢弃未发送材料引用并恢复已提交材料', !(await panel.locator('#chat-attachment').innerText()).includes('焦点：') && (await send({type:'chatActive',windowId})).chat.source.title==='Material B');
   await panel.getByRole('button',{name:'新对话',exact:true}).click();
   await panel.waitForFunction(()=>document.querySelector('#chat-list').innerText.includes('从一句话'));
   await send({type:'chatEnsure',windowId,source:materialA,material:{label:'A',blocks:[{id:'p1',text:'MATERIAL_A_SECRET_TEST'}]},quote:{blockIds:['p1']}});

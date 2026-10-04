@@ -15,6 +15,7 @@ import type {
   ChatRecordView,
   MaterialPayload,
   QuoteRef,
+  SelectionCandidate,
   SourceDescriptor,
 } from './chat';
 
@@ -96,7 +97,10 @@ export type BgcRequest =
   | { type: 'vaultStatus' }
   | { type: 'vaultFlush' } // 立即尝试提交待写入队列并读回
   | { type: 'vaultSync' } // 只读回（打开面板/焦点恢复触发）
-  | { type: 'openSettings' };
+  | { type: 'openSettings' }
+  // ---- 选区候选（选区查词 spec） ----
+  | SelectionCandidateSetMessage
+  | SelectionCandidateGetMessage;
 
 /**
  * 在线查词结果。degraded 说明结果经过了降级（不掩盖故障）：
@@ -342,7 +346,28 @@ export interface ChatSourceInfo {
   source: SourceDescriptor | null;
   canMaterial: boolean;
   hint: string;
+  /** 当前页面地址（选区候选身份校验用；面板上下文无 tabs 权限读 tab.url）。 */
+  pageUrl: string;
 }
+
+// ---- 选区候选（选区查词 spec） -----------------------------------------------------
+
+/** 内容脚本（隐式 sender 标签页）/ 侧栏（显式 tabId）→ background：固定或清除候选。 */
+export interface SelectionCandidateSetMessage {
+  type: 'selectionCandidateSet';
+  tabId?: number;
+  candidate: SelectionCandidate | null;
+}
+
+/** 侧栏 → background：读取指定标签页的最近选区候选。 */
+export interface SelectionCandidateGetMessage {
+  type: 'selectionCandidateGet';
+  tabId: number;
+}
+
+export type SelectionCandidateResult =
+  | { ok: true; candidate: SelectionCandidate | null }
+  | BgcError;
 
 export interface ChatMaterialInfo {
   type: 'blc-chat-material-info';

@@ -60,6 +60,11 @@ function installStub() {
   window.__listeners = [];
   window.__marking = true;
   window.__items = [];
+  // setContent 的 about:blank 在新版 Chrome 是非安全上下文：randomUUID 缺失会让
+  // 内容脚本启动即崩（真实页面均为 https，不受影响）
+  if (!crypto.randomUUID) {
+    crypto.randomUUID = () => `stub-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+  }
   window.browser = {
     runtime: {
       id: 'render-check',
@@ -140,6 +145,10 @@ try {
 or postponing something despite knowing that there will be negative consequences
 of doing so. In ancient Egypt, procrastination was considered a virtue.</p>
 <p id="para2">The committee decided to abandon the probe. They went home and give up eventually.</p>
+<p>Scholars have studied delay for centuries and the findings remain remarkably consistent across cultures.</p>
+<p>Modern research separates productive delay from avoidance, though the boundary is thinner than it looks.</p>
+<p>Practical strategies include time boxing, implementation intentions, and reducing ambient friction in the workspace.</p>
+<p>Whatever the method, the first step is noticing the moment of postponement as it happens rather than after the fact.</p>
 <input id="editor" value="committee abandon went give up"/>
 <pre id="code">committee abandon went give up</pre>
 <!-- 高 z-index 全屏覆盖层：弹窗必须盖在它上面 -->
@@ -588,10 +597,10 @@ of doing so. In ancient Egypt, procrastination was considered a virtue.</p>
     };
   });
   check(
-    '视频继续问：引用固定当前句（p2 + 时间备注）',
+    '视频继续问：词卡表达为焦点 + 字幕项背景（spec：三入口范围一致）',
     ytAsk.sourceKey === 'yt:testvid1' &&
-      ytAsk.blocks === 3 &&
-      JSON.stringify(ytAsk.quoteBlocks) === '["p2"]' &&
+      ytAsk.blocks === 2 &&
+      JSON.stringify(ytAsk.quoteBlocks) === '["p1"]' &&
       ytAsk.note?.startsWith('0:05'),
     JSON.stringify(ytAsk),
   );
@@ -721,21 +730,12 @@ of doing so. In ancient Egypt, procrastination was considered a virtue.</p>
     trackId: 'https://t/tt-fr',
     cues: [{ start: 0, dur: 2000, text: 'bonjour', lastOff: 1900 }],
   });
+  // M11 起：非英文原文字幕是合法轨道，按实际语言继续（不强切英语、不丢弃）
   await yt.waitForFunction(
-    () => document.getElementById('blc-debug')?.getAttribute('data-blc-count') === '',
+    () => document.getElementById('blc-debug')?.getAttribute('data-blc-track-lang') === 'fr' &&
+      document.getElementById('blc-debug')?.getAttribute('data-blc-count') === '1',
   );
-  const frNotice = await yt.evaluate(() => {
-    const host = document.getElementById('blc-debug');
-    return {
-      notice: host.getAttribute('data-blc-notice'),
-      bar: document.getElementById('blc-subs')?.shadowRoot?.querySelector('.notice')?.textContent ?? null,
-    };
-  });
-  check(
-    '非英文轨道丢弃并提示',
-    !!frNotice.notice && !!frNotice.bar,
-    JSON.stringify(frNotice),
-  );
+  check('非英文轨道合法保留', true);
 
   // 恢复英文轨道 → 字幕回来（旧结果不覆盖）
   await postMsg({
