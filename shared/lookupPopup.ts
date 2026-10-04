@@ -19,7 +19,9 @@ import {
   type LearningResult,
   type ContextExplanation,
   type VocabStatus,
+  VOCAB_STATUS_LABEL,
 } from '@/shared/vocab';
+import { entryKeyOf } from './languages';
 
 export const POPUP_ID = 'blc-lookup-popup';
 
@@ -74,13 +76,9 @@ interface PinnedState {
   lookupError: string | undefined;
   status: VocabStatus | null;
   entryExists: boolean;
+  /** 保存成功后回填的词条键；后续状态查询 / 更新优先用它。 */
+  entryKey?: string;
 }
-
-const STATUS_LABEL: Record<VocabStatus, string> = {
-  saved: '已收藏',
-  learning: '在学',
-  known: '已掌握',
-};
 
 const ERROR_LABEL: Record<string, string> = {
   'invalid-config': 'AI 配置无效，请在设置中检查接口与模型',
@@ -271,7 +269,7 @@ export function createLookupPopup(opts: {
     if (p.status) {
       const chip = document.createElement('span');
       chip.className = `chip ${p.status}`;
-      chip.textContent = STATUS_LABEL[p.status];
+      chip.textContent = VOCAB_STATUS_LABEL[p.status];
       head.appendChild(chip);
     }
     body.appendChild(head);
@@ -334,7 +332,7 @@ export function createLookupPopup(opts: {
       for (const s of ['saved', 'learning', 'known'] as const) {
         const opt = document.createElement('option');
         opt.value = s;
-        opt.textContent = STATUS_LABEL[s];
+        opt.textContent = VOCAB_STATUS_LABEL[s];
         if (p.status === s) opt.selected = true;
         sel.appendChild(opt);
       }
@@ -429,10 +427,19 @@ export function createLookupPopup(opts: {
 
   // ---- 与 background 的交互 ---------------------------------------------------
 
+  // 词卡侧查询键：保存返回的词条键优先；否则按快照语言算作用域键
+  //（M11 词条键为 `${lang}::${表达}`）；无语言快照沿用裸键（迁移前记录）。
+  function entryQueryKey(p: PinnedState): string {
+    return p.entryKey
+      ?? (p.snapshot.lang
+        ? entryKeyOf(p.snapshot.lang, p.snapshot.expression)
+        : normalizeExpression(p.snapshot.expression));
+  }
+
   async function queryStatus(): Promise<void> {
     if (!pinned) return;
     const my = pinned.nonce;
-    const key = normalizeExpression(pinned.snapshot.expression);
+    const key = entryQueryKey(pinned);
     const r = await send<{ ok: boolean; entry?: EntryView | null }>({
       type: 'getEntry',
       key,
@@ -460,7 +467,15 @@ export function createLookupPopup(opts: {
     const requestId = `lookup-${Date.now()}-${++requestCounter}`;
     p.lookupRequest = requestId; p.source = source; p.lookupError = undefined; p.result = undefined; p.definition = null;
     renderPopup();
-    const r = await send<OnlineLookupResult>({ type: 'lookup', snapshot: p.snapshot, source, requestId });
+    // 查询意图：紧凑卡即 hover 路径（永不触发 AI 兜底）；展开后 /
+    // 主动打开的卡片按主动查词处理（background 缺省 active）。
+    const r = await send<OnlineLookupResult>({
+      type: 'lookup',
+      snapshot: p.snapshot,
+      source,
+      intent: p.compact ? 'hover' : 'active',
+      requestId,
+    });
     if (p.lookupRequest !== requestId) return;
     p.lookupRequest = undefined;
     if (r?.ok) {
@@ -498,6 +513,7 @@ export function createLookupPopup(opts: {
     });
     if (r && r.ok) {
       p.savedContextId = r.contextId;
+      p.entryKey = r.key; // 保存返回的词条键（可能是作用域键）
       await backfill(p);
       if (pinned !== p) return;
       p.status = r.status;
@@ -513,7 +529,7 @@ export function createLookupPopup(opts: {
   async function doStatus(status: VocabStatus): Promise<void> {
     if (!pinned) return;
     const p = pinned;
-    const key = normalizeExpression(p.snapshot.expression);
+    const key = entryQueryKey(p);
     const r = await send<{ ok: boolean }>({ type: 'setStatus', key, status });
     if (pinned !== p) return;
     if (r?.ok) {

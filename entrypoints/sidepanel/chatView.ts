@@ -17,10 +17,13 @@ import {
 } from '@/shared/chat';
 import {
   CHAT_PORT_NAME,
+  type ChatActiveResult,
+  type ChatEnsureResult,
   type ChatPortEvent,
   type ChatPortMessage,
   type ChatRecentItem,
   type ChatSourceInfo,
+  type ChatTickResult,
   type SelectionCandidateResult,
   type SubtitleCueView,
   type SubViewState,
@@ -108,6 +111,12 @@ let sending: string | null = null;
 let submittedInput = '';
 let submittedQuoteKey = '';
 let chatTabId: number | null = null;
+// 内容脚本发起 chatEnsure 时由 background 记账的来源标签页（无 tabs 权限，
+// tab.url 读不到，只能拿账面 tabId 回验）
+let chatSourceTabId: number | null = null;
+function noteSourceTab(r: { sourceTabId?: number | null } | null | undefined): void {
+  chatSourceTabId = typeof r?.sourceTabId === 'number' ? r.sourceTabId : null;
+}
 let chatSource: SourceDescriptor | null = null;
 let chatRecord: ChatRecordView | null = null;
 let chatQuote: QuoteRef | null = null;
@@ -125,9 +134,10 @@ export function snapshotChat():ChatViewSnapshot {const list=document.getElementB
 export function setChatActive(active:boolean) {panelActive=active;if(!active)operation++;}
 export async function restoreChat(snapshot?:ChatViewSnapshot) {
   const op = ++operation;
-  const r=await send<{ok:boolean;chat:ChatRecordView}>({type:'chatActive'});
+  const r=await send<ChatActiveResult>({type:'chatActive'});
   if(op !== operation || !panelActive) return;
   if(!r?.ok||!r.chat)return;
+  noteSourceTab(r);
   await acceptRecord(r.chat,false);
   (document.getElementById('chat-input') as HTMLTextAreaElement).value=r.chat.draft??'';
   if(snapshot?.chatId===chatId&&snapshot.materialVersion===(r.chat.activeSnapshotVersion??null)&&snapshot.quoteKey===JSON.stringify(chatQuote)){chatSegmentIndex=snapshot.segmentIndex;historyOpen=snapshot.historyOpen;retainedOnly=snapshot.retainedOnly;autoScroll=snapshot.autoScroll;messageScrollTop=snapshot.top;}
@@ -218,6 +228,11 @@ function onPortEvent(ev: ChatPortEvent): void {
     msg.state = 'error';
     msg.errorKind = ev.errorKind;
   }
+  if (ev.kind === 'delta' && updateStreamingMessage(msg)) {
+    renderInputState();
+    renderGenerationState();
+    return;
+  }
   renderMessages();
   renderInputState();
   renderGenerationState();
@@ -245,8 +260,8 @@ function clearInlineError(): void {
 async function reloadRecord(): Promise<void> {
   if (!chatId) return;
   const id = chatId, op = operation;
-  const r = await send<{ ok: boolean; chat: ChatRecordView | null }>({ type: 'chatActive' });
-  if (r?.ok && r.chat && id === chatId && op === operation) await acceptRecord(r.chat);
+  const r = await send<ChatActiveResult>({ type: 'chatActive' });
+  if (r?.ok && r.chat && id === chatId && op === operation) { noteSourceTab(r); await acceptRecord(r.chat); }
 }
 
 function resetCitePanel(): void {
@@ -254,10 +269,17 @@ function resetCitePanel(): void {
   if (panel) { panel.hidden = true; panel.textContent = ''; }
 }
 
-export async function saveDraft(): Promise<void> {
-  if(!panelActive)return;
+// 草稿写回防抖：键入路径 400ms 尾沿合并；离开页面 / 发送 / 切面板模式显式 flush
+let draftTimer: ReturnType<typeof setTimeout> | null = null;
+export function saveDraft(flush = false): Promise<void> {
+  if (!panelActive || !chatRecord) return Promise.resolve();
+  if (draftTimer) { clearTimeout(draftTimer); draftTimer = null; }
+  if (!flush) {
+    draftTimer = setTimeout(() => { draftTimer = null; void saveDraft(true); }, 400);
+    return Promise.resolve();
+  }
   const input = document.getElementById('chat-input') as HTMLTextAreaElement;
-  if (chatRecord) await send({ type: 'chatSetDraft', chatId, draft: input.value.slice(0, 8000) });
+  return send({ type: 'chatSetDraft', chatId, draft: input.value.slice(0, 8000) }).then(() => {});
 }
 
 async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise<void> {
@@ -270,9 +292,18 @@ async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise
     retainedOnly = false;
     (document.getElementById('chat-input') as HTMLTextAreaElement).value = record.draft ?? '';
   }
+  // 迟到的旧快照不回退终态：同一回答（同 requestId）已完成/停止/出错时，
+  // 生成中每 1.5s 的兜底拉取可能在完成前读取、完成后返回，不能把端口事件
+  // 已落定的终态改回“生成中”；新尝试（requestId 变化）整体采纳
+  for (const m of record.messages) {
+    if (m.role !== 'assistant' || m.state !== 'streaming') continue;
+    const local = chatRecord?.messages.find((x) => x.id === m.id);
+    if (local && local.requestId === m.requestId && local.state && local.state !== 'streaming') m.state = local.state;
+  }
   chatId = record.id;
   chatRecord = record;
   chatSource = record.source;
+  syncTickKey(record);
   if (record.pendingQuote && JSON.stringify(record.pendingQuote)!==JSON.stringify(chatQuote)) {
     chatQuote = record.pendingQuote;
     const snap = latestSnapshot();
@@ -286,15 +317,36 @@ async function acceptRecord(record: ChatRecordView, revealQuote = true): Promise
 }
 
 let polling = false;
+// 轮询瘦身：先比对 chatTick 身份签名，变化才发全量 chatActive（整条会话记录）
+let tickKey = '';
+let tickGenerating = false;
+function syncTickKey(chat: ChatRecordView): void {
+  tickKey = `${chat.id}|${chat.editId ?? ''}|${chat.updatedAt}|${JSON.stringify(chat.pendingQuote ?? null)}|done`;
+}
 async function pollChatSource(): Promise<void> {
   if (polling || !panelActive) return;
   const op = operation;
   polling = true;
   try {
-    const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatActive' });
+    const t = await send<ChatTickResult>({ type: 'chatTick' });
     if (op !== operation) return;
-    if (r?.ok && r.chat && (r.chat.editId !== chatRecord?.editId || r.chat.id !== chatId || JSON.stringify(r.chat.pendingQuote??null)!==JSON.stringify(chatQuote) || r.chat.updatedAt !== chatRecord?.updatedAt)) {
-      await acceptRecord(r.chat);
+    // generating 参与签名：生成中每轮 tick 都全量拉取（端口事件丢失时的
+    // 兜底流式）；true→false 翻转时无论签名是否相同都再拉一次收尾，
+    // 端口事件丢失也能在完成后的第一轮轮询内取回终态
+    const generating = !!t && t.ok && t.generating;
+    const key = t?.ok ? `${t.chatId}|${t.editId ?? ''}|${t.updatedAt}|${t.pendingQuoteKey}|${generating ? 'gen' : 'done'}` : '';
+    const changed = generating !== tickGenerating || key !== tickKey;
+    tickGenerating = generating;
+    if (changed) {
+      const r = await send<ChatActiveResult>({ type: 'chatActive' });
+      if (op !== operation) return;
+      if (r?.ok && r.chat) {
+        noteSourceTab(r);
+        syncTickKey(r.chat);
+        if (r.chat.editId !== chatRecord?.editId || r.chat.id !== chatId || JSON.stringify(r.chat.pendingQuote??null)!==JSON.stringify(chatQuote) || r.chat.updatedAt !== chatRecord?.updatedAt) {
+          await acceptRecord(r.chat);
+        }
+      }
     }
     if (historyOpen) void refreshHistory();
   } finally { polling = false; }
@@ -306,10 +358,11 @@ export async function attachSelectionCandidate(candidate: SelectionCandidate, op
   clearInlineError();
   const built = materialFromCandidate(candidate);
   if (!built) { inlineError('选区内容无法附加，请重新选择'); return false; }
-  const r = await send<{ ok: boolean; chat: ChatRecordView }>({
+  const r = await send<ChatEnsureResult>({
     type: 'chatEnsure', chatId, source: candidate.source, material: built.material, quote: built.quote,
   });
-  if (r?.ok && op === operation) {
+  if (r?.ok && r.chat && op === operation) {
+    noteSourceTab(r);
     if (typeof opts.tabId === 'number') chatTabId = opts.tabId;
     chatSegmentIndex = 0;
     await acceptRecord(r.chat);
@@ -367,8 +420,8 @@ async function attachMaterial(kind: 'page' | 'selection' | 'video'): Promise<voi
     inlineError(info.hint || (kind === 'video' ? '字幕尚未就绪，稍后再试' : '未识别到可附加的正文'));
     return;
   }
-  const r = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatEnsure', chatId, source: info.source, material: material.material });
-  if (r?.ok && op === operation) { chatTabId = tab.id; chatQuote = null; chatSegmentIndex = 0; await acceptRecord(r.chat); }
+  const r = await send<ChatEnsureResult>({ type: 'chatEnsure', chatId, source: info.source, material: material.material });
+  if (r?.ok && r.chat && op === operation) { noteSourceTab(r); chatTabId = tab.id; chatQuote = null; chatSegmentIndex = 0; await acceptRecord(r.chat); }
   else if (op === operation) inlineError('附加失败，材料未改变');
 }
 
@@ -451,7 +504,7 @@ async function doSend(): Promise<void> {
   const editId = chatRecord.editId;
   submittedInput = input.value;
   submittedQuoteKey = JSON.stringify(chatQuote);
-  await saveDraft();
+  await saveDraft(true);
   if (id !== chatId || editId !== chatRecord?.editId) { if (sending === id) sending = null; return; }
   portSend({
     type: 'chat-send',
@@ -527,16 +580,19 @@ async function openCitation(msg: ChatMessageRecord, blockId: string): Promise<vo
     showCitationPanel(blockId, block.text, isVideo, true, snap.source);
     return;
   }
-  // 网页 / X：显示保存原文 + 尝试滚动定位
+  // 网页 / X：无 tabs 权限读不到 Tab.url，只能按账面 tabId 回验当前页面
+  // 地址后再滚动定位；验证不过即显示保存原文
   let located = false;
-  const tabs = await browser.tabs.query({});
-  const sourceTab = tabs.find(t => t.url?.split('#')[0] === snap.source.url.split('#')[0]);
-  if (typeof sourceTab?.id === 'number') {
-    const r = await tabSend<{ found: boolean }>(sourceTab.id, {
-      type: 'blc-chat-locate',
-      text: block.text,
-    });
-    located = !!r?.found;
+  const sourceTabId = chatTabId ?? chatSourceTabId;
+  if (typeof sourceTabId === 'number') {
+    const info = await tabSend<ChatSourceInfo>(sourceTabId, { type: 'blc-chat-source' });
+    if (info && normalizeArticleUrl(info.pageUrl ?? '') === normalizeArticleUrl(snap.source.url)) {
+      const r = await tabSend<{ found: boolean }>(sourceTabId, {
+        type: 'blc-chat-locate',
+        text: block.text,
+      });
+      located = !!r?.found;
+    }
   }
   showCitationPanel(blockId, block.text, isVideo, located, snap.source);
 }
@@ -710,8 +766,8 @@ async function refreshHistory(): Promise<void> {
           historyTotal.textContent = `历史 · ${historyRows.size} 个对话`;
           historyFeedback.textContent = '已删除一个对话';
           if (current && op === operation) {
-            const active = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatActive' });
-            if (active?.ok && op === operation) await acceptRecord(active.chat);
+            const active = await send<ChatActiveResult>({ type: 'chatActive' });
+            if (active?.ok && active.chat && op === operation) { noteSourceTab(active); await acceptRecord(active.chat); }
           }
           if (!historyRows.size) historyList.textContent = '还没有历史对话';
         });
@@ -776,6 +832,23 @@ function renderAnswerText(box: HTMLElement, msg: ChatMessageRecord): void {
   }
 }
 
+/** 流式 delta 快路径：该条消息 DOM 已在列表时只更新状态 chip 与正文。 */
+function updateStreamingMessage(msg: ChatMessageRecord): boolean {
+  if (!deps || deps.getActiveView() !== 'chat' || !msg.requestId) return false;
+  const item = document.querySelector<HTMLElement>(`#chat-list [data-request-id="${CSS.escape(msg.requestId)}"]`);
+  if (!item) return false;
+  item.querySelector('.a-head .state')?.replaceWith(assistantStateChip(msg));
+  const body = el('div', 'a-text');
+  renderAnswerText(body, msg);
+  if (msg.state === 'streaming' && !msg.text) body.appendChild(el('span', 'pending', '……'));
+  item.querySelector('.a-text')?.replaceWith(body);
+  if (autoScroll) {
+    const list = document.getElementById('chat-list');
+    if (list) list.scrollTop = list.scrollHeight;
+  }
+  return true;
+}
+
 function renderMessages(): void {
   if (!deps || deps.getActiveView() !== 'chat') return;
   const list = document.getElementById('chat-list')!;
@@ -823,6 +896,8 @@ function renderMessages(): void {
         item.appendChild(el('div', 'quote-ref', `引用：${m.quote.expression}`));
       }
     } else {
+      // 流式中的消息带请求标记：delta 快路径只更新这一条，不重建列表
+      if (m.state === 'streaming' && m.requestId) item.dataset.requestId = m.requestId;
       const headRow = el('div', 'a-head');
       headRow.appendChild(assistantStateChip(m));
       if (m.state === 'streaming') {
@@ -911,8 +986,8 @@ async function clearConversation(): Promise<void> {
   const r = await send<{ ok: boolean }>({ type: chatId ? 'chatClear' : 'chatNew', chatId });
   if (op !== operation) return;
   if (!r?.ok) { clearButton.setDisabled(false); inlineError('清空失败，请重试'); return; }
-  const active = await send<{ ok: boolean; chat: ChatRecordView }>({ type: 'chatActive' });
-  if (active?.ok && op === operation) await acceptRecord(active.chat);
+  const active = await send<ChatActiveResult>({ type: 'chatActive' });
+  if (active?.ok && active.chat && op === operation) { noteSourceTab(active); await acceptRecord(active.chat); }
 }
 
 // ---- 字幕列表「问 AI」入口 ---------------------------------------------------------
@@ -944,13 +1019,14 @@ export async function subtitleAskAi(subs: SubViewState, cue: SubtitleCueView): P
     blockIds: [`p${cue.id + 1}`],
     note: `${fmtClock(cue.startMs)} · ${cue.text.slice(0, 80)}`,
   };
-  const r = await send<{ ok: boolean; chat: ChatRecordView | null }>({
+  const r = await send<ChatEnsureResult>({
     type: 'chatEnsure',
     source,
     material,
     quote,
   });
   if (!r?.ok) return;
+  noteSourceTab(r);
   // 未发送引用留在会话中，直到提交或明确移除；容器切换不会消费它。
   if (r.chat) await acceptRecord(r.chat);
   deps?.switchView('chat');
@@ -1011,7 +1087,7 @@ export function initChatView(d: ChatViewDeps): void {
     void pollChatSource();
     setInterval(() => void pollChatSource(), 1500);
   });
-  window.addEventListener('pagehide', () => { port?.disconnect(); });
+  window.addEventListener('pagehide', () => { void saveDraft(true); port?.disconnect(); });
   const input = document.getElementById('chat-input') as HTMLTextAreaElement | null;
   input?.addEventListener('input', () => {
     updateCount();
@@ -1055,5 +1131,5 @@ export function chatViewEnter(): void {
 export function chatViewLeave(): void {
   const list=document.getElementById('chat-list');
   if(list?.clientHeight)messageScrollTop=list.scrollTop;
-  void saveDraft();
+  void saveDraft(true);
 }

@@ -147,8 +147,9 @@ export default defineContentScript({
       // 3) main / role=main
       const main = document.querySelector('main, [role="main"]');
       if (main && (main.textContent?.length ?? 0) > 500) return main;
-      // 4) 无语义标签的普通页面：正文块聚集在 body 下也可识别
-      //   （阈值比语义根更严：≥5 段且 >500 字符，避免把菜单当正文）
+      // 4) 无语义标签的普通页面：返回 body 作候选根（此处不设阈值；
+      //   正文块阈值——比语义根更严的 ≥5 段且 >500 字符——在
+      //   extractArticleMaterial 应用，避免把菜单当正文）
       return document.body ?? null;
     }
 
@@ -301,25 +302,38 @@ export default defineContentScript({
       }
     }
 
-    // 网页引用定位：按保存原文前缀找块级元素，滚动 + 短暂高亮
+    // 网页引用定位：找包含保存原文前缀的文本块（通用块检测，覆盖 div 结构
+    // 站点），取文本最短的命中（最内层块），滚动 + 短暂高亮
     function locateSavedText(text: string): boolean {
       const prefix = text.replace(/\s+/g, ' ').trim().slice(0, 48).toLowerCase();
       if (!prefix) return false;
-      const els = Array.from(document.querySelectorAll(BLOCK_SELECTOR)) as Element[];
-      for (const el of els) {
+      let best: Element | null = null;
+      let bestLen = Infinity;
+      const nodes = document.evaluate(
+        '//*[text()[normalize-space(.)]]',
+        document.body,
+        null,
+        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+        null,
+      );
+      for (let i = 0; i < nodes.snapshotLength; i++) {
+        const el = nodes.snapshotItem(i) as Element;
+        if (el.closest('script,style,noscript,template')) continue;
         const t = (el.textContent ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
-        if (t.includes(prefix)) {
-          el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-          const prev = (el as HTMLElement).style.boxShadow;
-          (el as HTMLElement).style.transition = 'box-shadow .3s';
-          (el as HTMLElement).style.boxShadow = '0 0 0 3px rgba(26,115,232,.65)';
-          setTimeout(() => {
-            (el as HTMLElement).style.boxShadow = prev;
-          }, 2400);
-          return true;
+        if (t.includes(prefix) && t.length < bestLen) {
+          best = el;
+          bestLen = t.length;
         }
       }
-      return false;
+      if (!best) return false;
+      best.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      const prev = (best as HTMLElement).style.boxShadow;
+      (best as HTMLElement).style.transition = 'box-shadow .3s';
+      (best as HTMLElement).style.boxShadow = '0 0 0 3px rgba(26,115,232,.65)';
+      setTimeout(() => {
+        (best as HTMLElement).style.boxShadow = prev;
+      }, 2400);
+      return true;
     }
 
     browser.runtime.onMessage.addListener(

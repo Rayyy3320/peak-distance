@@ -252,6 +252,7 @@ export type ChatRequest = (
   | { type: 'chatRemoveMaterial' | 'chatDelete'; chatId: string }
   | { type: 'chatGet'; chatId: string }
   | { type: 'chatRecent' }
+  | { type: 'chatTick' } // 轮询瘦身：只取编辑工作区身份签名，不读 IDB
   | {
       type: 'chatEnsure';
       chatId?: string;
@@ -261,7 +262,6 @@ export type ChatRequest = (
       quote?: QuoteRef | null;
       openPanel?: boolean;
     }
-  | { type: 'chatUpdateMaterial'; chatId: string; material: MaterialPayload }
   | { type: 'chatSetDraft'; chatId: string; draft: string }
   | { type: 'chatTakeQuote'; chatId: string }
   | { type: 'chatRetain'; chatId: string; messageId: string; retained: boolean }
@@ -277,10 +277,18 @@ export interface ChatRecentItem {
   updatedAt: number;
 }
 
+/** chatEnsure 由内容脚本发起时记录、chatActive 随结果带出的来源标签页（manifest 无 tabs 权限，引用定位按此账面对账而非 tab.url 匹配）。 */
 export type ChatEnsureResult =
-  | { ok: true; chat: ChatRecordView | null; panelOpened: boolean }
+  | { ok: true; chat: ChatRecordView | null; panelOpened: boolean; sourceTabId?: number | null }
+  | BgcError;
+export type ChatActiveResult =
+  | { ok: true; chat: ChatRecordView | null; sourceTabId?: number | null }
   | BgcError;
 export type ChatGetResult = { ok: true; chat: ChatRecordView | null } | BgcError;
+/** chatTick 结果：编辑工作区的身份签名（pendingQuoteKey = JSON.stringify(pendingQuote)），任一字段变化才需要全量 chatActive。 */
+export type ChatTickResult =
+  | { ok: true; chatId: string; editId: string | null; updatedAt: number; pendingQuoteKey: string; generating: boolean }
+  | BgcError;
 export type ChatMutationResult = { ok: true } | BgcError;
 
 /** 侧栏 ↔ background 的问答长连接（browser.runtime.connect，name='blc-chat'）。 */

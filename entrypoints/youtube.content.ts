@@ -1,8 +1,8 @@
 import { initFloatingPanel } from '@/shared/floatingPanel';
 import { createTranslationPopup } from '@/shared/translationPopup';
-import { shadowSelection, rangeOffsetsIn, clampRangeToElement } from '@/shared/selection';
+import { shadowSelection, classifyRangeIn, clampRangeToElement } from '@/shared/selection';
 import { brandTokens, brandControls, CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
-import { classifySelection, detectTextLanguage, effectiveLookupExpression } from '@/shared/tokenize';
+import { detectTextLanguage } from '@/shared/tokenize';
 import { createSelectionPill } from '@/shared/selectionPill';
 import { DEFAULT_SETTINGS } from '@/shared/settings';
 import type { Settings } from '@/shared/settings';
@@ -60,6 +60,8 @@ const SUBS_ID = 'blc-subs';
 const SWITCH_ID = 'blc-subs-switch';
 const BADGE_ID = 'blc-debug';
 const NATIVE_CAPTIONS_HIDE_STYLE_ID = 'blc-hide-native-captions';
+// 全屏字幕栏定位（整体赋值，防止随字幕重绘追加增长；--blc-font 单独 setProperty）
+const SUBS_FULLSCREEN_CSS = 'position:absolute;left:4%;right:4%;bottom:76px;z-index:60;';
 
 interface TrackInfo {
   lang: string; // 基础语言码（en / zh …）
@@ -104,6 +106,24 @@ export default defineContentScript({
     let settings: Settings = { ...DEFAULT_SETTINGS };
     let settingsReady = false;
     let settingsFailed = false;
+    // 在途设置写入记账：change → setSetting 消息与 settings-changed 广播之间，
+    // 广播里读到的可能是旧值；本地刚写的状态不回滚（5 秒过期兜底写入失败等）
+    const pendingSettingWrites = new Map<string, { at: number; value: unknown }>();
+
+    function notePendingSettingWrite(name: string, value: unknown): void {
+      pendingSettingWrites.set(name, { at: Date.now(), value });
+    }
+
+    /** 存储值是否应跳过覆盖本地：键在途且 ≠ 本地刚写的值 → true（视为回执则移除标记）。 */
+    function pendingWriteBlocks(name: string, stored: unknown): boolean {
+      const p = pendingSettingWrites.get(name);
+      if (!p) return false;
+      if (Date.now() - p.at > 5000 || stored === p.value) {
+        pendingSettingWrites.delete(name);
+        return false;
+      }
+      return true;
+    }
     let translationMode: 'regular' | 'ai' = 'regular';
     let modeReady = false;
     let modeBusy = false;
@@ -431,8 +451,21 @@ export default defineContentScript({
       return document.getElementById('movie_player') ?? document.documentElement;
     }
 
+    // 双语开关宿主与其菜单关闭函数：ensureSwitchHost 重建/移除时更新。
+    // document 级关闭监听在 main 顶层只注册一次（SPA 导航反复重建宿主时不累积）。
+    let switchHost: HTMLElement | null = null;
+    let closeSwitchMenu: (() => void) | null = null;
+    document.addEventListener('pointerdown', (e) => {
+      if (switchHost?.isConnected && !e.composedPath().includes(switchHost)) closeSwitchMenu?.();
+    }, true);
+
     function ensureSwitchHost(): void {
-      if (!currentVideoId) { document.getElementById(SWITCH_ID)?.remove(); return; }
+      if (!currentVideoId) {
+        document.getElementById(SWITCH_ID)?.remove();
+        switchHost = null;
+        closeSwitchMenu = null;
+        return;
+      }
       const parent = playerRoot().querySelector('.ytp-right-controls') ?? playerRoot();
       let host = document.getElementById(SWITCH_ID);
       if (!host) {
@@ -475,18 +508,21 @@ export default defineContentScript({
         root.querySelector('#chinese')!.addEventListener('change', e => {
           zhVisible = (e.target as HTMLInputElement).checked;
           if (!zhVisible) stopTranslation();
+          notePendingSettingWrite('chineseVisible', zhVisible);
           void send({ type:'setSetting', name:'chineseVisible', value:zhVisible }); renderBar();
         });
         root.querySelector('#translation-mode')!.addEventListener('change', e => void setTranslationMode((e.target as HTMLSelectElement).value as 'regular' | 'ai'));
         root.querySelector('#size')!.addEventListener('change', e => {
           settings.subtitleSize = (e.target as HTMLSelectElement).value as Settings['subtitleSize'];
+          notePendingSettingWrite('subtitleSize', settings.subtitleSize);
           void send({ type:'setSetting', name:'subtitleSize', value:settings.subtitleSize }); renderBar();
         });
         root.querySelector('#ap')!.addEventListener('change', e => void updateVideoSession({ autoPause:(e.target as HTMLInputElement).checked }));
         root.querySelector('#settings')!.addEventListener('click', () => { void send({ type:'openSettings' }); close(); });
         host.addEventListener('click', e => e.stopPropagation());
         host.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close(); root.querySelector<HTMLButtonElement>('#learning')!.focus(); } });
-        document.addEventListener('pointerdown', e => { if (!e.composedPath().includes(host!)) close(); }, true);
+        switchHost = host;
+        closeSwitchMenu = close;
       }
       if (host.parentElement !== parent) parent.append(host);
       host.style.cssText = parent === playerRoot() ? 'position:absolute;right:100px;bottom:10px;z-index:66;height:32px;' : '';
@@ -520,10 +556,9 @@ export default defineContentScript({
       }
       const fs = document.fullscreenElement;
       host.toggleAttribute('data-fullscreen', !!fs);
-      host.style.setProperty('--blc-font', `${subtitleFontSize(settings.subtitleSize)}px`);
       if (fs) {
         if (host.parentElement !== fs) fs.append(host);
-        host.style.cssText += ';position:absolute;left:4%;right:4%;bottom:76px;z-index:60;';
+        host.style.cssText = SUBS_FULLSCREEN_CSS;
       } else {
         host.style.position = 'relative'; host.style.left = ''; host.style.right = ''; host.style.bottom = ''; host.style.zIndex = '';
         const target = document.querySelector<HTMLElement>('ytd-watch-flexy[theater] #full-bleed-container') ?? document.getElementById('player-container-outer') ?? playerRoot();
@@ -531,6 +566,7 @@ export default defineContentScript({
         // 独立字幕行占播放器一列，侧栏跨两行。
         if (target.parentElement?.id === 'blc-learning-layout') { host.style.gridColumn = '1'; host.style.gridRow = '2'; } else { host.style.gridColumn = ''; host.style.gridRow = ''; }
       }
+      host.style.setProperty('--blc-font', `${subtitleFontSize(settings.subtitleSize)}px`);
       return { host, body:host.shadowRoot!.querySelector<HTMLDivElement>('.wrap')! };
     }
 
@@ -596,17 +632,12 @@ export default defineContentScript({
       const cue = cues[cueIndex];
       if (!cue || !currentVideoId || !lastTrackId) return null;
       const lang = baseLang(lastTrackLang) || 'en';
-      const cls = classifySelection(raw, lang);
-      let expression: string | null = null;
-      if (cls.kind !== 'sentence') {
-        const offsets = rangeOffsetsIn(en, clamped);
-        if (offsets && offsets.start <= offsets.end && offsets.end <= offsets.text.length) {
-          expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
-        }
-      }
+      // 分类与有效表达的统一计算（shared/selection.ts 的 classifyRangeIn）
+      const cls = classifyRangeIn(en, clamped, lang);
+      if (!cls) return null;
       let rect: DOMRect | null = null;
       try { rect = selected.range.getBoundingClientRect(); } catch { /* ignore */ }
-      return { raw, kind: cls.kind, hasWord: cls.hasWord, expression, cueIndex, rect };
+      return { raw, kind: cls.kind, hasWord: cls.hasWord, expression: cls.expression, cueIndex, rect };
     }
 
     function subtitleCandidate(info: SubtitleSelectionInfo): SelectionCandidate | null {
@@ -652,7 +683,7 @@ export default defineContentScript({
       root.querySelector<HTMLElement>('#translate')!.hidden = info.kind === 'word';
       const rect = info.rect ?? undefined;
       root.querySelector('#lookup')!.addEventListener('click',()=>{host.remove();openLookup(info.expression ?? info.raw, info.cueIndex);});
-      root.querySelector('#translate')!.addEventListener('click',()=>{host.remove();popup.close();translationPopup.open({text:info.raw,url:videoContextUrl(currentVideoId,cues[info.cueIndex]?.start??0),title:document.title},rect);});
+      root.querySelector('#translate')!.addEventListener('click',()=>{host.remove();popup.close();translationPopup.open({text:info.expression??info.raw,url:videoContextUrl(currentVideoId,cues[info.cueIndex]?.start??0),title:document.title},rect);});
       root.querySelector('#chat')!.addEventListener('click',()=>{host.remove();popup.close();void attachSubtitleSelection(info);});
       host.addEventListener('mousedown',e=>e.preventDefault());
       // 选区形成即固定候选（面板进入/字幕重绘不清空）
@@ -768,6 +799,7 @@ export default defineContentScript({
 
     function setBilingual(on: boolean): void {
       bilingualOn = on;
+      notePendingSettingWrite('bilingualEnabled', on);
       void send({ type: 'setSetting', name: 'bilingualEnabled', value: on });
       if (!on) {
         stopTranslation();
@@ -1111,8 +1143,12 @@ export default defineContentScript({
       const r = await send<{ ok: boolean; settings: Settings }>({ type: 'getSettings' });
       if (!r?.ok) { settingsFailed = true; renderBar(); return; }
       settingsFailed = false;
-      settings = { ...DEFAULT_SETTINGS, ...r.settings }; settingsReady = true;
-      bilingualOn = settings.bilingualEnabled; zhVisible = settings.chineseVisible;
+      const next: Settings = { ...DEFAULT_SETTINGS, ...r.settings };
+      // 在途写入不回滚：广播读到旧值时保留本地刚写的状态
+      if (pendingWriteBlocks('subtitleSize', next.subtitleSize)) next.subtitleSize = settings.subtitleSize;
+      settings = next; settingsReady = true;
+      if (!pendingWriteBlocks('bilingualEnabled', settings.bilingualEnabled)) bilingualOn = settings.bilingualEnabled;
+      if (!pendingWriteBlocks('chineseVisible', settings.chineseVisible)) zhVisible = settings.chineseVisible;
       if (!modeReady) await updateVideoSession();
       if (!bilingualOn || !zhVisible) stopTranslation();
       if (bilingualOn) { hideNativeCaptions(); ensureCaptionsOn(20); } else restoreNativeCaptions();
@@ -1192,7 +1228,17 @@ export default defineContentScript({
       });
     }
 
-    setInterval(tick, 50);
+    // 后台标签页降频轮询：隐藏 500ms / 可见 50ms，恢复可见立即对齐一次
+    let tickTimer: ReturnType<typeof setInterval> | null = null;
+    function restartTickTimer(): void {
+      if (tickTimer !== null) clearInterval(tickTimer);
+      tickTimer = setInterval(tick, document.hidden ? 500 : 50);
+    }
+    document.addEventListener('visibilitychange', () => {
+      restartTickTimer();
+      if (!document.hidden) tick();
+    });
+    restartTickTimer();
 
     // ---- 全屏：把字幕栏与弹窗宿主放进全屏元素（不靠堆 z-index） -------------------
 

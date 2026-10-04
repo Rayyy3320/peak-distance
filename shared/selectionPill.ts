@@ -5,8 +5,8 @@
 // 局部上下文）。来源、轻提示与「继续问」由调用方注入，跳过条件可扩展
 // （YouTube 用它排除字幕栏等自身 UI 内的选区）。
 import { brandTokens, brandControls, CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from './brand';
-import { classifySelection, detectTextLanguage, effectiveLookupExpression, sentenceContaining } from './tokenize';
-import { rangeOffsetsIn } from './selection';
+import { detectTextLanguage } from './tokenize';
+import { classifyRangeIn, inlineRunContainer } from './selection';
 import { materialFromCandidate, type SelectionCandidate, type SourceDescriptor } from './chat';
 import type { LookupPopup } from './lookupPopup';
 import type { SelectionSnapshot } from './panel';
@@ -40,9 +40,6 @@ export interface SelectionPillDeps {
   /** 额外跳过条件：自身其它 UI（如字幕栏、选区操作条、词卡）内的选区不产生入口。 */
   skipSelection?: (sel: Selection) => boolean;
 }
-
-const WORD_BLOCK_SELECTOR =
-  'p, h1, h2, h3, h4, h5, h6, li, blockquote, td, th, dd, dt, figcaption';
 
 function editableTarget(sel: Selection): boolean {
   const node = sel.anchorNode;
@@ -79,8 +76,9 @@ export function createSelectionPill(deps: SelectionPillDeps) {
   };
 
   function blockElementOf(node: Node | null): Element | null {
-    const el = node && (node.nodeType === 1 ? (node as Element) : node.parentElement);
-    return el?.closest(WORD_BLOCK_SELECTOR) ?? null;
+    // 通用文本块检测（见 shared/selection.ts）：不依赖语义标签清单，
+    // X / YouTube 页面正文等 div 结构同样得到正确的块
+    return inlineRunContainer(node);
   }
 
   function evaluate(): PillSelectionInfo | null {
@@ -103,27 +101,16 @@ export function createSelectionPill(deps: SelectionPillDeps) {
     const endBlock = blockElementOf(range.endContainer);
     const blockText = (startBlock?.textContent ?? '').replace(/\s+/g, ' ').trim();
     const lang = detectTextLanguage(raw) ?? detectTextLanguage(blockText) ?? 'en';
-    // 未跨正文块时才有词/短语分类；跨块（或选区落在无块元素文本上）按句段处理
+    // 未跨正文块时才有词/短语分类；跨块（或选区落在无块元素文本上）按句段处理。
+    // 分类与有效表达的计算见 shared/selection.ts 的 classifyRangeIn
     const crossesBlock = !startBlock || startBlock !== endBlock;
-    const cls = classifySelection(raw, lang, { crossesBlock });
-    let expression: string | null = null;
-    let sentence: string | null = null;
-    if (!crossesBlock && startBlock) {
-      const offsets = rangeOffsetsIn(startBlock, range);
-      if (offsets && offsets.start <= offsets.end && offsets.end <= offsets.text.length) {
-        // 偏移基于块内原始文本（未做空白归一），补词与原句都用这份定位
-        if (cls.kind !== 'sentence') {
-          expression = effectiveLookupExpression(offsets.text, offsets.start, offsets.end, lang)?.expression ?? null;
-        }
-        sentence = sentenceContaining(offsets.text, offsets.start, offsets.end);
-      }
-    }
+    const cls = classifyRangeIn(startBlock, range, lang, { crossesBlock });
     return {
       raw,
-      kind: cls.kind,
-      hasWord: cls.hasWord,
-      expression,
-      sentence,
+      kind: cls?.kind ?? 'sentence',
+      hasWord: cls?.hasWord ?? false,
+      expression: cls?.expression ?? null,
+      sentence: cls?.sentence ?? null,
       blockText: blockText.slice(0, 600),
       source: deps.buildSource(),
       rect,
@@ -158,7 +145,9 @@ export function createSelectionPill(deps: SelectionPillDeps) {
         if (!info) return;
         dismissSelection();
         lookup.close();
-        translation.open({ text: info.raw, url: location.href, title: document.title }, info.rect);
+        // 卡片展示与翻译请求同一文本：词/短语/句段首尾均用补全/清洗后的
+        // 有效表达（残缺词补齐、去词外标点；句段内部保持原文）
+        translation.open({ text: info.expression ?? info.raw, url: location.href, title: document.title }, info.rect);
         remove();
       });
       const chat = document.createElement('button');
@@ -289,11 +278,13 @@ export function createSelectionPill(deps: SelectionPillDeps) {
     selectionTimer = setTimeout(refresh, 250);
   }
 
+  const onKeyUp = (e: KeyboardEvent): void => {
+    if (e.shiftKey) onMaybeSelection();
+  };
+
   document.addEventListener('selectionchange', onMaybeSelection, true);
   document.addEventListener('mouseup', onMaybeSelection, true);
-  document.addEventListener('keyup', (e) => {
-    if (e.shiftKey) onMaybeSelection();
-  }, true);
+  document.addEventListener('keyup', onKeyUp, true);
 
   return {
     /** 当前选区信息（供外部即时读取）。 */
@@ -309,6 +300,7 @@ export function createSelectionPill(deps: SelectionPillDeps) {
       remove();
       document.removeEventListener('selectionchange', onMaybeSelection, true);
       document.removeEventListener('mouseup', onMaybeSelection, true);
+      document.removeEventListener('keyup', onKeyUp, true);
     },
   };
 }

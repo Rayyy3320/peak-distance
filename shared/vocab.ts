@@ -32,6 +32,13 @@ export type VocabStatus = 'saved' | 'learning' | 'known';
 
 export const VOCAB_STATUSES: readonly VocabStatus[] = ['saved', 'learning', 'known'];
 
+/** 状态的界面显示名（词卡与侧栏共用）。 */
+export const VOCAB_STATUS_LABEL: Record<VocabStatus, string> = {
+  saved: '已收藏',
+  learning: '在学',
+  known: '已掌握',
+};
+
 export function isVocabStatus(v: unknown): v is VocabStatus {
   return v === 'saved' || v === 'learning' || v === 'known';
 }
@@ -384,21 +391,14 @@ export function buildFormIndex(items: FormIndexInput[]): Map<string, string> {
 }
 
 /**
- * 表面词形 → 词条键：精确词条优先；否则查唯一的词形关联；
- * 冲突或无关联返回 null（保留独立表达）。
- * lang 提供时按该语言规范化（如土耳其语大小写）；缺省沿用旧规范化
- *（迁移前调用方兼容）。跨语言的同形词靠语言作用域键天然分离。
+ * 查询候选键（顺序即优先级）：裸键在前（迁移前记录直连）；带语言时
+ * 再加语言作用域键。db 的保存 / 查询解析与词卡查询共用，保证同一
+ * 表达在两侧落到同一条目（entryKeyOf 内部做语言感知规范化）。
  */
-export function resolveEntryKey(
-  items: FormIndexInput[],
-  surface: string,
-  lang?: LanguageTag,
-): string | null {
-  const key = lang ? normalizeExpressionInLanguage(surface, lang) : normalizeExpression(surface);
-  if (!key) return null;
-  if (items.some((it) => it.key === key)) return key;
-  const formIndex = buildFormIndex(items);
-  return formIndex.get(key) ?? null;
+export function lookupKeyCandidates(expression: string, lang?: LanguageTag): string[] {
+  const bare = normalizeExpression(expression);
+  const scoped = lang ? entryKeyOf(lang, expression) : '';
+  return [...new Set([bare, scoped].filter(Boolean))];
 }
 
 /**
@@ -433,23 +433,6 @@ export function parseFormsLine(line: string): string[] {
     .split(/[,，、;；/|\s]+/)
     .map((w) => normalizeExpression(w))
     .filter(Boolean);
-}
-
-/**
- * 表面词形 → 状态：含词形关联；冲突词形不出现（保留独立表达）。
- * 页面标记与字幕词标记共用同一判定。
- */
-export function buildSurfaceStatusMap(
-  items: (FormIndexInput & { status: VocabStatus })[],
-): Map<string, VocabStatus> {
-  const map = new Map<string, VocabStatus>();
-  for (const it of items) map.set(it.key, it.status);
-  const formIndex = buildFormIndex(items);
-  for (const [form, owner] of formIndex) {
-    const ownerItem = items.find((it) => it.key === owner);
-    if (ownerItem) map.set(form, ownerItem.status);
-  }
-  return map;
 }
 
 /**

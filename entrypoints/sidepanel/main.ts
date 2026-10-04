@@ -4,10 +4,10 @@ import { createYoutubeWorkspace, type WorkspaceState } from '@/shared/youtubeWor
 import { isPanelView, panelStateKey, panelTransportFailure, type SelectionSnapshot, type PanelFrameState } from '@/shared/panel';
 import { createTranslationPopup } from '@/shared/translationPopup';
 import { createLookupPopup } from '@/shared/lookupPopup';
-import { shadowSelection, rangeOffsetsIn, clampRangeToElement } from '@/shared/selection';
+import { shadowSelection, classifyRangeIn, clampRangeToElement } from '@/shared/selection';
 import { buildMarkBuckets } from '@/shared/marker';
 import { effectiveEntryLanguage, isRtlLanguage, langDisplayName } from '@/shared/languages';
-import { classifySelection, effectiveLookupExpression, segmentWords } from '@/shared/tokenize';
+import { segmentWords } from '@/shared/tokenize';
 import { materialFromCandidate, type SelectionCandidate } from '@/shared/chat';
 import { CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
 // 侧栏三个视图：生词本（词条 / 上下文 / 词形关联管理）、字幕（当前标签页
@@ -16,7 +16,7 @@ import { CHAT_ADD_ICON, CHAT_ADD_BUTTON_STYLE } from '@/shared/brand';
 // 字幕控制消息经 tabs.sendMessage 直达当前标签页，携带 videoId 防串页。
 
 import type { EntryView, SubViewState } from '@/shared/messages';
-import { videoContextUrl, blankExpression, type SavedSentence, type VocabStatus } from '@/shared/vocab';
+import { videoContextUrl, blankExpression, VOCAB_STATUS_LABEL, type SavedSentence, type VocabStatus } from '@/shared/vocab';
 import { buildReviewQueue, refreshQueue, type ReviewItem } from '@/shared/review';
 import { fmtClock } from '@/shared/cues';
 import {
@@ -28,12 +28,6 @@ import {
   saveDraft,
   snapshotChat,restoreChat,setChatActive,type ChatViewSnapshot,
 } from './chatView';
-
-const STATUS_LABEL: Record<VocabStatus, string> = {
-  saved: '已收藏',
-  learning: '在学',
-  known: '已掌握',
-};
 
 function send<T>(msg: unknown): Promise<T> {
   return new Promise((resolve) => {
@@ -171,14 +165,20 @@ document.getElementById('panel-mode')!.addEventListener('click',async()=>{
   // Native sidePanel.open must run before the first await in the click handler.
   const nativeOpen=floating?browser.sidePanel.open({windowId:panelWindow}).then(()=>true,()=>false):Promise.resolve(false);
   lookupPopup.close();
-  await saveDraft();await persistPanel();
+  await saveDraft(true);await persistPanel();
   const r=await send<{ok:boolean;error?:string}>({type:'panelSwitch',mode:floating?'fixed':'floating',nativeOpened:await nativeOpen});
   if(!r?.ok)feedback(r?.error??'切换失败，请重试');
 });
 document.getElementById('panel-close')!.addEventListener('click',async()=>{lookupPopup.close();await persistPanel();setChatActive(false);activePanel=false;ready=false;const r=await send<{ok:boolean}>({type:'panelClose'});if(!r?.ok){activePanel=true;ready=true;setChatActive(true);feedback('关闭失败，请重试');}});
 document.addEventListener('pointerdown',()=>void send({type:'panelOutsideClick',at:performance.timeOrigin+performance.now()}),true);
 document.addEventListener('click',()=>setTimeout(()=>void persistPanel(),0));
-document.addEventListener('scroll',()=>void persistPanel(),true);
+// 滚动以帧率触发，尾沿节流到 ≥400ms 一次持久化；点击路径保持立即
+let scrollPersistQueued=false,scrollPersistAt=0;
+document.addEventListener('scroll',()=>{
+  if(scrollPersistQueued)return;
+  scrollPersistQueued=true;
+  setTimeout(()=>{scrollPersistQueued=false;scrollPersistAt=Date.now();void persistPanel();},Math.max(0,scrollPersistAt+400-Date.now()));
+},true);
 
 
 async function refreshSentences(): Promise<void> {
@@ -248,7 +248,7 @@ function renderEntry(entry: EntryView): HTMLElement {
 
   const sel = el('select', 'status') as HTMLSelectElement;
   for (const s of ['saved', 'learning', 'known'] as const) {
-    const opt = el('option', undefined, STATUS_LABEL[s]);
+    const opt = el('option', undefined, VOCAB_STATUS_LABEL[s]);
     opt.value = s;
     if (entry.status === s) opt.selected = true;
     sel.appendChild(opt);
@@ -387,6 +387,26 @@ document.getElementById('lang-filter')!.addEventListener('change', () => {
 let subsState: SubViewState | null = null;
 let subsTabId: number | null = null;
 let cachedVideo: WorkspaceState | null=null;
+// 字幕视图轮询分快慢路径：快路径（1s）只做 blc-sub-get 与译文/当前句/提示的
+// 轻量更新，签名不变直接跳过；慢路径（视频身份变化立即，平时 ≥5s 一次，或
+// vocab/sentences 广播置脏）才做三连 IDB 拉取与 statuses/sentences/entries 重建。
+let subsLibraryDirty=true;
+let subsLibraryAt=0;
+const SUBS_LIBRARY_INTERVAL_MS=5000;
+let subsSignatureCached='';
+const subsSignature=(s:SubViewState)=>`${s.videoId}:${s.trackId}:${s.cues.length}:${s.currentIndex}:${s.cues.reduce((n,c)=>n+(c.zh?1:0),0)}:${s.notice}:${s.chineseVisible!==false}`;
+function rebuildCachedVideo(state:SubViewState,library?:{cues?:WorkspaceState['cues'];statuses:WorkspaceState['statuses'];sentences:WorkspaceState['sentences'];entries:WorkspaceState['entries']}):WorkspaceState{
+  const cues=library?.cues??(cachedVideo&&cachedVideo.videoId===state.videoId&&cachedVideo.videoRef.trackId===state.trackId&&cachedVideo.cues.length===state.cues.length
+    ?cachedVideo.cues
+    :state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0})));
+  return {videoId:state.videoId,videoRef:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:0},
+    trackLang:state.trackLang||undefined,
+    cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),
+    statuses:library?.statuses??cachedVideo?.statuses??new Map<string,string>(),
+    sentences:library?.sentences??cachedVideo?.sentences??[],
+    entries:library?.entries??cachedVideo?.entries??[],
+    notice:state.notice,chinese:state.chineseVisible!==false};
+}
 const videoWorkspace=createYoutubeWorkspace({
   bindWords:host=>{
     const events=host.shadowRoot!;
@@ -414,14 +434,10 @@ const videoWorkspace=createYoutubeWorkspace({
         const raw=clamped.toString().replace(/\s+/g,' ').trim();
         if(!raw)return null;
         const lang=((cachedVideo?.trackLang||subsState?.trackLang)||'en').split('-')[0]!;
-        const cls=classifySelection(raw,lang);
-        let expression:string|null=null;
-        if(cls.kind!=='sentence'){
-          const offsets=rangeOffsetsIn(en,clamped);
-          if(offsets&&offsets.start<=offsets.end&&offsets.end<=offsets.text.length)
-            expression=effectiveLookupExpression(offsets.text,offsets.start,offsets.end,lang)?.expression??null;
-        }
-        return {kind:cls.kind,raw,expression,firstIndex:first,count:1,hasWord:cls.hasWord,rect:selection.range.getBoundingClientRect()};
+        // 分类与有效表达的统一计算（shared/selection.ts 的 classifyRangeIn）
+        const cls=classifyRangeIn(en,clamped,lang);
+        if(!cls)return null;
+        return {kind:cls.kind,raw,expression:cls.expression,firstIndex:first,count:1,hasWord:cls.hasWord,rect:selection.range.getBoundingClientRect()};
       }
       // 跨字幕项：实际选择的原文（按行收窄到 .en，不含译文/控件文字）
       const parts:string[]=[];
@@ -470,7 +486,8 @@ const videoWorkspace=createYoutubeWorkspace({
       const selectedVideo=subsState.videoId,selectedCue=subsState.cues[info.firstIndex];
       const candidate=listSelectionCandidate(info);
       if(candidate)void send({type:'selectionCandidateSet',tabId:subsTabId??undefined,candidate});
-      const snapshot={text:info.raw,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue?.startMs??0)};
+      // 词/短语翻译用补全/清洗后的有效表达；句段/跨行保持实际选文
+      const snapshot={text:info.expression??info.raw,title:subsState.title,url:videoContextUrl(selectedVideo,selectedCue?.startMs??0)};
       // 分类表：word=查词+对话；phrase=查词+翻译+对话；sentence/cross-cue=翻译+对话
       if(info.kind!=='word'){
         const translate=el('button',undefined,'翻译');translate.onmousedown=e=>e.preventDefault();translate.onclick=()=>{buttons.remove();selectionPopup.open(snapshot,rect);};buttons.append(translate);
@@ -517,6 +534,18 @@ async function videoAction(action:string,index:number,word?:string,play?:boolean
   if(!r?.ok)feedback('视频操作失败，请回到原视频重试');
   else await pollSubs();
 }
+async function refreshSubsLibrary(state:SubViewState):Promise<void> {
+  subsLibraryAt=Date.now();subsLibraryDirty=false;
+  const [vocab,saved,index]=await Promise.all([send<{ok:boolean;entries:EntryView[]}>({type:'listEntries'}),send<{ok:boolean;sentences:SavedSentence[]}>({type:'listSentences'}),send<{ok:boolean;items:import('@/shared/vocab').VocabIndexItem[]}>({type:'vocabIndex'})]);
+  if(currentView!=='subs'||subsState!==state)return;
+  const stable=<T>(old:T,next:T):T=>JSON.stringify(old)===JSON.stringify(next)?old:next;
+  const cues=state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0}));
+  cachedVideo=rebuildCachedVideo(state,{
+    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,
+    statuses:buildMarkBuckets(index?.items??[]).get((state.trackLang||'en').split('-')[0]!)?.statusByKey??new Map<string,string>(),
+    sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[])});
+  videoWorkspace.update(cachedVideo);
+}
 async function pollSubs():Promise<void> {
   if(currentView!=='subs'||!activePanel)return;
   const tab=(await browser.tabs.query({active:true,currentWindow:true}))[0];
@@ -524,7 +553,10 @@ async function pollSubs():Promise<void> {
   const id=tab.id;
   const st=await tabSend<SubViewState>(id,{type:'blc-sub-get'});
   if(currentView!=='subs')return;
-  if(subsTabId!==id||subsState?.videoId!==st?.videoId){lookupPopup.close();selectionPopup.close();document.getElementById('panel-selection-actions')?.remove();}
+  const switched=subsTabId!==id||subsState?.videoId!==st?.videoId;
+  if(switched){lookupPopup.close();selectionPopup.close();document.getElementById('panel-selection-actions')?.remove();}
+  // 换轨道不清浮层，但词表按轨道语言分桶，也算身份变化要重建
+  if(switched||(subsState?.trackId??'')!==(st?.trackId??''))subsLibraryDirty=true;
   subsTabId=id;subsState=st?.type==='blc-sub-state'?st:null;
   document.getElementById('video-workspace')!.hidden=!subsState?.videoId;
   const web=document.getElementById('web-selection')!;web.hidden=!!subsState?.videoId;
@@ -538,15 +570,16 @@ async function pollSubs():Promise<void> {
     return;
   }
   const state=subsState;
-  const [vocab,saved,index]=await Promise.all([send<{ok:boolean;entries:EntryView[]}>({type:'listEntries'}),send<{ok:boolean;sentences:SavedSentence[]}>({type:'listSentences'}),send<{ok:boolean;items:import('@/shared/vocab').VocabIndexItem[]}>({type:'vocabIndex'})]);
-  if(currentView!=='subs'||subsState!==state)return;
-  const cues=state.cues.map(c=>({start:c.startMs,dur:c.endMs-c.startMs,text:c.text,lastOff:0}));
-  const stable=<T>(old:T,next:T):T=>JSON.stringify(old)===JSON.stringify(next)?old:next;
-  cachedVideo={videoId:state.videoId,videoRef:{videoId:state.videoId,trackId:state.trackId,trackKind:state.trackKind==='asr'?'asr':'manual',trackLang:state.trackLang,startMs:0},
-    trackLang:state.trackLang||undefined,
-    cues:cachedVideo?.videoId===state.videoId?stable(cachedVideo.cues,cues):cues,current:state.currentIndex,translations:new Map(state.cues.filter(c=>c.zh).map(c=>[c.id,c.zh!])),
-    statuses:buildMarkBuckets(index?.items??[]).get((state.trackLang||'en').split('-')[0]!)?.statusByKey??new Map<string,string>(),
-    sentences:stable(cachedVideo?.sentences??[],saved?.sentences??[]),entries:stable(cachedVideo?.entries??[],vocab?.entries??[]),notice:state.notice,chinese:state.chineseVisible!==false};
+  const signature=subsSignature(state);
+  if(subsLibraryDirty||Date.now()-subsLibraryAt>=SUBS_LIBRARY_INTERVAL_MS){
+    await refreshSubsLibrary(state);
+    if(currentView!=='subs'||subsState!==state)return;
+    subsSignatureCached=signature;
+    return;
+  }
+  if(cachedVideo&&subsSignatureCached===signature)return;
+  subsSignatureCached=signature;
+  cachedVideo=rebuildCachedVideo(state);
   videoWorkspace.update(cachedVideo);
 }
 setInterval(()=>void pollSubs(),1000);
@@ -621,7 +654,7 @@ function renderReview(): void {
 
   const it = reviewQueue[reviewIdx]!;
   const prog = el('div', 'review-progress');
-  prog.textContent = `${reviewIdx + 1} / ${reviewQueue.length} · ${STATUS_LABEL[it.status]}`;
+  prog.textContent = `${reviewIdx + 1} / ${reviewQueue.length} · ${VOCAB_STATUS_LABEL[it.status]}`;
   body.appendChild(prog);
 
   const card = el('div', 'review-card');
@@ -719,10 +752,16 @@ async function refreshReviewQueue(): Promise<void> {
 browser.runtime.onMessage.addListener((msg: unknown) => {
   const t = (msg as { type?: string })?.type;
   if (t === 'vocab-changed') {
+    subsLibraryDirty=true;
     if (currentView === 'list') void refresh();
     if (currentView === 'review') void refreshReviewQueue();
+    if (currentView === 'subs') void pollSubs();
   }
-  if (t === 'sentences-changed' && currentView === 'sentences') void refreshSentences();
+  if (t === 'sentences-changed') {
+    subsLibraryDirty=true;
+    if (currentView === 'sentences') void refreshSentences();
+    if (currentView === 'subs') void pollSubs();
+  }
   if (t === 'settings-changed') {
     /* 内容标记开关变化不影响侧栏自身展示 */
   }
@@ -768,5 +807,5 @@ async function restorePanel(view?:unknown) {
   if(version!==restoreVersion)return;
   workspaceFailureStage='';setChatActive(activePanel);ready=true;document.body.inert=false;
 }
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){void persistPanel();setChatActive(false);}else setChatActive(activePanel&&ready);});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'){void saveDraft(true);void persistPanel();setChatActive(false);}else setChatActive(activePanel&&ready);});
 void boot().catch(error=>workspaceFailed('boot',error));

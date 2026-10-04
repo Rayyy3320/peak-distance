@@ -210,6 +210,14 @@ export function createMarker(opts: {
   }
 
   function markTextNode(node: Text): void {
+    // 进行中的选区与该节点相交时跳过本次包装（replaceChild 会破坏选区），
+    // 该节点留待下次 mutation / 重刷
+    const sel = document.getSelection();
+    if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+      for (let i = 0; i < sel.rangeCount; i++) {
+        if (sel.getRangeAt(i).intersectsNode(node)) return;
+      }
+    }
     if (!buckets.size) return;
     const raw = node.nodeValue ?? '';
     if (!raw || raw.length > MAX_NODE_TEXT) return;

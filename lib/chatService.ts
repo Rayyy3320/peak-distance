@@ -554,6 +554,10 @@ export async function handleChatRequest(
   const windowId = sender.tab?.windowId ?? (typeof m.windowId === 'number' ? m.windowId : -1);
   const activeKey = `chat-active:${windowId}`;
   const currentId = async () => (await browser.storage.session.get(activeKey))[activeKey] as string | undefined;
+  // manifest 无 tabs 权限，Tab.url 恒为 undefined：来源标签页只能在 chatEnsure
+  //（内容脚本发起）时按 windowId 记账，侧栏引用定位用它找回原页。
+  const tabKey = `chat-tab:${windowId}`;
+  const sourceTabId = async () => ((await browser.storage.session.get(tabKey))[tabKey] as number | undefined) ?? null;
   const operation = ['chatNew', 'chatSelect', 'chatClear'].includes(String(m.type)) ? beginChatOperation(windowId) : chatOperation(windowId);
   const currentOperation = () => chatOperation(windowId) === operation;
   switch (m.type) {
@@ -566,7 +570,7 @@ export async function handleChatRequest(
       const id = await currentId();
       if (edit.id && edit.id === id) {
         const record = await getChat(edit.id, isLiveRequest(edit.id));
-        if (!currentOperation()) return { ok: true, chat: await readChatEdit(windowId) };
+        if (!currentOperation()) return { ok: true, chat: await readChatEdit(windowId), sourceTabId: await sourceTabId() };
         if (!record) {
           if (ownsChatEdit(windowId, edit)) await activateChatEdit(windowId, null);
         } else if (ownsChatEdit(windowId, edit)) {
@@ -577,7 +581,7 @@ export async function handleChatRequest(
         const record = await getChat(id, isLiveRequest(id));
         if (record && currentOperation() && ownsChatEdit(windowId, edit)) await replaceChatEdit(windowId, record);
       }
-      return { ok: true, chat: await readChatEdit(windowId) };
+      return { ok: true, chat: await readChatEdit(windowId), sourceTabId: await sourceTabId() };
     }
     case 'chatSelect': {
       if (typeof m.chatId !== 'string') return bad('bad-payload');
@@ -605,6 +609,13 @@ export async function handleChatRequest(
     case 'chatRecent': {
       return { ok: true, chats: await listChats() };
     }
+    case 'chatTick': {
+      // 轮询瘦身：只回编辑工作区身份签名（readChatEdit 内存缓存，不读 IDB）。
+      // generating 附带该会话是否正在生成：端口事件丢失（SW 重启等）时，
+      // 生成中的每次 tick 与完成翻转都会触发调用方全量拉取，兜底流式与收尾。
+      const edit = await readChatEdit(windowId);
+      return { ok: true, chatId: edit.id, editId: edit.editId ?? null, updatedAt: edit.updatedAt, pendingQuoteKey: JSON.stringify(edit.pendingQuote ?? null), generating: activeChats.has(edit.id) };
+    }
     case 'chatEnsure': {
       const source = parseSource(m.source);
       if (!source) return bad('bad-payload', 'source');
@@ -624,17 +635,11 @@ export async function handleChatRequest(
       if (typeof m.chatId === 'string' && m.chatId !== edit.id || m.editId && m.editId !== edit.editId) return bad('stale-edit');
       editChatMaterial(edit, { source, material, quote });
       await writeChatEdit(windowId, edit);
-      const r: ChatEnsureResult = { ok: true, chat: edit, panelOpened };
+      if (typeof sender.tab?.id === 'number') {
+        await browser.storage.session.set({ [tabKey]: sender.tab.id });
+      }
+      const r: ChatEnsureResult = { ok: true, chat: edit, panelOpened, sourceTabId: await sourceTabId() };
       return r;
-    }
-    case 'chatUpdateMaterial': {
-      const material = parseMaterial(m.material);
-      if (!material) return bad('bad-payload', 'material');
-      const edit = await readChatEdit(windowId);
-      if (edit.id !== m.chatId || m.editId && m.editId !== edit.editId) return bad('stale-edit');
-      editChatMaterial(edit, { source: edit.source, material });
-      await writeChatEdit(windowId, edit);
-      return { ok: true, chat: edit };
     }
     case 'chatSetDraft': {
       if (typeof m.chatId !== 'string' || typeof m.draft !== 'string') return bad('bad-payload');

@@ -314,14 +314,18 @@ export async function syncFromVault(): Promise<SyncResult & { error?: 'not-conne
     updated++;
   }
 
-  // 删除检测：有同步快照但库中不再存在该 ID（移动保留同 ID，不会误判）
+  // 删除检测：有同步快照但库中不再存在该 ID（移动保留同 ID，不会误判）。
+  // 本轮有文件读取失败（权限瞬断 / IO）时扫描不完整，跳过删除检测（下次 vaultSync 重试），
+  // 避免读取失败的词条被当成“文件已删”而误删本地词条与全部上下文。
   let deleted = 0;
-  for (const id of await listSyncSnapshotIds()) {
-    if (!seen.has(id)) {
-      await deleteEntry(id).catch(() => {});
-      await deleteSyncSnapshot(id);
-      await putVaultRaw(`conflict:${id}`, null).catch(() => {});
-      deleted++;
+  if (scan.readFailures === 0) {
+    for (const id of await listSyncSnapshotIds()) {
+      if (!seen.has(id)) {
+        await deleteEntry(id).catch(() => {});
+        await deleteSyncSnapshot(id);
+        await putVaultRaw(`conflict:${id}`, null).catch(() => {});
+        deleted++;
+      }
     }
   }
 
