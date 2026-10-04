@@ -106,6 +106,24 @@ export default defineContentScript({
     let settings: Settings = { ...DEFAULT_SETTINGS };
     let settingsReady = false;
     let settingsFailed = false;
+    // 在途设置写入记账：change → setSetting 消息与 settings-changed 广播之间，
+    // 广播里读到的可能是旧值；本地刚写的状态不回滚（5 秒过期兜底写入失败等）
+    const pendingSettingWrites = new Map<string, { at: number; value: unknown }>();
+
+    function notePendingSettingWrite(name: string, value: unknown): void {
+      pendingSettingWrites.set(name, { at: Date.now(), value });
+    }
+
+    /** 存储值是否应跳过覆盖本地：键在途且 ≠ 本地刚写的值 → true（视为回执则移除标记）。 */
+    function pendingWriteBlocks(name: string, stored: unknown): boolean {
+      const p = pendingSettingWrites.get(name);
+      if (!p) return false;
+      if (Date.now() - p.at > 5000 || stored === p.value) {
+        pendingSettingWrites.delete(name);
+        return false;
+      }
+      return true;
+    }
     let translationMode: 'regular' | 'ai' = 'regular';
     let modeReady = false;
     let modeBusy = false;
@@ -490,11 +508,13 @@ export default defineContentScript({
         root.querySelector('#chinese')!.addEventListener('change', e => {
           zhVisible = (e.target as HTMLInputElement).checked;
           if (!zhVisible) stopTranslation();
+          notePendingSettingWrite('chineseVisible', zhVisible);
           void send({ type:'setSetting', name:'chineseVisible', value:zhVisible }); renderBar();
         });
         root.querySelector('#translation-mode')!.addEventListener('change', e => void setTranslationMode((e.target as HTMLSelectElement).value as 'regular' | 'ai'));
         root.querySelector('#size')!.addEventListener('change', e => {
           settings.subtitleSize = (e.target as HTMLSelectElement).value as Settings['subtitleSize'];
+          notePendingSettingWrite('subtitleSize', settings.subtitleSize);
           void send({ type:'setSetting', name:'subtitleSize', value:settings.subtitleSize }); renderBar();
         });
         root.querySelector('#ap')!.addEventListener('change', e => void updateVideoSession({ autoPause:(e.target as HTMLInputElement).checked }));
@@ -785,6 +805,7 @@ export default defineContentScript({
 
     function setBilingual(on: boolean): void {
       bilingualOn = on;
+      notePendingSettingWrite('bilingualEnabled', on);
       void send({ type: 'setSetting', name: 'bilingualEnabled', value: on });
       if (!on) {
         stopTranslation();
@@ -1128,8 +1149,12 @@ export default defineContentScript({
       const r = await send<{ ok: boolean; settings: Settings }>({ type: 'getSettings' });
       if (!r?.ok) { settingsFailed = true; renderBar(); return; }
       settingsFailed = false;
-      settings = { ...DEFAULT_SETTINGS, ...r.settings }; settingsReady = true;
-      bilingualOn = settings.bilingualEnabled; zhVisible = settings.chineseVisible;
+      const next: Settings = { ...DEFAULT_SETTINGS, ...r.settings };
+      // 在途写入不回滚：广播读到旧值时保留本地刚写的状态
+      if (pendingWriteBlocks('subtitleSize', next.subtitleSize)) next.subtitleSize = settings.subtitleSize;
+      settings = next; settingsReady = true;
+      if (!pendingWriteBlocks('bilingualEnabled', settings.bilingualEnabled)) bilingualOn = settings.bilingualEnabled;
+      if (!pendingWriteBlocks('chineseVisible', settings.chineseVisible)) zhVisible = settings.chineseVisible;
       if (!modeReady) await updateVideoSession();
       if (!bilingualOn || !zhVisible) stopTranslation();
       if (bilingualOn) { hideNativeCaptions(); ensureCaptionsOn(20); } else restoreNativeCaptions();
