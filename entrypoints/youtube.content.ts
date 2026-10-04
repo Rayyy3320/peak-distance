@@ -431,8 +431,21 @@ export default defineContentScript({
       return document.getElementById('movie_player') ?? document.documentElement;
     }
 
+    // 双语开关宿主与其菜单关闭函数：ensureSwitchHost 重建/移除时更新。
+    // document 级关闭监听在 main 顶层只注册一次（SPA 导航反复重建宿主时不累积）。
+    let switchHost: HTMLElement | null = null;
+    let closeSwitchMenu: (() => void) | null = null;
+    document.addEventListener('pointerdown', (e) => {
+      if (switchHost?.isConnected && !e.composedPath().includes(switchHost)) closeSwitchMenu?.();
+    }, true);
+
     function ensureSwitchHost(): void {
-      if (!currentVideoId) { document.getElementById(SWITCH_ID)?.remove(); return; }
+      if (!currentVideoId) {
+        document.getElementById(SWITCH_ID)?.remove();
+        switchHost = null;
+        closeSwitchMenu = null;
+        return;
+      }
       const parent = playerRoot().querySelector('.ytp-right-controls') ?? playerRoot();
       let host = document.getElementById(SWITCH_ID);
       if (!host) {
@@ -486,7 +499,8 @@ export default defineContentScript({
         root.querySelector('#settings')!.addEventListener('click', () => { void send({ type:'openSettings' }); close(); });
         host.addEventListener('click', e => e.stopPropagation());
         host.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') { e.preventDefault(); close(); root.querySelector<HTMLButtonElement>('#learning')!.focus(); } });
-        document.addEventListener('pointerdown', e => { if (!e.composedPath().includes(host!)) close(); }, true);
+        switchHost = host;
+        closeSwitchMenu = close;
       }
       if (host.parentElement !== parent) parent.append(host);
       host.style.cssText = parent === playerRoot() ? 'position:absolute;right:100px;bottom:10px;z-index:66;height:32px;' : '';
