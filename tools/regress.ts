@@ -50,7 +50,6 @@ import {
 import {
   blankExpression,
   buildFormIndex,
-  buildSurfaceStatusMap,
   isDuplicateContext,
   isDuplicateVideoContext,
   lookupKeyCandidates,
@@ -58,7 +57,6 @@ import {
   parseFormsLine,
   planForms,
   planSave,
-  resolveEntryKey,
   shouldBackfill,
   videoContextUrl,
   type VocabEntryRecord,
@@ -311,9 +309,6 @@ console.log('M3 词形：关联、独立与冲突');
   check('constraining 关联 constrain', fi.get('constraining') === 'constrain');
   check('went 关联 go', fi.get('went') === 'go');
   check('constraint 独立（不映射到 constrain）', !fi.has('constraint') || fi.get('constraint') === 'constraint');
-  check('resolveEntryKey：精确优先', resolveEntryKey(items, 'constraint') === 'constraint');
-  check('resolveEntryKey：词形落到词条', resolveEntryKey(items, 'Constrained') === 'constrain');
-  check('resolveEntryKey：未知词形为空', resolveEntryKey(items, 'gone') === null);
 
   // 冲突：两个词条声明同一词形 → 不映射（保留独立表达）
   const conflict = [
@@ -340,12 +335,6 @@ console.log('M3 词形：关联、独立与冲突');
     merged.join(','),
   );
   check('词形行解析', JSON.stringify(parseFormsLine('constrains, constrained、constraining；went')) === '["constrains","constrained","constraining","went"]');
-
-  // 表面词形 → 状态（字幕词标记）
-  const sm = buildSurfaceStatusMap(items);
-  check('constrained 呈现 constrain 状态', sm.get('constrained') === 'saved');
-  check('went 呈现 go 状态', sm.get('went') === 'saved');
-  check('constraint 用自身状态', sm.get('constraint') === 'learning');
 }
 
 console.log('M3 释义回复：词形行');

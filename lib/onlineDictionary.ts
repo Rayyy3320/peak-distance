@@ -178,15 +178,3 @@ export async function lookupDictionarySource(
     return { ok: false, source, error: 'bad-response', detail: String(error) };
   }
 }
-
-/** 默认按首选、备用顺序查询；用户指定来源时只调用 lookupDictionarySource。 */
-export async function lookupOnlineDictionary(
-  expression: string,
-  primary: DictionarySource = 'youdao',
-  backup: DictionarySource = 'cambridge',
-  signal?: AbortSignal,
-): Promise<DictionaryResult> {
-  const first = await lookupDictionarySource(expression, primary, signal);
-  if (first.ok || first.error === 'aborted' || primary === backup) return first;
-  return lookupDictionarySource(expression, backup, signal);
-}

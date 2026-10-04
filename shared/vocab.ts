@@ -395,24 +395,6 @@ export function lookupKeyCandidates(expression: string, lang?: LanguageTag): str
 }
 
 /**
- * 表面词形 → 词条键：精确词条优先；否则查唯一的词形关联；
- * 冲突或无关联返回 null（保留独立表达）。
- * lang 提供时按该语言规范化（如土耳其语大小写）；缺省沿用旧规范化
- *（迁移前调用方兼容）。跨语言的同形词靠语言作用域键天然分离。
- */
-export function resolveEntryKey(
-  items: FormIndexInput[],
-  surface: string,
-  lang?: LanguageTag,
-): string | null {
-  const key = lang ? normalizeExpressionInLanguage(surface, lang) : normalizeExpression(surface);
-  if (!key) return null;
-  if (items.some((it) => it.key === key)) return key;
-  const formIndex = buildFormIndex(items);
-  return formIndex.get(key) ?? null;
-}
-
-/**
  * 词条 forms 合并决策：新词形来自同次释义结果；以下情况不并入 ——
  * 已是某词条自身的键（保留独立表达）、已被其它词条声明（冲突）。
  * lang 提供时按该语言规范化（词形关联限同一语言，M11 spec 3.4）；
@@ -444,23 +426,6 @@ export function parseFormsLine(line: string): string[] {
     .split(/[,，、;；/|\s]+/)
     .map((w) => normalizeExpression(w))
     .filter(Boolean);
-}
-
-/**
- * 表面词形 → 状态：含词形关联；冲突词形不出现（保留独立表达）。
- * 页面标记与字幕词标记共用同一判定。
- */
-export function buildSurfaceStatusMap(
-  items: (FormIndexInput & { status: VocabStatus })[],
-): Map<string, VocabStatus> {
-  const map = new Map<string, VocabStatus>();
-  for (const it of items) map.set(it.key, it.status);
-  const formIndex = buildFormIndex(items);
-  for (const [form, owner] of formIndex) {
-    const ownerItem = items.find((it) => it.key === owner);
-    if (ownerItem) map.set(form, ownerItem.status);
-  }
-  return map;
 }
 
 /**

@@ -1,9 +1,17 @@
 // 实时来源冒烟检查：npm exec tsx tools/check-online-sources.ts
-import { lookupDictionarySource, lookupOnlineDictionary } from '../lib/onlineDictionary';
+import { lookupDictionarySource } from '../lib/onlineDictionary';
 import { translateRegularText } from '../lib/regularTranslation';
 
+// 首选/备用顺序逐个查询（原 lookupOnlineDictionary 的循环语义）。
+async function lookupWithBackup(expression: string) {
+  const first = await lookupDictionarySource(expression, 'youdao');
+  if (first.ok) return first;
+  const backup = await lookupDictionarySource(expression, 'cambridge');
+  return backup.ok ? backup : first;
+}
+
 for (const expression of ['run', 'bank', 'went', 'take off', 'in spite of']) {
-  const result = await lookupOnlineDictionary(expression);
+  const result = await lookupWithBackup(expression);
   if (!result.ok || !result.entry.senses.some((sense) => /[\u3400-\u9fff]/u.test(sense.definition))) {
     throw new Error(`${expression}: no Chinese dictionary entry: ${JSON.stringify(result)}`);
   }
