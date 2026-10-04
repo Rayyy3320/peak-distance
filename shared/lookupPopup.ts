@@ -472,7 +472,15 @@ export function createLookupPopup(opts: {
     const requestId = `lookup-${Date.now()}-${++requestCounter}`;
     p.lookupRequest = requestId; p.source = source; p.lookupError = undefined; p.result = undefined; p.definition = null;
     renderPopup();
-    const r = await send<OnlineLookupResult>({ type: 'lookup', snapshot: p.snapshot, source, requestId });
+    // 查询意图：紧凑卡即 hover 路径（永不触发 AI 兜底）；展开后 /
+    // 主动打开的卡片按主动查词处理（background 缺省 active）。
+    const r = await send<OnlineLookupResult>({
+      type: 'lookup',
+      snapshot: p.snapshot,
+      source,
+      intent: p.compact ? 'hover' : 'active',
+      requestId,
+    });
     if (p.lookupRequest !== requestId) return;
     p.lookupRequest = undefined;
     if (r?.ok) {
