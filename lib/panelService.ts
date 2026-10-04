@@ -19,9 +19,13 @@ export function initPanelLifecycle() {
         const value = host as { mode?: string; tabId?: number };
         if (key.startsWith('panel-host:') && value.mode === 'floating' && value.tabId === tabId) await discardChatEdit(Number(key.split(':')[1]));
       }
+      await browser.storage.session.remove(`panel-diagnostics:${tabId}`);
     });
   });
-  browser.windows.onRemoved.addListener(windowId => { void discardChatEdit(windowId); });
+  browser.windows.onRemoved.addListener(windowId => {
+    void discardChatEdit(windowId);
+    void browser.storage.session.remove([`selection:${windowId}`, `chat-tab:${windowId}`]);
+  });
 }
 
 type Sender = Parameters<Parameters<typeof browser.runtime.onMessage.addListener>[0]>[1];
