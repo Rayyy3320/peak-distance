@@ -104,6 +104,7 @@ function toEntryView(e: VocabEntryRecord, contexts: ContextRecord[]): EntryView 
     key: e.key,
     language: e.language,
     expression: e.expression,
+    note: e.note,
     kind: e.kind,
     status: e.status,
     createdAt: e.createdAt,
@@ -737,5 +738,96 @@ export async function getVaultStatus(): Promise<VaultStatus> {
       lastCommitAt: meta?.lastCommitAt ?? null,
       lastError: meta?.lastError ?? null,
     };
+  });
+}
+
+// ---- 学习库读回：外部记录落库与同步快照（三方合并的 base） ------------------------
+
+/** 外部（Obsidian）记录整体落库：词条替换 + 上下文全量重建（单一事务）。 */
+export async function importVaultEntry(
+  entry: VocabEntryRecord,
+  contexts: Omit<ContextRecord, 'id'>[],
+): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction([ENTRIES, CONTEXTS], 'readwrite');
+    const entries = tx.objectStore(ENTRIES);
+    const contextStore = tx.objectStore(CONTEXTS);
+    entries.put(entry);
+    const ids = (await px(contextStore.index('entryKey').getAllKeys(entry.key))) as IDBValidKey[];
+    for (const id of ids) contextStore.delete(id);
+    for (const c of contexts) contextStore.add({ ...c, entryKey: entry.key });
+    await txDone(tx);
+  });
+}
+
+export async function upsertVaultSentence(sentence: SavedSentence): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction('sentences', 'readwrite');
+    tx.objectStore('sentences').put(sentence);
+    await txDone(tx);
+  });
+}
+
+/** 上次同步快照（JSON 字符串）：三方合并的 base；缺失返回 null。 */
+export async function getSyncSnapshot(recordId: string): Promise<string | null> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = (await px(tx.objectStore(VAULT).get(`sync:${recordId}`))) as string | undefined;
+    await txDone(tx);
+    return r ?? null;
+  });
+}
+
+export async function setSyncSnapshot(recordId: string, json: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(json, `sync:${recordId}`);
+    await txDone(tx);
+  });
+}
+
+/** 列出全部同步快照的 recordId（删除检测用）。 */
+export async function listSyncSnapshotIds(): Promise<string[]> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const keys = (await px(tx.objectStore(VAULT).getAllKeys())) as IDBValidKey[];
+    await txDone(tx);
+    return keys.filter((k) => String(k).startsWith('sync:')).map((k) => String(k).slice(5));
+  });
+}
+
+export async function deleteSyncSnapshot(recordId: string): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).delete(`sync:${recordId}`);
+    await txDone(tx);
+  });
+}
+
+/** 断开时清理同步快照（待办队列保留，按库身份重连后重建）。 */
+export async function clearSyncSnapshots(): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    const keys = (await px(tx.objectStore(VAULT).getAllKeys())) as IDBValidKey[];
+    for (const k of keys) if (String(k).startsWith('sync:')) tx.objectStore(VAULT).delete(k);
+    await txDone(tx);
+  });
+}
+
+/** vault store 的通用键值（冲突记录等小对象）。 */
+export async function putVaultRaw(key: string, value: unknown): Promise<void> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readwrite');
+    tx.objectStore(VAULT).put(value, key);
+    await txDone(tx);
+  });
+}
+
+export async function getVaultRaw<T>(key: string): Promise<T | null> {
+  return withDb(async db => {
+    const tx = db.transaction(VAULT, 'readonly');
+    const r = (await px(tx.objectStore(VAULT).get(key))) as T | undefined;
+    await txDone(tx);
+    return r ?? null;
   });
 }

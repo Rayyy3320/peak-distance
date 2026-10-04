@@ -28,7 +28,17 @@ import { lookupExpression, translateSentences } from '@/lib/aiClient';
 import { getAiConfig } from '@/lib/aiTransport';
 import { aiCacheScope, isAiProvider, validateAiProfile } from '@/shared/aiConfig';
 import { handleChatRequest, initChatService } from '@/lib/chatService';
-import { getVaultStatus } from '@/lib/db';
+import { getVaultIdentity, getVaultStatus } from '@/lib/db';
+import {
+  adoptVault,
+  disconnectVault,
+  enqueuePreferenceWrite,
+  enqueueSentenceWrite,
+  enqueueVocabWrite,
+  entryViewToVaultRecord,
+  flushVaultWrites,
+  syncFromVault,
+} from '@/lib/vault/sync';
 import { isLanguageTag, normalizeLangTag } from '@/shared/languages';
 import {
   sentenceId,
@@ -65,6 +75,20 @@ function bad(error: string, detail?: string): BgcError {
 function parseLangField(v: unknown): string | undefined | null {
   if (v === undefined) return undefined;
   return isLanguageTag(v) ? normalizeLangTag(v) : null;
+}
+
+/** 本机保存成功后（已连接库时）排队写入学库并尝试提交；结果经 vault-changed 广播。 */
+function queueVaultWriteAfterSave(task: () => Promise<void>): void {
+  void (async () => {
+    try {
+      if (!(await getVaultIdentity())) return;
+      await task();
+      await flushVaultWrites();
+      broadcast({ type: 'vault-changed' });
+    } catch {
+      /* 写库失败保留待办（队列持久化），下次活动补写 */
+    }
+  })();
 }
 
 function parseVideoRef(v: unknown): VideoRef | null {
@@ -222,12 +246,28 @@ async function handle(
       const language = parseLangField(s?.language);
       if (!s || !video || typeof s.text !== 'string' || !s.text.trim() || s.text.length > MAX_SENTENCE ||
           typeof s.title !== 'string' || !Number.isFinite(s.endMs) || s.endMs < video.startMs || language === null) return bad('bad-payload');
-      await saveSentence({ id: sentenceId(video, s.text), video, text: s.text, endMs: s.endMs, title: s.title.slice(0, MAX_TITLE),
+      const savedSentence = { id: sentenceId(video, s.text), video, text: s.text, endMs: s.endMs, title: s.title.slice(0, MAX_TITLE),
         zh: typeof s.zh === 'string' ? s.zh.slice(0, MAX_SENTENCE) : undefined,
         translationSource: typeof s.translationSource === 'string' ? s.translationSource.slice(0, 80) : undefined,
         ...(language ? { language } : {}),
-        createdAt: Date.now() });
+        createdAt: Date.now() };
+      await saveSentence(savedSentence);
       broadcast({ type: 'sentences-changed' });
+      if (language) {
+        queueVaultWriteAfterSave(async () => {
+          await enqueueSentenceWrite({
+            id: savedSentence.id,
+            language: savedSentence.language ?? video.trackLang ?? 'und',
+            text: savedSentence.text,
+            ...(savedSentence.zh ? { translation: savedSentence.zh } : {}),
+            ...(savedSentence.translationSource ? { translationSource: savedSentence.translationSource } : {}),
+            video,
+            endMs: savedSentence.endMs,
+            title: savedSentence.title,
+            createdAt: savedSentence.createdAt,
+          });
+        });
+      }
       return { ok: true };
     }
     case 'deleteSentence': {
@@ -320,6 +360,13 @@ async function handle(
       if (!r) return bad('bad-payload', 'empty-expression');
       const out: SaveResult = r;
       broadcast({ type: 'vocab-changed' });
+      if (snapshot.lang || r.key.includes('::')) {
+        // M11 语言作用域词条：连接学习库时排队写入（旧键词条待语言迁移批次）
+        queueVaultWriteAfterSave(async () => {
+          const entry = await getEntry(r.key);
+          if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
+        });
+      }
       return out;
     }
     case 'backfillResult': {
@@ -394,6 +441,10 @@ async function handle(
         return bad('bad-payload', 'setting');
       }
       await browser.storage.local.set({ [m.name]: m.value });
+      // 语言偏好双向生效：连接学习库时排队写回 偏好.md
+      if (m.name === 'defaultComprehensionLang' || m.name === 'comprehensionOverrides') {
+        queueVaultWriteAfterSave(() => enqueuePreferenceWrite());
+      }
       return { ok: true };
     }
     case 'translateCues': {
@@ -459,17 +510,37 @@ async function handle(
         return { ok: true, translations };
       } finally { if (onlineRequests.get(requestKey) === controller) onlineRequests.delete(requestKey); }
     }
-    // ---- M11 学习库：状态真实读取；连接／授权／提交随 V 线程模块接入 -----
+    // ---- M11 学习库 -------------------------------------------------------------
     case 'vaultStatus': {
       return { ok: true, status: await getVaultStatus() };
     }
-    case 'vaultConnect':
-    case 'vaultReauthorize':
-    case 'vaultDisconnect':
+    case 'vaultConnect': {
+      // 页面侧已完成选目录/授权（pickVaultDirectoryInPage 把句柄写入 IDB），
+      // 重新授权 = 页面再次选同一目录后重发本消息。
+      const r = await adoptVault();
+      if (!r.ok) return bad(r.error);
+      broadcast({ type: 'vault-changed' });
+      broadcast({ type: 'vocab-changed' });
+      return { ok: true, vault: (await getVaultIdentity()) ?? null, imported: r.imported };
+    }
+    case 'vaultDisconnect': {
+      await disconnectVault();
+      broadcast({ type: 'vault-changed' });
+      return { ok: true };
+    }
     case 'vaultFlush': {
-      // 目录选择与授权需要用户激活上下文（具体落点由 V 探针结果决定），
-      // 队列提交依赖 lib/vault/**；接入前明确报告，不伪造成功。
-      return bad('vault-module-pending', '学习库模块尚未接入');
+      const r = await flushVaultWrites();
+      await syncFromVault();
+      broadcast({ type: 'vault-changed' });
+      broadcast({ type: 'vocab-changed' });
+      return { ok: true, ...r };
+    }
+    case 'vaultSync': {
+      const r = await syncFromVault();
+      if (r.error) return bad(r.error);
+      broadcast({ type: 'vault-changed' });
+      if (r.updated || r.deleted) broadcast({ type: 'vocab-changed' });
+      return { ok: true, ...r };
     }
     case 'openSettings': {
       return handlePanelMessage({type:'panelOpen',view:'settings'},sender,nativeOpen);

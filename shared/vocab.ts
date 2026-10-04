@@ -97,6 +97,8 @@ export interface VocabEntryRecord {
   expression: string;
   kind: 'word' | 'phrase';
   status: VocabStatus;
+  /** 个人笔记（M11：学习库“我的笔记”双向同步；也可在详情内编辑） */
+  note?: string;
   createdAt: number;
   updatedAt: number;
   forms?: string[];

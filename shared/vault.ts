@@ -109,10 +109,16 @@ export interface VaultRecordUpdate {
 }
 
 /** 真实冲突（同字段两侧不同改法）：保留双方，交给用户处理。 */
+export interface VaultConflictField {
+  field: string;
+  local: unknown;
+  remote: unknown;
+}
+
 export interface VaultConflictRecord {
   kind: VaultRecordKind;
   recordId: string;
-  fields: string[];
+  fields: VaultConflictField[];
   local: unknown;
   remote: unknown;
 }

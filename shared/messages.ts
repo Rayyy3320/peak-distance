@@ -89,12 +89,12 @@ export type BgcRequest =
       targetLang?: LanguageTag; // 译文语言
       items: { id: number; text: string }[];
     }
-  // ---- M11 学习库（目录句柄与读写由 lib/vault/** 提供，background 只路由） ----
-  | { type: 'vaultConnect' } // 选择目录并授权（在探针证明的授权上下文执行）
+  // ---- M11 学习库（页面侧选目录/授权后通知 background；文件操作在 lib/vault） ----
+  | { type: 'vaultConnect' } // 页面 pickVaultDirectoryInPage 成功后调用（也用于重新授权）
   | { type: 'vaultDisconnect' } // 断开：不删除文件，待办按库身份保留
-  | { type: 'vaultReauthorize' } // 重新授权现有目录
   | { type: 'vaultStatus' }
-  | { type: 'vaultFlush' } // 立即尝试提交待写入队列
+  | { type: 'vaultFlush' } // 立即尝试提交待写入队列并读回
+  | { type: 'vaultSync' } // 只读回（打开面板/焦点恢复触发）
   | { type: 'openSettings' };
 
 /**
@@ -143,6 +143,8 @@ export interface EntryView {
   expression: string;
   kind: 'word' | 'phrase';
   status: VocabStatus;
+  /** 个人笔记（学习库“我的笔记”双向同步） */
+  note?: string;
   createdAt: number;
   updatedAt: number;
   forms: string[];
