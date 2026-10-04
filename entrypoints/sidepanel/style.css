@@ -19,7 +19,30 @@ body {display:grid;grid-template-rows:auto minmax(0,1fr)}
 .section-title {display:flex;gap:8px;align-items:center;justify-content:space-between;margin-bottom:16px}
 .section-title h1 {margin:0}.section-title button {font-size:12px}
 .library-tabs {display:flex;gap:8px;margin-bottom:12px}.library-tabs button {border:0;background:transparent;color:var(--pd-muted)}.library-tabs .active {background:var(--pd-selected);color:var(--pd-blue)}
-#search {width:100%}
+/* 搜索 + 语言筛选组合栏（图标菜单 + 可清除 chip，规格：design/lang-filter-mockup.html 方案 B） */
+.search-combo {position:relative;display:flex;align-items:stretch;height:38px;background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:8px}
+.search-combo:focus-within {border-color:var(--pd-mist)}
+#search {flex:1;min-width:0;border:0;background:transparent;padding:0 12px;color:inherit}
+#search::placeholder {color:var(--pd-muted)}
+#search:focus-visible {outline:none}
+.search-combo svg {width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
+#lang-filter {position:relative;display:flex;align-items:center;justify-content:center;width:40px;border:0;border-right:1px solid var(--pd-line);border-radius:0;background:transparent;color:var(--pd-muted);min-height:0;padding:0}
+#lang-filter:hover {background:var(--pd-paper)}
+#lang-filter.on {color:var(--pd-blue)}
+#lang-filter.on::after {content:'';position:absolute;top:7px;right:8px;width:6px;height:6px;border-radius:50%;background:var(--pd-blue)}
+#lang-chip {display:flex;align-items:center;gap:2px;margin:5px 6px 5px 0;padding:0 5px 0 10px;background:var(--pd-selected);border:1px solid #c3d8ee;border-radius:999px;color:var(--pd-blue);font-size:12px;flex:none;min-width:0}
+#lang-chip-label {white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lang-chip-clear {display:flex;align-items:center;justify-content:center;width:16px;height:16px;border:0;border-radius:50%;background:transparent;color:inherit;min-height:0;padding:0;flex:none}
+#lang-chip-clear:hover {background:#d2e2f3}
+#lang-chip-clear svg {width:9px;height:9px;stroke-width:2}
+#lang-menu {position:absolute;top:calc(100% + 6px);left:0;width:196px;z-index:5;background:var(--pd-surface);border:1px solid var(--pd-line);border-radius:10px;box-shadow:var(--pd-shadow);padding:6px;display:flex;flex-direction:column;gap:2px}
+#lang-menu button {display:flex;align-items:center;gap:8px;border:0;background:transparent;min-height:0;padding:7px 10px;border-radius:7px;font-size:13px;text-align:left;color:var(--pd-ink);white-space:nowrap}
+#lang-menu button:hover {background:var(--pd-paper)}
+#lang-menu button.cur {color:var(--pd-blue);background:var(--pd-selected)}
+#lang-menu .cnt {margin-left:auto;font-size:11px;color:var(--pd-muted)}
+#lang-menu .check {width:14px;height:14px;visibility:hidden;flex:none}
+#lang-menu button.cur .check {visibility:visible}
+@media(max-width:359px){#lang-chip{flex:0 1 auto;max-width:45%}}
 main {min-height:0;min-width:0;overflow:auto;padding:20px 16px;flex:1;overscroll-behavior:contain}
 .empty {padding:28px 12px;color:var(--pd-muted);text-align:center}
 .empty-landscape {height:220px;background:url('/brand/mountain-coast.png') center 70%/cover;border-radius:8px;margin-top:16px}

@@ -15,7 +15,7 @@
     </header>
     <div class="app-content">
       <div id="panel-feedback" role="status" hidden></div>
-      <div id="library-tools"><div class="section-title"><h1>生词本</h1><button data-view="review" type="button">原句复习 →</button></div><div class="library-tabs"><button data-view="list">词语</button><button data-view="sentences">句子</button></div><input id="search" type="search" placeholder="搜索表达…" autocomplete="off" aria-label="搜索表达"><select id="lang-filter" aria-label="语言筛选"><option value="all">全部语言</option><option value="und">待确认</option></select></div>
+      <div id="library-tools"><div class="section-title"><h1>生词本</h1><button data-view="review" type="button">原句复习 →</button></div><div class="library-tabs"><button data-view="list">词语</button><button data-view="sentences">句子</button></div><div class="search-combo" id="search-combo"><button id="lang-filter" type="button" aria-label="语言筛选" aria-haspopup="listbox" aria-expanded="false" title="语言筛选"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M2.8 10h14.4M10 2.8c2.4 2.2 2.4 12.2 0 14.4M10 2.8c-2.4 2.2-2.4 12.2 0 14.4"/></svg></button><input id="search" type="search" placeholder="搜索表达…" autocomplete="off" aria-label="搜索表达"><span id="lang-chip" hidden><span id="lang-chip-label"></span><button id="lang-chip-clear" type="button" aria-label="清除语言筛选"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15"/></svg></button></span><div id="lang-menu" role="listbox" hidden></div></div></div>
     <main id="view-list" aria-live="polite">
       <div id="list"></div>
     </main>

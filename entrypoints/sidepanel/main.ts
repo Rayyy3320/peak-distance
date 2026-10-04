@@ -124,7 +124,7 @@ async function persistPanel() {
 
 function switchView(view: string): void {
   if (view === currentView) return;
-  lookupPopup.close();document.getElementById('panel-selection-actions')?.remove();
+  lookupPopup.close();closeLangMenu();document.getElementById('panel-selection-actions')?.remove();
   const prev = currentView;
   if (prev === 'chat' && view !== 'chat') chatViewLeave();
   savedScroll[prev]=currentMain()?.scrollTop??0;
@@ -142,8 +142,7 @@ function switchView(view: string): void {
   document.getElementById('library-tools')!.hidden = !['list','sentences'].includes(view);
   document.querySelectorAll<HTMLButtonElement>('.library-tabs button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   currentMain()?.scrollTo(0,savedScroll[view]??0);
-  const search = document.getElementById('search')!;
-  search.style.display = view === 'list' ? '' : 'none';
+  document.getElementById('search-combo')!.style.display = view === 'list' ? '' : 'none';
   // 侧栏各视图共用同一连接；显式停止或窗口关闭才停止生成
   if (view === 'chat') chatViewEnter();
   if (view === 'list') void refresh();
@@ -348,26 +347,19 @@ async function refresh(): Promise<void> {
     list.appendChild(el('div', 'empty', '加载失败，请重试'));
     return;
   }
-  // 语言筛选：全部 / 待确认 / 出现过的语言（记住选择，spec 3.4）
-  const filter = document.getElementById('lang-filter') as HTMLSelectElement;
+  // 语言筛选：全部 / 待确认 / 出现过的语言（记住选择，spec 3.4）。
+  // 合并到搜索行：globe 图标菜单 + 可清除 chip（规格见 design/lang-filter-mockup.html 方案 B）
   const langs = [...new Set(r.entries.map((e) => effectiveEntryLanguage(e)).filter((l): l is string => !!l))].sort();
-  const wanted = localStorage.getItem('blc-lang-filter') ?? 'all';
-  if (filter.dataset.langs !== langs.join(',')) {
-    filter.dataset.langs = langs.join(',');
-    const current = wanted;
-    filter.replaceChildren();
-    const all = el('option', undefined, '全部语言'); all.value = 'all'; filter.appendChild(all);
-    const und = el('option', undefined, '待确认'); und.value = 'und'; filter.appendChild(und);
-    for (const l of langs) {
-      if (l === 'und') continue;
-      const o = el('option', undefined, langDisplayName(l)); o.value = l; filter.appendChild(o);
-    }
-    filter.value = [...filter.options].some((o) => o.value === current) ? current : 'all';
+  let filter = localStorage.getItem('blc-lang-filter') ?? 'all';
+  if (filter !== 'all' && filter !== 'und' && !langs.includes(filter)) {
+    filter = 'all'; // 存储语言已不存在（词条删除等）：回退全部并回写
+    localStorage.setItem('blc-lang-filter', 'all');
   }
-  const filtered = filter.value === 'all' ? r.entries : r.entries.filter((e) => effectiveEntryLanguage(e) === filter.value);
+  renderLangControls(filter, langs, r.entries);
+  const filtered = filter === 'all' ? r.entries : r.entries.filter((e) => effectiveEntryLanguage(e) === filter);
   if (filtered.length === 0) {
     list.appendChild(
-      el('div', 'empty', q ? '没有匹配的表达' : filter.value !== 'all' ? '该语言暂无词条' : '还没有收藏的表达。在网页上选中一个词或短语，点击“查词”开始。'),
+      el('div', 'empty', q ? '没有匹配的表达' : filter !== 'all' ? '该语言暂无词条' : '还没有收藏的表达。在网页上选中一个词或短语，点击“查词”开始。'),
     );
     return;
   }
@@ -376,10 +368,78 @@ async function refresh(): Promise<void> {
 }
 
 document.getElementById('search')!.addEventListener('input', () => void refresh());
-document.getElementById('lang-filter')!.addEventListener('change', () => {
-  const filter = document.getElementById('lang-filter') as HTMLSelectElement;
-  localStorage.setItem('blc-lang-filter', filter.value);
+
+// ---- 语言筛选（globe 菜单 + 可清除 chip） ----------------------------------------
+
+const LANG_CHECK_SVG = '<svg class="check" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10.5 4 4 8-9"/></svg>';
+
+function langMenuOpen(): boolean {
+  return !document.getElementById('lang-menu')!.hidden;
+}
+
+function closeLangMenu(focusButton = false): void {
+  document.getElementById('lang-menu')!.hidden = true;
+  const btn = document.getElementById('lang-filter')!;
+  btn.setAttribute('aria-expanded', 'false');
+  if (focusButton) btn.focus();
+}
+
+function setLangFilter(value: string): void {
+  localStorage.setItem('blc-lang-filter', value);
   void refresh();
+}
+
+/** 筛选值驱动 UI：chip 文案/显隐、globe 高亮与圆点、菜单项与计数（计数按语言过滤前的 entries）。 */
+function renderLangControls(filter: string, langs: string[], entries: EntryView[]): void {
+  const counts = new Map<string, number>();
+  for (const e of entries) {
+    const l = effectiveEntryLanguage(e) ?? '';
+    counts.set(l, (counts.get(l) ?? 0) + 1);
+  }
+  const active = filter !== 'all';
+  const label = active ? langDisplayName(filter) : '';
+  const btn = document.getElementById('lang-filter')!;
+  btn.classList.toggle('on', active);
+  btn.title = active ? `语言筛选：${label}` : '语言筛选';
+  btn.setAttribute('aria-label', btn.title);
+  document.getElementById('lang-chip')!.hidden = !active;
+  if (active) document.getElementById('lang-chip-label')!.textContent = label;
+  const menu = document.getElementById('lang-menu')!;
+  menu.textContent = '';
+  const item = (value: string, text: string, count: number) => {
+    const b = el('button', filter === value ? 'cur' : undefined);
+    b.type = 'button';
+    b.setAttribute('role', 'option');
+    b.setAttribute('aria-selected', String(filter === value));
+    b.innerHTML = LANG_CHECK_SVG;
+    b.append(el('span', undefined, text), el('span', 'cnt', String(count)));
+    b.addEventListener('click', () => {
+      closeLangMenu();
+      setLangFilter(value);
+    });
+    menu.appendChild(b);
+  };
+  item('all', '全部语言', entries.length);
+  item('und', '待确认', counts.get('und') ?? 0);
+  for (const l of langs) if (l !== 'und') item(l, langDisplayName(l), counts.get(l) ?? 0);
+}
+
+document.getElementById('lang-filter')!.addEventListener('click', () => {
+  if (langMenuOpen()) closeLangMenu();
+  else {
+    document.getElementById('lang-menu')!.hidden = false;
+    document.getElementById('lang-filter')!.setAttribute('aria-expanded', 'true');
+  }
+});
+document.getElementById('lang-chip-clear')!.addEventListener('click', () => setLangFilter('all'));
+document.addEventListener('pointerdown', (e) => {
+  if (langMenuOpen() && !e.composedPath().includes(document.getElementById('search-combo')!)) closeLangMenu();
+}, true);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && langMenuOpen()) {
+    e.preventDefault();
+    closeLangMenu(true);
+  }
 });
 
 // ---- 字幕视图（当前标签页的视频） ---------------------------------------------------
