@@ -29,7 +29,7 @@ export function isTimedtextUrl(url: unknown): boolean {
 
 function paramsOf(url: string, href: string): URLSearchParams {
   try {
-    return new URL(url, href).searchParams;
+    return new URL(url, href || undefined).searchParams;
   } catch {
     return new URLSearchParams();
   }
@@ -39,13 +39,74 @@ export function hasTlangParam(url: string, href: string): boolean {
   return paramsOf(url, href).has('tlang');
 }
 
-/** 轨道稳定标识：剥离会轮换（pot）或可变（fmt/tlang）的参数。 */
+export interface SubtitleTrack {
+  id: string;
+  lang: string;
+  kind: 'manual' | 'asr';
+  name: string;
+  label?: string;
+  xtags: string;
+  vssId?: string;
+}
+
+function trackInfo(lang: string, kind: 'manual' | 'asr', name = '', xtags = '', vssId = ''): SubtitleTrack {
+  lang = lang.toLowerCase();
+  const defaultVss = `${kind === 'asr' ? 'a.' : '.'}${lang}${name ? `.${name}` : ''}`;
+  const variant = vssId && vssId.toLowerCase() !== defaultVss.toLowerCase() ? vssId : '';
+  const identity = [lang, kind, name, xtags];
+  if (variant) identity.push(variant);
+  return { id: JSON.stringify(identity), lang, kind, name, xtags, ...(variant ? { vssId: variant } : {}) };
+}
+
+export function trackOfUrl(url: string, href = ''): SubtitleTrack | null {
+  const p = paramsOf(url, href);
+  const lang = p.get('lang');
+  return lang ? trackInfo(lang, p.get('kind') === 'asr' ? 'asr' : 'manual', p.get('name') || '', p.get('xtags') || '', p.get('vssId') || p.get('vss_id') || '') : null;
+}
+
+export interface PlayerCaptionTrack extends SubtitleTrack {
+  url: string;
+  native: { languageCode: string; kind: string; name: string; xtags: string; vss_id?: string };
+}
+
+/** 播放器 API 与 playerResponse 两种描述在这个边界统一。 */
+export function captionTrackOf(raw: any): PlayerCaptionTrack | null {
+  if (typeof raw?.languageCode !== 'string' || !raw.languageCode) return null;
+  const url = typeof raw.baseUrl === 'string' ? raw.baseUrl : typeof raw.url === 'string' ? raw.url : '';
+  const fromUrl = trackOfUrl(url);
+  const name = fromUrl?.name ?? (typeof raw.name === 'string' ? raw.name : '');
+  const track = trackInfo(raw.languageCode, raw.kind === 'asr' ? 'asr' : 'manual', name, fromUrl?.xtags ?? raw.xtags ?? '', fromUrl?.vssId || raw.vss_id || raw.vssId || '');
+  return {
+    ...track, url,
+    label: raw.displayName || raw.name?.simpleText || raw.languageName,
+    native: { languageCode: raw.languageCode, kind: track.kind === 'asr' ? 'asr' : '', name, xtags: track.xtags, vss_id: raw.vss_id || raw.vssId || fromUrl?.vssId },
+  };
+}
+
+/** 原文和译文轨道共用：保留目标自身签名，更新为当前视频最近的 pot。 */
+export function captionUrlFor(track: Pick<PlayerCaptionTrack, 'id' | 'url'>, tokenSource: string, href: string): string | null {
+  const base = track.url || (trackOfUrl(tokenSource, href)?.id === track.id ? tokenSource : '');
+  if (!base) return null;
+  const u = new URL(base, href || undefined);
+  const pot = paramsOf(tokenSource, href).get('pot');
+  if (pot) u.searchParams.set('pot', pot);
+  return buildJson3Url(u.toString(), href);
+}
+
+/** 轨道身份只取视频和内容字段；签名、令牌、参数顺序均不参与。 */
 export function normTrackKey(url: string, href: string): string {
   try {
-    const u = new URL(url, href);
-    u.searchParams.delete('fmt');
-    u.searchParams.delete('tlang');
-    u.searchParams.delete('pot');
+    const u = new URL(url, href || undefined);
+    if (!isTimedtextUrl(url) || !u.searchParams.has('lang')) return url;
+    const track = trackOfUrl(url, href)!;
+    const videoId = u.searchParams.get('v') || videoIdFromUrl(href);
+    u.search = '';
+    u.searchParams.set('v', videoId);
+    u.searchParams.set('lang', track.lang);
+    if (track.kind === 'asr') u.searchParams.set('kind', 'asr');
+    if (track.name) u.searchParams.set('name', track.name);
+    if (track.xtags) u.searchParams.set('xtags', track.xtags);
+    if (track.vssId) u.searchParams.set('vssId', track.vssId);
     return u.toString();
   } catch {
     return url;
@@ -54,7 +115,7 @@ export function normTrackKey(url: string, href: string): string {
 
 export function stripTlang(url: string, href: string): string {
   try {
-    const u = new URL(url, href);
+    const u = new URL(url, href || undefined);
     u.searchParams.delete('tlang');
     return u.toString();
   } catch {
@@ -77,7 +138,7 @@ export function vidOfTimedtext(url: string, href: string): string {
 
 /** 拉取 URL：保留全部参数（含 pot 与签名），强制 fmt=json3，去掉 tlang。 */
 export function buildJson3Url(base: string, href: string): string {
-  const u = new URL(base, href);
+  const u = new URL(base, href || undefined);
   u.searchParams.delete('tlang');
   u.searchParams.set('fmt', 'json3');
   return u.toString();
@@ -93,9 +154,13 @@ export interface PinnedSource {
 export class SubtitleSourceTracker {
   currentVideoId: string;
   sourceUrl = '';
-  sourceVid = '';
   sourceKey = '';
   producedForUrl = '';
+  tokenSourceUrl = ''; // 当前视频最近携带 pot 的 URL，不随一次选轨失败或取消丢失。
+  selectedTrack: SubtitleTrack | null = null;
+  private playerTrackId: string | null = null;
+  private latestCaptureTime = -1;
+  selectionVersion = 0;
 
   constructor(initialVideoId: string) {
     this.currentVideoId = initialVideoId;
@@ -109,37 +174,62 @@ export class SubtitleSourceTracker {
   }
 
   /**
-   * 视频切换重置（config 与轮询共用）。已属于新视频的来源保留 —— 这是时序 A
-   * 的关键：捕获先于 config 到达时，重置不能把刚抓到的来源清掉。
+   * 只在视频身份变化时重置。捕获先于 config 对齐身份后，后续 config 不再
+   * 重置同一视频的来源（时序 A）。
    */
   resetForVideo(newVideoId: string): boolean {
     if (newVideoId === this.currentVideoId) return false;
     this.currentVideoId = newVideoId;
-    if (this.sourceVid !== newVideoId) {
-      this.sourceUrl = '';
-      this.sourceVid = '';
-      this.sourceKey = '';
-    }
-    this.producedForUrl = '';
+    this.tokenSourceUrl = '';
+    this.selectedTrack = null;
+    this.playerTrackId = null;
+    this.latestCaptureTime = -1;
+    this.selectionVersion++;
+    this.clearSource();
     return true;
   }
 
+  /** 明确意图与播放器确认值分开；setOption 后的旧读数不是新意图。 */
+  observePlayer(track: SubtitleTrack | null): SubtitleTrack | null {
+    if (!track || track.id === this.playerTrackId) return null;
+    this.playerTrackId = track.id;
+    return track.id === this.selectedTrack?.id ? null : track;
+  }
+
+  selectTrack(track: SubtitleTrack): boolean {
+    if (track.id === this.selectedTrack?.id) return false;
+    const { id, lang, kind, name, label, xtags, vssId } = track;
+    this.selectedTrack = { id, lang, kind, name, label, xtags, vssId };
+    this.selectionVersion++;
+    this.clearSource();
+    return true;
+  }
+
+  clearSource(): void {
+    this.sourceUrl = ''; this.sourceKey = ''; this.producedForUrl = '';
+  }
+
   /** 记录在途 timedtext URL。调用方已排除自身请求（selfUrls）。 */
-  noteTimedtext(url: string, locationHref: string): CaptureResult {
+  noteTimedtext(url: string, locationHref: string, startedAt?: number): CaptureResult {
     if (!isTimedtextUrl(url)) return 'ignored';
-    // 时序 A 第一步：先同步视频身份，再判定归属 —— 否则新视频的捕获会被
-    // 尚未轮询到的旧身份（sourceVid !== currentVideoId）拦下。
+    // 捕获先对齐视频身份，再判定 URL 归属；不依赖 config／轮询到达顺序。
     this.syncVideo(locationHref);
     const vidHere = this.currentVideoId;
     const urlVid = vidOfTimedtext(url, locationHref);
     if (vidHere && urlVid !== vidHere) return 'other-video';
+    const track = trackOfUrl(url, locationHref);
+    if (!track || (this.selectedTrack && track.id !== this.selectedTrack.id)) return 'ignored';
+    if (startedAt !== undefined) {
+      if (startedAt < this.latestCaptureTime) return 'ignored';
+      this.latestCaptureTime = startedAt;
+    }
     const effective = hasTlangParam(url, locationHref)
       ? stripTlang(url, locationHref)
       : url;
+    if (paramsOf(effective, locationHref).has('pot')) this.tokenSourceUrl = effective;
     const key = normTrackKey(url, locationHref);
     const wasKey = this.sourceKey;
     this.sourceUrl = effective;
-    this.sourceVid = urlVid;
     if (key !== wasKey) {
       this.sourceKey = key;
       return 'new';
@@ -149,7 +239,7 @@ export class SubtitleSourceTracker {
 
   /** 当前是否存在可用的（属于当前视频的）来源。 */
   hasCurrentSource(): boolean {
-    return !!this.sourceUrl && this.sourceVid === this.currentVideoId;
+    return !!this.sourceUrl;
   }
 
   /**
@@ -157,8 +247,8 @@ export class SubtitleSourceTracker {
    * 不再触碰 live 状态。
    */
   pinForProduce(): PinnedSource | null {
-    if (!this.sourceUrl || this.sourceVid !== this.currentVideoId) return null;
-    return { src: this.sourceUrl, trackKey: normTrackKey(this.sourceUrl, '') };
+    if (!this.sourceUrl) return null;
+    return { src: this.sourceUrl, trackKey: this.sourceKey };
   }
 
   /**
@@ -167,6 +257,6 @@ export class SubtitleSourceTracker {
    */
   staleAfterFetch(pinnedTrackKey: string): boolean {
     if (!this.sourceUrl) return true;
-    return normTrackKey(this.sourceUrl, '') !== pinnedTrackKey;
+    return this.sourceKey !== pinnedTrackKey;
   }
 }

@@ -31,6 +31,8 @@ import { scanMarkHits, type MarkBucket } from '../shared/marker';
 import {
   SubtitleSourceTracker,
   normTrackKey,
+  captionTrackOf,
+  captionUrlFor,
 } from '../shared/subtitleTracker';
 import {
   buildSegments,
@@ -59,6 +61,7 @@ import {
   planSave,
   shouldBackfill,
   videoContextUrl,
+  sentenceId,
   type VocabEntryRecord,
   type VideoRef,
 } from '../shared/vocab';
@@ -145,6 +148,41 @@ console.log('M0 基线：正常取字幕与跨视频旧响应');
   check('地址先变化且新来源未到时清除旧来源', t.sourceUrl === '' && !t.hasCurrentSource());
   t.resetForVideo('');
   check('离开视频页清除视频身份', t.currentVideoId === '' && !t.hasCurrentSource());
+}
+
+console.log('字幕轨道身份、凭据与选轨权威');
+{
+  const first = TT('V', 'en', 'signature=one&expire=1');
+  const renewed = 'https://www.youtube.com/api/timedtext?expire=2&signature=two&lang=en&v=V&pot=new&fmt=json3';
+  check('绝对 URL 无 base 仍可解析稳定轨道身份', normTrackKey(first, '') === normTrackKey(first, WATCH('V')));
+  check('签名、pot、格式和参数顺序不改变轨道身份', normTrackKey(first, '') === normTrackKey(renewed, ''));
+  check('具名轨道身份不同', normTrackKey(first + '&name=First', '') !== normTrackKey(first + '&name=Second', ''));
+  check('独立 vss 变体保留身份', normTrackKey(first + '&vssId=variant-one', '') !== normTrackKey(first + '&vssId=variant-two', ''));
+  const t = new SubtitleSourceTracker('V');
+  t.noteTimedtext(first, WATCH('V'), 100);
+  const pin = t.pinForProduce()!;
+  t.noteTimedtext(renewed, WATCH('V'), 200);
+  check('同轨凭据刷新不使内容身份过期', !t.staleAfterFetch(pin.trackKey));
+  check('迟到旧 Resource Timing 不回退最近凭据', t.noteTimedtext(first, WATCH('V'), 100) === 'ignored' && t.tokenSourceUrl === renewed);
+  const en = captionTrackOf({ languageCode: 'en' })!;
+  const ar = captionTrackOf({ languageCode: 'ar' })!;
+  t.observePlayer(en); t.selectTrack(ar);
+  check('播放器旧确认值不能撤销明确目标', t.observePlayer(en) === null && t.selectedTrack?.id === ar.id);
+  check('旧轨捕获不进入明确目标', t.noteTimedtext(first, WATCH('V')) === 'ignored');
+  check('播放器确认目标不重复发起选择', t.observePlayer(ar) === null);
+  const fr = captionTrackOf({ languageCode: 'fr' })!;
+  check('之后原生新选择被识别', t.observePlayer(fr)?.id === fr.id);
+  const target = captionTrackOf({ languageCode: 'fr', baseUrl: 'https://www.youtube.com/api/timedtext?v=V&lang=fr&signature=fr-own' })!;
+  const url = new URL(captionUrlFor(target, renewed, WATCH('V'))!);
+  check('跨轨 URL 使用目标签名和最近 pot，不重写旧轨签名', url.searchParams.get('signature') === 'fr-own' && url.searchParams.get('lang') === 'fr' && url.searchParams.get('pot') === 'new');
+  const staleTarget = { ...target, url: target.url + '&pot=expired' };
+  check('最新 pot 覆盖轨道表中的旧 pot', new URL(captionUrlFor(staleTarget, renewed, WATCH('V'))!).searchParams.get('pot') === 'new');
+  const variant = captionTrackOf({ languageCode: 'en', xtags: 'variant-one', vssId: 'variant-id' })!;
+  check('播放器描述往返保留 xtags 与独立 vss 身份', captionTrackOf(variant.native)?.id === variant.id);
+  const video = { videoId: 'V', trackId: first, trackLang: 'en', trackKind: 'manual' as const, startMs: 0 };
+  check('旧签名记录与新稳定身份共享句子去重', sentenceId(video, 'Text') === sentenceId({ ...video, trackId: renewed }, 'Text') && isDuplicateVideoContext({ entryKey: 'text', sentence: 'Text', video }, 'text', { ...video, trackId: renewed }, 'Text'));
+  t.resetForVideo('W');
+  check('换视频清掉旧视频凭据和选轨意图', t.tokenSourceUrl === '' && t.selectedTrack === null);
 }
 
 console.log('M1 词汇：规范化与去重');

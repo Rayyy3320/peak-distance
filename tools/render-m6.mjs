@@ -1,5 +1,186 @@
 // 在现有 render-check 浏览器中检查 MAIN/ISOLATED 双轨与取消链路。
 export async function renderM6({ browser, port, content, inject, installStub, check }) {
+  const trackId = (lang, kind = 'asr', name = '') => JSON.stringify([lang, kind, name, '']);
+  const tracksPage = await browser.newPage({ viewport: { width: 720, height: 600 } });
+  await tracksPage.goto(`http://127.0.0.1:${port}/watch?v=tracks01`);
+  await tracksPage.evaluate(installStub);
+  await tracksPage.evaluate(() => {
+    window.__selectedTracks = [];
+    const tracks = ['ar', 'en', 'pt-BR', 'pt-PT', 'fr'].map(lang => ({
+      languageCode: lang, kind: 'asr',
+      baseUrl: `https://www.youtube.com/api/timedtext?v=tracks01&lang=${lang}&kind=asr&signature=${lang}`,
+    }));
+    window.ytInitialPlayerResponse = { videoDetails: { videoId: 'tracks01' }, captions: { playerCaptionsTracklistRenderer: {
+      captionTracks: tracks, defaultAudioTrackIndex: 1,
+      audioTracks: [{ defaultCaptionTrackIndex: 0 }, { defaultCaptionTrackIndex: 1 }],
+    } } };
+    const p = document.getElementById('movie_player');
+    p.loadModule = () => {};
+    p.getOption = (_, key) => key === 'tracklist' ? [] : window.__currentTrack || {};
+    p.setOption = (_, key, value) => {
+      if (window.__deferSelection) window.__pendingNativeTrack = value;
+      else window.__currentTrack = value;
+      window.__selectedTracks.push(value);
+    };
+    window.PerformanceObserver = class {
+      constructor(callback) { this.callback = callback; }
+      observe() { window.__timingReport = name => this.callback({ getEntries: () => [{ name }] }); }
+    };
+    window.fetch = async (input, init = {}) => {
+      const u = new URL(input);
+      const lang = u.searchParams.get('lang');
+      if (window.__failLang === lang) return new Response('', { status: 503 });
+      if (u.searchParams.get('signature') !== lang || !u.searchParams.has('pot')) return new Response('');
+      if (window.__holdLang === lang) await new Promise(resolve => { window.__releaseTrack = resolve; });
+      return Response.json({ events: [{ tStartMs: 0, dDurationMs: 5000, segs: [{ utf8: `Captions ${lang}${u.searchParams.get('name') ? ` ${u.searchParams.get('name')}` : ''}` }] }] });
+    };
+    document.querySelector('video').currentTime = 1;
+  });
+  await tracksPage.addScriptTag({ content: inject });
+  await tracksPage.addScriptTag({ content });
+  await tracksPage.evaluate(() => window.postMessage({ source: 'blc-content', type: 'nudge' }, '*'));
+  const defaultSelected = await tracksPage.waitForFunction(() => window.__currentTrack?.languageCode === 'en', null, { timeout: 1200 }).then(() => true, () => false);
+  check('无选轨时使用当前默认音轨的默认字幕，首项阿拉伯语不被抢选', defaultSelected);
+  await tracksPage.evaluate(() => { void fetch('https://www.youtube.com/api/timedtext?v=tracks01&lang=en&kind=asr&signature=en&pot=valid'); });
+  await tracksPage.waitForFunction(() => document.getElementById('blc-debug')?.getAttribute('data-blc-track-lang') === 'en');
+  await tracksPage.locator('#blc-subs-switch #learning').click();
+  const sourcePicker = tracksPage.getByRole('combobox', { name: '原文字幕语言', exact: true });
+  const pickerExists = await sourcePicker.count() === 1;
+  check('双语菜单提供原文字幕语言选择，并保留地区变体', pickerExists && await sourcePicker.locator('option').allTextContents().then(x => x.length === 6));
+  if (pickerExists) {
+    await sourcePicker.selectOption(trackId('ar'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions ar');
+    check('切换原文语言同步播放器选轨，缓存不发请求时也读取目标自身签名', await tracksPage.evaluate(() => window.__currentTrack.languageCode === 'ar' && document.getElementById('blc-subs').shadowRoot.querySelector('.en').textContent === 'Captions ar'));
+    await sourcePicker.selectOption(trackId('pt-br'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions pt-BR');
+    check('同语言地区变体切换保持完整标签', await tracksPage.evaluate(() => window.__currentTrack.languageCode === 'pt-BR'));
+    await tracksPage.evaluate(() => { window.__failLang = 'fr'; });
+    await sourcePicker.selectOption(trackId('fr'));
+    await tracksPage.getByText('字幕切换失败，请重新选择原文语言', { exact: true }).first().waitFor();
+    check('选轨失败保留可用原文并明确反馈，不伪装为新语言成功', await sourcePicker.inputValue() === trackId('pt-br') && await tracksPage.locator('#blc-subs .en').textContent() === 'Captions pt-BR');
+    await tracksPage.evaluate(() => { window.__failLang = ''; });
+    await sourcePicker.selectOption(trackId('fr'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions fr');
+    check('同一失败目标恢复网络后可重新选择并成功获取', await sourcePicker.inputValue() === trackId('fr'));
+    await tracksPage.evaluate(() => { window.__holdLang = 'ar'; });
+    await sourcePicker.selectOption(trackId('ar'));
+    await tracksPage.waitForFunction(() => !!window.__releaseTrack);
+    await sourcePicker.selectOption(trackId('en'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions en');
+    await tracksPage.evaluate(() => window.__releaseTrack());
+    await tracksPage.waitForTimeout(100);
+    check('连续选轨后迟到旧字幕不能覆盖最新选择', await tracksPage.locator('#blc-subs .en').textContent() === 'Captions en');
+    await tracksPage.evaluate(() => window.__timingReport('https://www.youtube.com/api/timedtext?v=tracks01&lang=ar&kind=asr&signature=ar&pot=late'));
+    await tracksPage.waitForTimeout(100);
+    check('成功选轨后迟到旧原生 Resource Timing 不回退语言', await tracksPage.locator('#blc-subs .en').textContent() === 'Captions en');
+    await tracksPage.evaluate(() => {
+      window.__currentTrack = { languageCode: 'pt-PT', kind: 'asr' };
+    });
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions pt-PT');
+    check('原生缓存换轨没有 timedtext 请求时仍同步原文与选择器', await sourcePicker.inputValue() === trackId('pt-pt'));
+    await tracksPage.evaluate(() => { delete window.__releaseTrack; window.__failLang = ''; });
+    await sourcePicker.selectOption(trackId('ar'));
+    await tracksPage.waitForFunction(() => !!window.__releaseTrack);
+    await tracksPage.evaluate(() => {
+      window.__currentTrack = { languageCode: 'fr', kind: 'asr' };
+    });
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions fr');
+    await tracksPage.evaluate(() => window.__releaseTrack());
+    await tracksPage.waitForTimeout(100);
+    check('扩展切换在途时原生菜单的新选择接管，旧偏好不覆盖', await sourcePicker.inputValue() === trackId('fr') && await tracksPage.locator('#blc-subs .en').textContent() === 'Captions fr');
+    await sourcePicker.selectOption(trackId('en'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions en');
+    await tracksPage.evaluate(() => { window.__deferSelection = true; delete window.__releaseTrack; });
+    await sourcePicker.selectOption(trackId('ar'));
+    await tracksPage.waitForFunction(() => !!window.__releaseTrack);
+    await tracksPage.evaluate(() => window.__timingReport('https://www.youtube.com/api/timedtext?v=tracks01&lang=en&kind=asr&signature=en&pot=old-reading'));
+    await tracksPage.waitForTimeout(100);
+    check('setOption 尚未反映时旧播放器读数不能撤销明确选轨', await sourcePicker.inputValue() === trackId('ar'));
+    await tracksPage.evaluate(() => { window.__currentTrack = window.__pendingNativeTrack; window.__deferSelection = false; window.__releaseTrack(); window.__holdLang = ''; });
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions ar');
+    await tracksPage.evaluate(() => {
+      for (const name of ['First', 'Second']) window.ytInitialPlayerResponse.captions.playerCaptionsTracklistRenderer.captionTracks.push({
+        languageCode: 'en', name: { simpleText: name }, vssId: `.en.${name}`,
+        baseUrl: `https://www.youtube.com/api/timedtext?v=tracks01&lang=en&name=${name}&signature=en`,
+      });
+    });
+    await sourcePicker.selectOption(trackId('en'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions en');
+    await sourcePicker.selectOption(trackId('en', 'manual', 'First'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions en First');
+    await sourcePicker.selectOption(trackId('en', 'manual', 'Second'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions en Second');
+    check('同语言同类型的具名轨道各自可选并同步正确播放器轨道', await tracksPage.evaluate(() => window.__currentTrack.name === 'Second'));
+    await sourcePicker.selectOption(trackId('en'));
+    await tracksPage.waitForFunction(() => document.getElementById('blc-subs')?.shadowRoot?.querySelector('.en')?.textContent === 'Captions en');
+    const beforeRenewal = await tracksPage.evaluate(() => ({ id: document.getElementById('blc-debug').getAttribute('data-blc-track-id'), zh: document.getElementById('blc-subs').shadowRoot.querySelector('.zh')?.textContent }));
+    await tracksPage.evaluate(() => window.__timingReport('https://www.youtube.com/api/timedtext?expire=renewed&signature=renewed&kind=asr&lang=en&v=tracks01&pot=renewed'));
+    await tracksPage.waitForTimeout(100);
+    check('同轨签名续期保留轨道身份和已有译文', await tracksPage.evaluate(before => document.getElementById('blc-debug').getAttribute('data-blc-track-id') === before.id && document.getElementById('blc-subs').shadowRoot.querySelector('.zh')?.textContent === before.zh, beforeRenewal));
+    await sourcePicker.focus();
+    await sourcePicker.press('Escape');
+    await tracksPage.locator('#blc-subs-switch #learning').click();
+    await tracksPage.screenshot({ path: '.upstream/subtitle-language-menu.png' });
+    await tracksPage.clock.install();
+    await tracksPage.evaluate(() => { window.__holdLang = 'ar'; });
+    await sourcePicker.selectOption(trackId('ar'));
+    await tracksPage.clock.runFor(31000);
+    check('已有字幕时切换超时也结束等待并保留原文', await sourcePicker.inputValue() === trackId('en') && await tracksPage.locator('#blc-subs .en').textContent() === 'Captions en' && await tracksPage.getByText('字幕切换失败，请重新选择原文语言', { exact: true }).count() > 0);
+    await tracksPage.evaluate(() => { window.__holdLang = ''; window.__timingReport('https://www.youtube.com/api/timedtext?v=tracks01&lang=ar&kind=asr&signature=ar&pot=after-cancel'); });
+    await tracksPage.clock.runFor(600);
+    check('取消后新捕获不能重新启动已结束的获取', await tracksPage.locator('#blc-subs .en').textContent() === 'Captions en');
+  }
+  await tracksPage.close();
+
+  const nudged = await browser.newPage();
+  await nudged.goto(`http://127.0.0.1:${port}/watch?v=nudge001`);
+  await nudged.clock.install();
+  await nudged.evaluate(() => {
+    window.__currentTrack = { languageCode: 'ar', kind: 'asr' };
+    window.ytInitialPlayerResponse = { videoDetails: { videoId: 'nudge001' }, captions: { playerCaptionsTracklistRenderer: { captionTracks: [{ languageCode: 'ar', kind: 'asr' }, { languageCode: 'en', kind: 'asr' }] } } };
+    const p = document.getElementById('movie_player');
+    p.loadModule = () => {};
+    p.getOption = (_, key) => key === 'track' ? window.__currentTrack : [];
+    p.setOption = (_, key, value) => { window.__currentTrack = value; };
+  });
+  await nudged.addScriptTag({ content: inject });
+  await nudged.evaluate(() => {
+    window.postMessage({ source: 'blc-content', type: 'config', nonce: 1 }, '*');
+    window.postMessage({ source: 'blc-content', type: 'nudge' }, '*');
+  });
+  await nudged.clock.runFor(450);
+  await nudged.evaluate(() => window.postMessage({ source: 'blc-content', type: 'select-track', videoId: 'nudge001', nonce: 2, trackId: JSON.stringify(['en', 'asr', '', '']) }, '*'));
+  await nudged.clock.runFor(800); // 等本次无凭据选轨自己的唤醒完成，再核对最终语言。
+  check('旧字幕唤醒的延迟恢复不能覆盖新的显式语言选择', await nudged.evaluate(() => window.__currentTrack.languageCode === 'en'));
+  await nudged.close();
+
+  const initial = await browser.newPage();
+  await initial.goto(`http://127.0.0.1:${port}/watch?v=initial01`);
+  await initial.evaluate(installStub);
+  await initial.evaluate(() => {
+    window.__failInitial = true;
+    window.__currentTrack = { languageCode: 'en', kind: 'asr' };
+    const tracks = ['', '&kind=asr'].map(kind => ({ languageCode: 'en', kind: kind ? 'asr' : '', baseUrl: `https://www.youtube.com/api/timedtext?v=initial01&lang=en&pot=valid${kind}` }));
+    const p = document.getElementById('movie_player');
+    p.getOption = (_, key) => key === 'track' ? window.__currentTrack : tracks;
+    p.setOption = (_, key, track) => { window.__currentTrack = track; };
+    window.fetch = async url => window.__failInitial ? new Response('', { status: 503 }) : Response.json({ events: [{ tStartMs: 0, dDurationMs: 5000, segs: [{ utf8: new URL(url).searchParams.has('kind') ? 'Automatic' : 'Manual' }] }] });
+    document.querySelector('video').currentTime = 1;
+  });
+  await initial.addScriptTag({ content: inject });
+  await initial.addScriptTag({ content });
+  await initial.getByRole('button', { name: '重试字幕', exact: true }).waitFor();
+  check('首次当前自动轨与同语言人工轨并存时选择人工轨', await initial.evaluate(() => window.__currentTrack.kind === ''));
+  await initial.evaluate(() => { window.__failInitial = false; });
+  await initial.getByRole('button', { name: '重试字幕', exact: true }).click();
+  await initial.locator('#blc-subs .en').filter({ hasText: 'Manual' }).waitFor();
+  check('首屏失败后的重试为相同轨道重新获取', true);
+  await initial.locator('#blc-subs-switch #learning').click();
+  await initial.getByRole('combobox', { name: '原文字幕语言', exact: true }).selectOption(trackId('en'));
+  await initial.locator('#blc-subs .en').filter({ hasText: 'Automatic' }).waitFor();
+  check('首次人工优先之后仍尊重明确选择自动轨', await initial.evaluate(() => window.__currentTrack.kind === 'asr'));
+  await initial.close();
+
   // 真实双入口；只替换网络和播放器轨道表，复现首轨抢选与令牌刷新时序。
   const loading = await browser.newPage();
   await loading.goto(`http://127.0.0.1:${port}/watch?v=loading01`);

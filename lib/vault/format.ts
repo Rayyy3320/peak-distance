@@ -26,6 +26,7 @@
 import { DEFAULT_COMPREHENSION_LANG, isLanguageTag, type LanguageTag } from '@/shared/languages';
 import {
   collapseWhitespace,
+  sentenceId,
   isVocabStatus,
   type ContextExplanation,
   type LearningResult,
@@ -772,7 +773,7 @@ export type VocabRecordWithNote = VaultVocabRecord & { note?: string | null };
 function contextIdentity(c: VaultVocabContext): string {
   const sentence = collapseWhitespace(c.sentence);
   if (c.sourceType === 'video' && c.video) {
-    return JSON.stringify(['video', c.video.videoId, c.video.trackId, c.video.startMs, sentence]);
+    return `video:${sentenceId(c.video, sentence)}`;
   }
   return JSON.stringify(['web', c.url, sentence]);
 }

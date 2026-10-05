@@ -9,8 +9,7 @@ import type { Settings } from '@/shared/settings';
 // YouTube 隔离世界：字幕、页内学习侧栏、查词与播放控制。
 //
 // 职责（M0 嗅探链路之上）：
-//   1. 与 MAIN world 嗅探脚本互通（config / nudge / tracklist / prefer），
-//      沿用播放器当前轨道；拿到字幕后才尝试同语言人工轨道；
+//   1. 与 MAIN world 嗅探脚本互通，展示可用轨道并提交选轨意图；
 //   2. 用 video.currentTime 定位当前句渲染双语字幕栏（ASR 滚动合并），
 //      暂停 / 拖动 / 倍速后按时间重新定位；
 //   3. 常规中文优先轨道 / 平台 / Google；显式 AI 按当前窗口小批量请求。
@@ -27,6 +26,7 @@ import type { Settings } from '@/shared/settings';
 // 沿用 Gythiro yt-dual-subs（MIT）的获取链路思路，见 docs/REFERENCES.md。
 
 import { videoIdFromLocation } from '@/shared/youtube';
+import { captionTrackOf, trackOfUrl, type SubtitleTrack as TrackInfo } from '@/shared/subtitleTracker';
 import {
   CONTENT_SOURCE,
   INJECT_SOURCE,
@@ -63,11 +63,6 @@ const NATIVE_CAPTIONS_HIDE_STYLE_ID = 'blc-hide-native-captions';
 // 全屏字幕栏定位（整体赋值，防止随字幕重绘追加增长；--blc-font 单独 setProperty）
 const SUBS_FULLSCREEN_CSS = 'position:absolute;left:4%;right:4%;bottom:76px;z-index:60;';
 
-interface TrackInfo {
-  lang: string; // 基础语言码（en / zh …）
-  kind: 'manual' | 'asr';
-}
-
 export default defineContentScript({
   matches: ['https://www.youtube.com/*'],
   runAt: 'document_idle',
@@ -84,7 +79,7 @@ export default defineContentScript({
     let lastTrackLang = '';
     let lastTrackId = '';
     let tracklist: TrackInfo[] = [];
-    let preferTried = false;
+    let pendingTrack: TrackInfo | null = null;
     let notice = '';
     let nocuesReason = '';
     let nocuesRetries = 0;
@@ -334,19 +329,22 @@ export default defineContentScript({
       }
     }
 
-    function sendConfig(): void {
+    function sendConfig(target?: TrackInfo): void {
       if (!currentVideoId) return; // 非视频页不请求
       nonce++;
+      armAcquisitionTimer();
+      postToInject(target ? { type: 'select-track', nonce, videoId: currentVideoId, trackId: target.id } : { type: 'config', nonce });
+    }
+
+    function armAcquisitionTimer(): void {
       // 覆盖整个首屏获取，包括 MAIN 未响应；自动恢复不能延长这份预算。
-      if (!cues.length && !acquisitionTimer) {
+      if ((!cues.length || pendingTrack) && !acquisitionTimer) {
         acquisitionTimer = setTimeout(() => {
           acquisitionTimer = null;
-          if (cues.length) return;
-          postToInject({ type: 'source-cancel', nonce });
+          if (cues.length && !pendingTrack) return;
           failAcquisition('acquisition-timeout');
         }, 30000);
       }
-      postToInject({ type: 'config', nonce });
     }
 
     function clearAcquisitionTimer(): void {
@@ -356,8 +354,10 @@ export default defineContentScript({
 
     function failAcquisition(reason: string): void {
       clearAcquisitionTimer();
+      postToInject({ type: 'source-cancel', nonce });
       nocuesReason = reason;
-      notice = reason.includes('timeout') ? '字幕获取超时' : reason === 'no-timedtext-seen' ? '未捕获到字幕，请确认此视频已开启字幕' : '字幕获取失败';
+      notice = pendingTrack ? '字幕切换失败，请重新选择原文语言' : reason.includes('timeout') ? '字幕获取超时' : reason === 'no-timedtext-seen' ? '未捕获到字幕，请确认此视频已开启字幕' : '字幕获取失败';
+      pendingTrack = null;
       log('subtitle-error', { reason });
       renderBar();
     }
@@ -366,27 +366,8 @@ export default defineContentScript({
       postToInject({ type: 'nudge' });
     }
 
-    function sendPrefer(lang: string, kind: 'manual' | 'asr'): void {
-      postToInject({ type: 'prefer', nonce, lang, kind });
-    }
-
     function baseLang(s: string): string {
       return (s || '').split('-')[0]!.toLowerCase();
-    }
-
-    /** 沿用播放器当前轨道；有原文后才尝试同语言人工轨道。 */
-    function evaluateTrackPreference(): void {
-      if (!tracklist.length || preferTried) return;
-      const cur = baseLang(lastTrackLang);
-      if (cues.length > 0) {
-        // 已有产出：仅当同语言存在人工轨且当前是自动轨时升级
-        const sameManual = tracklist.find((t) => t.kind === 'manual' && baseLang(t.lang) === cur);
-        if (lastTrack === 'manual' || !sameManual) return;
-        preferTried = true;
-        sendPrefer(sameManual.lang, 'manual');
-        log('prefer', { lang: sameManual.lang, kind: 'manual' });
-        return;
-      }
     }
 
     // ---- 打开 YouTube 原生 CC（嗅探需要播放器发出 timedtext 请求） --------------
@@ -425,25 +406,6 @@ export default defineContentScript({
       else if (cc.getAttribute('aria-pressed') === 'true') ccDiag = 'on';
       else ccDiag = 'off';
       renderBadge();
-    }
-
-    function rearmCaptions(): boolean {
-      const vid = currentVideoId;
-      const player = document.getElementById('movie_player');
-      const cc = player?.querySelector('.ytp-subtitles-button');
-      if (!cc) return false;
-      if (cc.getAttribute('aria-disabled') === 'true') return false;
-      if (cc.getAttribute('aria-pressed') !== 'true') return false;
-      (cc as HTMLElement).click(); // 关
-      setTimeout(() => {
-        if (vid !== currentVideoId || !bilingualOn) return;
-        const p2 = document.getElementById('movie_player');
-        const cc2 = p2?.querySelector('.ytp-subtitles-button');
-        if (cc2 && cc2.getAttribute('aria-pressed') !== 'true') {
-          (cc2 as HTMLElement).click(); // 开
-        }
-      }, 250);
-      return true;
     }
 
     /** 关闭双语：恢复播放器原字幕显示（去掉我方隐藏样式）。 */
@@ -499,7 +461,7 @@ export default defineContentScript({
           button:focus-visible,select:focus-visible { outline:2px solid #8ab4f8; }
           #learning { background:transparent; border:0; padding:0 12px; height:100%; }
           ${brandTokens}
-          #menu { color:var(--pd-ink);position:absolute; right:0; bottom:calc(100% + 12px); width:280px; background:var(--pd-paper); border:1px solid var(--pd-line); border-radius:8px; padding:12px; box-shadow:0 6px 24px #0008; }
+          #menu { color:var(--pd-ink);position:absolute; right:0; bottom:calc(100% + 12px); width:280px; box-sizing:border-box; max-height:calc(var(--blc-player-height,360px) - 72px); overflow-y:auto; background:var(--pd-paper); border:1px solid var(--pd-line); border-radius:8px; padding:12px; box-shadow:0 6px 24px #0008; }
           [hidden] { display:none!important; } label { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:7px 0; } small { color:var(--pd-muted); } #menu button,#menu select { background:var(--pd-surface);border-color:var(--pd-line);color:var(--pd-ink); } #menu input {accent-color:var(--pd-blue)}
           .menu-actions {display:grid;grid-template-columns:1fr auto;gap:8px;padding-bottom:12px;margin-bottom:4px;border-bottom:1px solid var(--pd-line)}
           .menu-actions button {display:flex;align-items:center;justify-content:center;gap:8px;min-height:38px;padding:7px 12px;border-radius:7px;font-size:13px;box-sizing:border-box}
@@ -514,6 +476,8 @@ export default defineContentScript({
             <button id="settings" aria-label="打开设置" title="打开设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h3m4 0h9M4 17h9m4 0h3"/><circle cx="9" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></svg><span>设置</span></button>
           </div>
           <label>双语字幕<input id="bilingual" type="checkbox"></label><label>显示中文<input id="chinese" type="checkbox"></label>
+          <label>原文语言<select id="source-track" aria-label="原文字幕语言" style="max-width:180px"></select></label>
+          <small id="source-track-status" role="status"></small>
           <label>本视频翻译<select id="translation-mode" aria-label="本视频翻译方式"><option value="regular">常规</option><option value="ai">AI（LLM）</option></select></label>
           <small>默认方式在设置中修改</small>
           <label>字幕字号<select id="size" aria-label="字幕字号"><option value="small">小</option><option value="standard">标准</option><option value="large">大</option></select></label>
@@ -534,6 +498,16 @@ export default defineContentScript({
           void send({ type:'setSetting', name:'chineseVisible', value:zhVisible }); renderBar();
         });
         root.querySelector('#translation-mode')!.addEventListener('change', e => void setTranslationMode((e.target as HTMLSelectElement).value as 'regular' | 'ai'));
+        root.querySelector('#source-track')!.addEventListener('change', e => {
+          const target = tracklist.find(t => t.id === (e.target as HTMLSelectElement).value);
+          if (!target) return;
+          pendingTrack = target;
+          notice = ''; nocuesReason = '';
+          stopTranslation();
+          clearAcquisitionTimer();
+          sendConfig(target);
+          renderBar();
+        });
         root.querySelector('#size')!.addEventListener('change', e => {
           settings.subtitleSize = (e.target as HTMLSelectElement).value as Settings['subtitleSize'];
           notePendingSettingWrite('subtitleSize', settings.subtitleSize);
@@ -548,7 +522,23 @@ export default defineContentScript({
       }
       if (host.parentElement !== parent) parent.append(host);
       host.style.cssText = parent === playerRoot() ? 'position:absolute;right:100px;bottom:10px;z-index:66;height:32px;' : '';
+      host.style.setProperty('--blc-player-height', `${playerRoot().getBoundingClientRect().height}px`);
       const root = host.shadowRoot!;
+      const sourceTrack = root.querySelector<HTMLSelectElement>('#source-track')!;
+      const tracks = [...tracklist];
+      const currentTrack = trackOfUrl(lastTrackId) ?? captionTrackOf({ languageCode: lastTrackLang, kind: lastTrack === 'asr' ? 'asr' : '' });
+      if (currentTrack && !tracks.some(t => t.id === currentTrack.id)) tracks.push(currentTrack);
+      const trackKey = JSON.stringify(tracks);
+      if (sourceTrack.dataset.tracks !== trackKey) {
+        sourceTrack.replaceChildren(new Option('沿用播放器', ''));
+        for (const t of tracks) sourceTrack.add(new Option(`${langDisplayName(t.lang)}（${t.kind === 'asr' ? '自动' : '人工'}）${t.name ? ` · ${t.label || t.name}` : ''}`, t.id));
+        sourceTrack.dataset.tracks = trackKey;
+      }
+      sourceTrack.value = pendingTrack?.id ?? currentTrack?.id ?? '';
+      if (sourceTrack.selectedIndex < 0) sourceTrack.value = '';
+      sourceTrack.options[0]!.disabled = true;
+      sourceTrack.disabled = !tracks.length;
+      root.querySelector('#source-track-status')!.textContent = pendingTrack ? '正在切换原文字幕…' : notice;
       if (!modeBusy) (root.querySelector('#translation-mode') as HTMLSelectElement).value = translationMode;
       (root.querySelector('#translation-mode') as HTMLSelectElement).disabled = modeBusy || !modeReady;
       if (!modeBusy) (root.querySelector('#ap') as HTMLInputElement).checked = autoPause;
@@ -761,7 +751,6 @@ export default defineContentScript({
           retry.addEventListener('click', () => {
             notice = ''; nocuesReason = ''; nocuesRetries = 0;
             sendConfig();
-            rearmCaptions(); // 让播放器刷新失效签名/令牌，而非只重放旧 URL。
             ensureCaptionsOn(20);
             sendNudge();
             renderBar();
@@ -884,7 +873,8 @@ export default defineContentScript({
     async function toggleSentence(index: number): Promise<void> {
       const cue = cues[index]; if (!cue) return;
       const video = videoRef(index), id = sentenceId(video, cue.text);
-      const r = await send<{ ok:boolean }>(sentences.some(s => s.id === id) ? { type:'deleteSentence', id } : {
+      const existing = sentences.find(s => sentenceId(s.video, s.text) === id);
+      const r = await send<{ ok:boolean }>(existing ? { type:'deleteSentence', id: existing.id } : {
         type:'saveSentence', sentence:{ id, video, text:cue.text, zh:translations.get(index), translationSource:translationSources.get(index),
           ...(lastTrackLang ? { language: lastTrackLang } : {}),
           endMs:cue.start + cue.dur, title:document.title, createdAt:Date.now() },
@@ -1124,7 +1114,7 @@ export default defineContentScript({
         bindPlayListener();
         const t = v.currentTime * 1000;
         let idx = cueIndexAt(cues, t);
-        if (autoPause && !v.paused && !v.seeking) {
+        if (autoPause && !pendingTrack && !v.paused && !v.seeking) {
           if (apIndex >= 0 && t >= cueEnd(cues, apIndex)) {
             apDisplayIndex = apIndex; apLastStopped = apIndex; apIndex = -1;
             apHeld = true; pausedByUsVideo = null; v.pause();
@@ -1196,12 +1186,7 @@ export default defineContentScript({
     }
 
     function captionCacheKey(): string {
-      // 缓存随目标语言区分（默认 zh 与旧 'youtube-zh' 键一致，老缓存继续可用）
-      const target = baseLang(targetLangOf());
-      try {
-        const p = new URL(lastTrackId).searchParams;
-        return JSON.stringify([currentVideoId, p.get('lang'), p.get('kind'), p.get('name'), p.get('vssId'), `youtube-${target}`]);
-      } catch { return `${currentVideoId}|${lastTrackId}|youtube-${target}`; }
+      return JSON.stringify([currentVideoId, lastTrackId, targetLangOf()]);
     }
 
     function requestPlatform(): void {
@@ -1231,7 +1216,7 @@ export default defineContentScript({
     }
 
     function scheduleTranslate(): void {
-      if (!settingsReady || !modeReady || modeBusy || !bilingualOn || !zhVisible || translating || currentIdx < 0) return;
+      if (pendingTrack || !settingsReady || !modeReady || modeBusy || !bilingualOn || !zhVisible || translating || currentIdx < 0) return;
       if (!cues.length || !currentVideoId || !lastTrackId) return;
       const session = `${currentVideoId}|${lastTrackId}|${translationMode}`;
       if (session !== translateSession) translateSession = session;
@@ -1441,7 +1426,7 @@ export default defineContentScript({
       lastTrackLang = '';
       lastTrackId = '';
       tracklist = [];
-      preferTried = false;
+      pendingTrack = null;
       notice = '';
       nocuesReason = '';
       nocuesRetries = 0;
@@ -1498,6 +1483,15 @@ export default defineContentScript({
           return;
         }
 
+        if (d.type === 'track-selected') {
+          if (d.track && (pendingTrack || cues.length)) {
+            pendingTrack = d.track;
+            stopTranslation();
+            clearAcquisitionTimer(); armAcquisitionTimer();
+            renderBar();
+          }
+          return;
+        }
         if (d.type === 'translation') {
           if (d.requestId !== platformRequest || d.trackId !== lastTrackId || translationMode !== 'regular') return;
           if (platformTimer) clearTimeout(platformTimer);
@@ -1510,14 +1504,9 @@ export default defineContentScript({
         }
 
         if (d.type === 'tracklist' && Array.isArray(d.tracks)) {
-          tracklist = (d.tracks as { lang?: unknown; kind?: unknown }[])
-            .filter((t) => typeof t.lang === 'string')
-            .map((t) => ({
-              lang: baseLang(String(t.lang)),
-              kind: t.kind === 'asr' ? 'asr' : 'manual',
-            }));
+          tracklist = d.tracks.filter(t => typeof t.id === 'string' && typeof t.lang === 'string');
           log('tracklist', { count: tracklist.length, tracks: tracklist });
-          evaluateTrackPreference();
+          renderBar();
           return;
         }
 
@@ -1536,6 +1525,7 @@ export default defineContentScript({
           cues = kind === 'asr' ? normalizeAsrCues(d.cues as Cue[]) : d.cues as Cue[];
           if (!cues.length) { failAcquisition('empty-track'); return; }
           clearAcquisitionTimer();
+          pendingTrack = null;
           if (bilingualOn) hideNativeCaptions();
           lastTrack = kind;
           lastTrackLang = lang;
@@ -1546,7 +1536,6 @@ export default defineContentScript({
           if (typeof d.seen === 'number') sawTimedtext = d.seen;
           // M11：非英文原文字幕是合法轨道，按实际语言继续（不强切英语）
           notice = '';
-          evaluateTrackPreference();
           log('cues', {
             videoId: d.videoId,
             track: `${lastTrackLang}(${lastTrack})`,
@@ -1558,7 +1547,8 @@ export default defineContentScript({
           return;
         }
         if (d.type === 'nocues') {
-          // 已有当前视频字幕（如英文轨道偏好切换失败回退）：保留现状
+          if (pendingTrack) { failAcquisition(d.reason || 'track-selection-failed'); return; }
+          // 已有当前视频字幕：保留现状。
           if (cues.length) {
             if (typeof d.seen === 'number') sawTimedtext = d.seen;
             log('nocues-ignored-have-cues', { reason: d.reason });
@@ -1571,14 +1561,13 @@ export default defineContentScript({
           if (nocuesReason === 'no-timedtext-seen' && nocuesRetries++ < 1) {
             const retryNonce = nonce;
             const retryVideo = currentVideoId;
-            const rearmed = rearmCaptions();
             sendNudge(); // 播放器 API 强制选轨
             setTimeout(() => {
               if (nonce !== retryNonce || currentVideoId !== retryVideo || cues.length || notice) return;
               sendConfig();
               ensureCaptionsOn(20);
             }, 800);
-            log('nocues-retry', { attempt: nocuesRetries, rearmed });
+            log('nocues-retry', { attempt: nocuesRetries });
           } else {
             failAcquisition(nocuesReason);
           }
