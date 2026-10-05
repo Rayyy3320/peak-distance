@@ -277,11 +277,12 @@ function renderEntry(entry: EntryView): HTMLElement {
 
   // 个人笔记（学习库“我的笔记”同源；就地编辑，正常保存给就近状态）
   const noteBox = el('details', 'note-box');
+  if (entry.note) noteBox.open = true;
   const noteSummary = el('summary', undefined, entry.note ? '我的笔记' : '添加笔记');
   noteBox.appendChild(noteSummary);
   const noteArea = document.createElement('textarea');
   noteArea.value = entry.note ?? '';
-  noteArea.placeholder = '写下自己的理解（同步到学习库“我的笔记”，Obsidian 中可直接编辑）';
+  noteArea.placeholder = '写下自己的理解';
   noteArea.setAttribute('aria-label', `${entry.expression} 我的笔记`);
   const noteState = el('p', 'hint');
   const noteSave = el('button', 'ghost', '保存笔记');

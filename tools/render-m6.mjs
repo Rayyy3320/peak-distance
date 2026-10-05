@@ -1,5 +1,78 @@
 // 在现有 render-check 浏览器中检查 MAIN/ISOLATED 双轨与取消链路。
 export async function renderM6({ browser, port, content, inject, installStub, check }) {
+  // 真实双入口；只替换网络和播放器轨道表，复现首轨抢选与令牌刷新时序。
+  const loading = await browser.newPage();
+  await loading.goto(`http://127.0.0.1:${port}/watch?v=loading01`);
+  await loading.evaluate(installStub);
+  await loading.evaluate(() => {
+    window.__requests = [];
+    window.__messages = [];
+    window.__sourceAborted = 0;
+    window.addEventListener('message', e => {
+      if (e.data?.source === 'blc-inject') window.__messages.push(e.data);
+    });
+    window.ytInitialPlayerResponse = {
+      videoDetails: { videoId: 'loading01' },
+      captions: { playerCaptionsTracklistRenderer: { captionTracks: [
+        { languageCode: 'ar', kind: 'asr' }, { languageCode: 'en', kind: 'asr' },
+      ] } },
+    };
+    window.fetch = async (input, init = {}) => {
+      const u = new URL(input);
+      window.__requests.push(u.toString());
+      if (window.__failSource) return new Response('');
+      if (window.__requireFresh && u.searchParams.get('pot') !== 'renewed') return new Response('');
+      if (u.searchParams.get('lang') !== 'en') return new Response('');
+      if (!u.searchParams.has('pot')) {
+        // 旧无令牌请求卡住，新令牌请求必须能立即接管。
+        return new Promise((resolve, reject) => {
+          init.signal?.addEventListener('abort', () => { window.__sourceAborted++; reject(new DOMException('abort', 'AbortError')); }, { once: true });
+        });
+      }
+      return Response.json({ events: [{ tStartMs: 0, dDurationMs: 5000, segs: [{ utf8: 'Current English captions.' }] }] });
+    };
+    document.querySelector('video').currentTime = 1;
+  });
+  await loading.addScriptTag({ content: inject });
+  await loading.addScriptTag({ content });
+  await loading.waitForFunction(() => document.getElementById('blc-debug')?.getAttribute('data-blc-log')?.includes('tracklist'));
+  await loading.evaluate(() => { void fetch('https://www.youtube.com/api/timedtext?v=loading01&lang=en&kind=asr&fmt=json3').catch(() => {}); });
+  await loading.waitForFunction(() => window.__requests.length >= 2);
+  await loading.evaluate(() => { void fetch('https://www.youtube.com/api/timedtext?v=loading01&lang=en&kind=asr&fmt=json3&pot=fresh'); });
+  const recovered = await loading.waitForFunction(() => document.getElementById('blc-debug')?.getAttribute('data-blc-count') === '1', null, { timeout: 4000 }).then(() => true, () => false);
+  check('字幕首轨不是当前语言时不抢选；有效令牌立即接管旧请求', recovered, JSON.stringify(await loading.evaluate(() => ({ requests: window.__requests.map(s => { const u = new URL(s); return `${u.searchParams.get('lang')}:${u.searchParams.has('pot')}`; }), notice: document.getElementById('blc-subs')?.shadowRoot?.querySelector('.notice')?.textContent }))));
+  check('新来源取消旧请求', await loading.evaluate(() => window.__sourceAborted === 1));
+
+  await loading.evaluate(() => {
+    window.__failSource = true;
+    history.pushState({}, '', '/watch?v=loading02');
+    window.dispatchEvent(new Event('yt-navigate-finish'));
+  });
+  await loading.waitForFunction(() => document.getElementById('blc-debug')?.getAttribute('data-blc-video') === 'loading02');
+  await loading.evaluate(() => { void fetch('https://www.youtube.com/api/timedtext?v=loading02&lang=en&kind=asr&pot=valid'); });
+  await loading.getByRole('button', { name: '重试字幕', exact: true }).waitFor();
+  check('空响应结束 loading 并保留原生字幕', await loading.evaluate(() => !document.getElementById('blc-hide-native-captions') && document.getElementById('blc-debug').getAttribute('data-blc-count') === ''));
+  await loading.evaluate(() => {
+    window.__failSource = false;
+    window.__requireFresh = true;
+    document.querySelector('.ytp-subtitles-button').addEventListener('click', e => {
+      if (e.currentTarget.getAttribute('aria-pressed') === 'true') void fetch('https://www.youtube.com/api/timedtext?v=loading02&lang=en&kind=asr&pot=renewed');
+    });
+  });
+  await loading.getByRole('button', { name: '重试字幕', exact: true }).click();
+  await loading.waitForFunction(() => document.getElementById('blc-debug')?.getAttribute('data-blc-count') === '1');
+  check('点击重试使播放器刷新失效来源并恢复当前视频字幕', await loading.getByRole('button', { name: '重试字幕', exact: true }).count() === 0);
+  await loading.close();
+
+  const silent = await browser.newPage();
+  await silent.goto(`http://127.0.0.1:${port}/watch?v=silent01`);
+  await silent.clock.install();
+  await silent.evaluate(installStub);
+  await silent.addScriptTag({ content }); // MAIN 未注入/无响应
+  await silent.clock.runFor(31000);
+  check('MAIN 无响应也在整体截止时间结束等待并可重试', await silent.getByRole('button', { name: '重试字幕', exact: true }).isVisible());
+  await silent.close();
+
   for (const kind of ['manual', 'asr', 'missing']) {
     const page = await browser.newPage({ viewport: { width: 720, height: 420 } });
     await page.goto(`http://127.0.0.1:${port}/watch?v=m6test01`);

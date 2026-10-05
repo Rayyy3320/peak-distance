@@ -104,7 +104,7 @@ export class SubtitleSourceTracker {
   /** 地址已变而轮询未跑时先对齐身份，返回对齐后的视频 ID。 */
   syncVideo(locationHref: string): string {
     const v = videoIdFromUrl(locationHref);
-    if (v && v !== this.currentVideoId) this.currentVideoId = v;
+    this.resetForVideo(v);
     return this.currentVideoId;
   }
 
@@ -113,7 +113,7 @@ export class SubtitleSourceTracker {
    * 的关键：捕获先于 config 到达时，重置不能把刚抓到的来源清掉。
    */
   resetForVideo(newVideoId: string): boolean {
-    if (!newVideoId || newVideoId === this.currentVideoId) return false;
+    if (newVideoId === this.currentVideoId) return false;
     this.currentVideoId = newVideoId;
     if (this.sourceVid !== newVideoId) {
       this.sourceUrl = '';

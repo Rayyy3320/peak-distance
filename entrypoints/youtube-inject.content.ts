@@ -59,53 +59,26 @@ export default defineContentScript({
     // 比 finally 晚，因此计数保留一段时间再清除。
     const selfUrls = new Map<string, number>();
     const SELF_URL_LINGER_MS = 5000;
-    const TT_FETCH_TIMEOUT_MS = 20000;
-    const RETRY_DELAYS_MS = [300, 800];
+    const TT_FETCH_TIMEOUT_MS = 12000;
 
     async function fetchJson3(url: string, signal?: AbortSignal): Promise<any> {
       selfUrls.set(url, (selfUrls.get(url) || 0) + 1);
-      let res: Response;
       try {
-        res = await fetch(url, {
+        const res = await fetch(url, {
           method: 'GET',
           credentials: 'include',
-          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(12000)]) : AbortSignal.timeout(TT_FETCH_TIMEOUT_MS),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(TT_FETCH_TIMEOUT_MS)]) : AbortSignal.timeout(TT_FETCH_TIMEOUT_MS),
         });
+        if (!res.ok) throw new Error(`timedtext http ${res.status}`);
+        const txt = await res.text();
+        if (!txt) throw new Error('timedtext empty body');
+        return JSON.parse(txt);
       } finally {
         setTimeout(() => {
           const n = (selfUrls.get(url) || 1) - 1;
           if (n > 0) selfUrls.set(url, n);
           else selfUrls.delete(url);
         }, SELF_URL_LINGER_MS);
-      }
-      if (!res.ok) {
-        const err = new Error(`timedtext http ${res.status}`);
-        (err as any).status = res.status;
-        throw err;
-      }
-      const txt = await res.text();
-      if (!txt) throw new Error('timedtext empty body');
-      return JSON.parse(txt);
-    }
-
-    // 只重试“偶发”失败（网络错误/空响应/坏 JSON/429/5xx）；
-    // 其余 4xx 是明确答复，不值得再花两次请求。
-    function isHiccup(err: unknown): boolean {
-      const s = (err as any)?.status;
-      if (typeof s !== 'number') return true;
-      return s === 429 || s >= 500;
-    }
-
-    async function fetchJson3Retry(url: string, wantVid: string): Promise<any> {
-      for (let i = 0; ; i++) {
-        try {
-          return await fetchJson3(url);
-        } catch (err) {
-          if (i >= RETRY_DELAYS_MS.length || !isHiccup(err)) throw err;
-          await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[i]));
-          // 重试期间已导航离开：结果本就会被丢弃，下一个视频的产出已在路上。
-          if (wantVid && wantVid !== tracker.currentVideoId) throw err;
-        }
       }
     }
 
@@ -197,41 +170,18 @@ export default defineContentScript({
         nocuesTimer = null;
         if (vid !== tracker.currentVideoId) return;
         if (nonceAtArm !== reqNonce) return;
-        if (tracker.sourceUrl) return; // 捕获与计时器竞争 —— 一切正常
+        if (tracker.hasCurrentSource()) return;
         post('nocues', nonceAtArm, { reason: 'no-timedtext-seen' });
       }, 6000);
     }
 
-    // ---- 产出字幕（同一时刻只允许一个在跑，并发请求排队） ---------------------
+    // ---- 产出字幕（新来源/配置取消旧请求，不让旧视频阻塞当前视频） ------------
 
     let englishSource: { src: string; videoId: string; trackId: string; cues: Cue[]; kind: string } | null = null;
     let chineseController: AbortController | null = null;
-    let producing = false;
-    let produceAgain = false;
-    let produceAgainForce = false;
+    let sourceController: AbortController | null = null;
 
     async function produceCues(force: boolean): Promise<void> {
-      if (producing) {
-        // 排队而不是丢弃：换视频期间上一个产出还在途时，新视频的捕获不能丢。
-        produceAgain = true;
-        if (force) produceAgainForce = true;
-        return;
-      }
-      producing = true;
-      try {
-        await produceCuesOnce(force);
-      } finally {
-        producing = false;
-        if (produceAgain) {
-          produceAgain = false;
-          const again = produceAgainForce;
-          produceAgainForce = false;
-          void produceCues(again);
-        }
-      }
-    }
-
-    async function produceCuesOnce(force: boolean): Promise<void> {
       // 开始即固定来源与轨道身份：此后所有读取只用固定值（时序 B）。
       const pinned = tracker.pinForProduce();
       if (!cfg || !pinned) return;
@@ -240,23 +190,26 @@ export default defineContentScript({
       const src = prefer ? buildVariantUrl(pinned.src, prefer) : pinned.src;
       // 捕获的源 URL 必须属于当前视频。
       if (!force && tracker.producedForUrl === src) return;
+      sourceController?.abort();
+      const controller = new AbortController();
+      sourceController = controller;
       tracker.producedForUrl = src;
       clearNocuesTimer();
 
       const vid = tracker.currentVideoId;
       // nonce 在产出开始时定格：并发产出的回复必须对准各自的请求。
       const myNonce = reqNonce;
+      const stale = () => controller.signal.aborted || myNonce !== reqNonce || vid !== videoIdFromLocation() || tracker.staleAfterFetch(pinned.trackKey);
       const kind = prefer
         ? prefer.kind
         : trackKindOf(src, location.href);
       const lang = prefer ? prefer.lang : trackLangOf(src, location.href);
       try {
-        const json = await fetchJson3Retry(buildJson3Url(src, location.href), vid);
+        const json = await fetchJson3(buildJson3Url(src, location.href), controller.signal);
         // 拉取期间轨道或视频已变 —— 旧结果整体丢弃，不带新元数据发出。
-        if (tracker.staleAfterFetch(pinned.trackKey)) return;
+        if (stale()) return;
         const cues = parseJson3(json);
         if (!cues.length) {
-          if (tracker.staleAfterFetch(pinned.trackKey)) return;
           tracker.producedForUrl = ''; // 轨道稍后可能产出内容，允许重试
           if (prefer) {
             pendingPrefer = null; // 偏好轨道不存在：让原轨道自然产出
@@ -275,15 +228,15 @@ export default defineContentScript({
           trackLang: lang,
           trackId: normTrackKey(src, location.href),
         });
-      } catch {
-        if (tracker.staleAfterFetch(pinned.trackKey)) return;
+      } catch (err) {
+        if (stale()) return;
         tracker.producedForUrl = ''; // 允许下次捕获时重试
         if (prefer) {
           pendingPrefer = null;
           post('nocues', myNonce, { reason: 'prefer-fetch-failed' });
           return;
         }
-        post('nocues', myNonce, { reason: 'fetch-failed' });
+        post('nocues', myNonce, { reason: (err as Error)?.name === 'TimeoutError' ? 'fetch-timeout' : 'fetch-failed' });
       }
     }
 
@@ -343,11 +296,16 @@ export default defineContentScript({
     // 记录在途看到的 timedtext URL。
     function noteTimedtext(url: unknown): void {
       try {
-        seenTimedtext++;
         if (!isTimedtextUrl(url)) return;
         if (selfUrls.has(url as string)) return; // 这是我方自己的请求
+        seenTimedtext++;
+        const previousVideo = tracker.currentVideoId;
         const result = tracker.noteTimedtext(url as string, location.href);
-        if (result === 'new') onSourceCaptured();
+        if (previousVideo !== tracker.currentVideoId) {
+          sourceController?.abort(); chineseController?.abort(); englishSource = null; pendingPrefer = null;
+        }
+        // 同轨道从无 pot 到有效 pot 是来源修复；不能只存 URL 却继续等旧请求。
+        if (result === 'new' || (result === 'refresh' && englishSource?.trackId !== tracker.sourceKey)) onSourceCaptured();
       } catch {
         /* never throw */
       }
@@ -454,6 +412,7 @@ export default defineContentScript({
 
     function postTracklist(nonceAtConfig: number, attempt = 0): void {
       try {
+        if (!cfg || nonceAtConfig !== reqNonce) return;
         const p = activePlayer() as any;
         const list = p ? captionTracksOf(p) : null;
         if (!list && attempt < 3) {
@@ -476,7 +435,9 @@ export default defineContentScript({
     setInterval(() => {
       try {
         const v = videoIdFromLocation();
-        if (v && tracker.resetForVideo(v)) { chineseController?.abort(); englishSource = null; }
+        if (tracker.resetForVideo(v)) {
+          sourceController?.abort(); chineseController?.abort(); englishSource = null; pendingPrefer = null;
+        }
       } catch {
         /* never throw */
       }
@@ -490,12 +451,21 @@ export default defineContentScript({
         const d = evt.data;
         if (!d || d.source !== CONTENT_SOURCE) return;
 
+        if (d.type === 'source-cancel') {
+          if (d.nonce !== reqNonce) return;
+          sourceController?.abort();
+          clearNocuesTimer();
+          return;
+        }
+
         if (d.type === 'translation-cancel') { chineseController?.abort(); return; }
         if (d.type === 'translation-request') {
           if (d.videoId === videoIdFromLocation() && typeof d.requestId === 'string' && typeof d.trackId === 'string') void produceChinese(d.requestId, d.trackId, reqNonce, typeof d.targetLang === 'string' ? d.targetLang : 'zh-Hans');
           return;
         }
         if (d.type === 'bye') {
+          sourceController?.abort();
+          clearNocuesTimer();
           chineseController?.abort();
           // 扩展已重载/移除：不再为一个已经不在的监听者拉取字幕。
           cfg = false;
@@ -522,6 +492,8 @@ export default defineContentScript({
           // config 是权威的导航信号：resetForVideo 保留已属于当前视频的来源
           //（时序 A），不靠 nudge 重抓。
           tracker.resetForVideo(videoIdFromLocation());
+          sourceController?.abort();
+          pendingPrefer = null;
           cfg = true;
           if (typeof d.nonce === 'number') reqNonce = d.nonce;
           tracker.producedForUrl = ''; // 新配置下重新产出
