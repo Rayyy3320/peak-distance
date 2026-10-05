@@ -3,11 +3,11 @@
   <desc id="desc">纯矢量学习流程示意。用 She is comfortable with people 展示英文原句与词义，把原句、来源和学习状态一起保留。不是产品界面截图。</desc>
   <rect width="1200" height="520" fill="#f7f4ec"/>
   <g id="title-block" fill="#2f3a40">
-    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">ENGLISH IN CONTEXT</text>
+    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">LANGUAGE IN CONTEXT</text>
     <text x="60" y="166" font-family="Georgia,'Times New Roman',serif" font-size="86">Peak Distance</text>
     <path d="M64 200H120" stroke="#d4a950" stroke-width="3"/>
     <g font-family="'Noto Serif SC',SimSun,serif" font-size="42">
-      <text x="64" y="267">把英文读懂，</text>
+      <text x="64" y="267">读懂新的语言，</text>
       <text x="64" y="327">把语境留下。</text>
     </g>
   </g>
