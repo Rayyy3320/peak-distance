@@ -15,6 +15,8 @@ import type {
 } from '@/shared/messages';
 import {
   normalizeExpression,
+  isDuplicateContext,
+  isDuplicateVideoContext,
   type LookupSnapshot,
   type LearningResult,
   type ContextExplanation,
@@ -449,8 +451,13 @@ export function createLookupPopup(opts: {
       pinned.status = r.entry.status;
       pinned.entryExists = true;
       const snap = pinned.snapshot;
-      const saved = r.entry.contexts.find(c => c.sentence.replace(/\s+/g, ' ').trim() === snap.sentence.replace(/\s+/g, ' ').trim() &&
-        (snap.source === 'video' ? c.video?.videoId === snap.video.videoId && c.video.trackId === snap.video.trackId && c.video.startMs === snap.video.startMs : c.url === snap.url));
+      const entry = r.entry;
+      const saved = entry.contexts.find(c => {
+        const context = { ...c, entryKey: entry.key };
+        return snap.source === 'video'
+          ? isDuplicateVideoContext(context, entry.key, snap.video, snap.sentence)
+          : isDuplicateContext(context, entry.key, snap.url, snap.sentence);
+      });
       if (saved) { pinned.savedContextId = saved.id; pinned.explanation = saved.explanation; void backfill(pinned); }
       renderPopup();
     }

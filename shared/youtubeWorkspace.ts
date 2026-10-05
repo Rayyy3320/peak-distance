@@ -106,7 +106,7 @@ export function createYoutubeWorkspace(actions: {
         state.cues.forEach((cue, i) => {
           const row = line(i), tools = meta(row);
           button(tools, fmtClock(cue.start), () => actions.seek(i)).dataset.playback = '';
-          const saved = state.sentences.some(s => s.id === sentenceId({ ...state.videoRef, startMs: cue.start }, cue.text));
+          const saved = state.sentences.some(s => sentenceId(s.video, s.text) === sentenceId({ ...state.videoRef, startMs: cue.start }, cue.text));
           button(tools, saved ? '已收藏' : '收藏整句', () => actions.save(i));
           button(tools, '问 AI', () => actions.ask(i)); body.append(row);
         });

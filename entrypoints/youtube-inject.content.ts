@@ -15,18 +15,20 @@ import { alignTranslatedCues, normalizeAsrCues } from '@/shared/cues';
 // 时序状态机（捕获归属、换视频重置、轨道身份固定）在 shared/subtitleTracker.ts，
 // 由 tools/regress.ts 离线回归。M6 复用上游的 tlang URL 规则，时间对齐和请求取消在本项目实现。
 // TTS、SRT 导出、Shorts 早nudge、自动配音纠正未移植。
-// M2 增补（自研，非上游）：轨道表上报（tracklist）与英文轨道偏好变体拉取
-//（prefer —— 在捕获源 URL 上换 lang/kind，pot 与签名原样保留）。
+// 轨道描述与身份规则集中在 subtitleTracker；播放器选轨与字幕获取只走一条路径。
 //
 // 约束（沿自上游）：绝不能向页面抛出异常 —— 所有钩子体都包在 try/catch 里。
 
 import {
   buildJson3Url,
+  captionTrackOf,
+  captionUrlFor,
   isTimedtextUrl,
-  normTrackKey,
   trackKindOf,
   trackLangOf,
+  trackOfUrl,
   videoIdFromUrl,
+  type PlayerCaptionTrack,
   SubtitleSourceTracker,
 } from '@/shared/subtitleTracker';
 import { CONTENT_SOURCE, INJECT_SOURCE, type Cue } from '@/shared/protocol';
@@ -49,6 +51,7 @@ export default defineContentScript({
     // 请求令牌：与 content script 的 config 消息同步，回复带上它，
     // content script 据此丢弃过期请求的结果。
     let reqNonce = 0;
+    let initialSelectionPending = true;
     // 钩子见过的 timedtext 请求总数（诊断用）。
     let seenTimedtext = 0;
 
@@ -112,7 +115,7 @@ export default defineContentScript({
     // ---- 与 content script 的桥 ---------------------------------------------
 
     function post(
-      type: 'cues' | 'nocues' | 'tracklist' | 'translation',
+      type: 'cues' | 'nocues' | 'tracklist' | 'track-selected' | 'translation',
       nonce: number,
       extra: Record<string, unknown> = {},
     ): void {
@@ -132,26 +135,6 @@ export default defineContentScript({
         );
       } catch {
         /* never throw */
-      }
-    }
-
-    // ---- 轨道偏好（content script 的 prefer 消息） ---------------------------
-
-    let pendingPrefer: { lang: string; kind: 'manual' | 'asr' } | null = null;
-
-    /** 在捕获的源 URL（带 pot）上换语言 / 类型；其余参数原样保留。 */
-    function buildVariantUrl(
-      base: string,
-      prefer: { lang: string; kind: 'manual' | 'asr' },
-    ): string {
-      try {
-        const u = new URL(base, location.href);
-        u.searchParams.set('lang', prefer.lang);
-        if (prefer.kind === 'asr') u.searchParams.set('kind', 'asr');
-        else u.searchParams.delete('kind');
-        return u.toString();
-      } catch {
-        return base;
       }
     }
 
@@ -177,19 +160,17 @@ export default defineContentScript({
 
     // ---- 产出字幕（新来源/配置取消旧请求，不让旧视频阻塞当前视频） ------------
 
-    let englishSource: { src: string; videoId: string; trackId: string; cues: Cue[]; kind: string } | null = null;
-    let chineseController: AbortController | null = null;
+    let subtitleSource: { src: string; videoId: string; trackId: string; cues: Cue[]; kind: 'manual' | 'asr' } | null = null;
+    let translationController: AbortController | null = null;
     let sourceController: AbortController | null = null;
 
-    async function produceCues(force: boolean): Promise<void> {
+    async function produceCues(): Promise<void> {
       // 开始即固定来源与轨道身份：此后所有读取只用固定值（时序 B）。
       const pinned = tracker.pinForProduce();
       if (!cfg || !pinned) return;
-      // 轨道偏好：在捕获源上切换语言/类型；偏好一旦消费即固定本次产出
-      const prefer = pendingPrefer;
-      const src = prefer ? buildVariantUrl(pinned.src, prefer) : pinned.src;
+      const src = pinned.src;
       // 捕获的源 URL 必须属于当前视频。
-      if (!force && tracker.producedForUrl === src) return;
+      if (tracker.producedForUrl === src) return;
       sourceController?.abort();
       const controller = new AbortController();
       sourceController = controller;
@@ -200,10 +181,8 @@ export default defineContentScript({
       // nonce 在产出开始时定格：并发产出的回复必须对准各自的请求。
       const myNonce = reqNonce;
       const stale = () => controller.signal.aborted || myNonce !== reqNonce || vid !== videoIdFromLocation() || tracker.staleAfterFetch(pinned.trackKey);
-      const kind = prefer
-        ? prefer.kind
-        : trackKindOf(src, location.href);
-      const lang = prefer ? prefer.lang : trackLangOf(src, location.href);
+      const kind = trackKindOf(src, location.href);
+      const lang = trackLangOf(src, location.href);
       try {
         const json = await fetchJson3(buildJson3Url(src, location.href), controller.signal);
         // 拉取期间轨道或视频已变 —— 旧结果整体丢弃，不带新元数据发出。
@@ -211,31 +190,20 @@ export default defineContentScript({
         const cues = parseJson3(json);
         if (!cues.length) {
           tracker.producedForUrl = ''; // 轨道稍后可能产出内容，允许重试
-          if (prefer) {
-            pendingPrefer = null; // 偏好轨道不存在：让原轨道自然产出
-            post('nocues', myNonce, { reason: 'prefer-empty-track' });
-            return;
-          }
           post('nocues', myNonce, { reason: 'empty-track' });
           return;
         }
-        if (prefer) pendingPrefer = null; // 偏好产出成功，不再作用于后续产出
-        chineseController?.abort();
-        englishSource = { src, videoId: vid, trackId: normTrackKey(src, location.href), cues, kind };
+        translationController?.abort();
+        subtitleSource = { src, videoId: vid, trackId: pinned.trackKey, cues, kind };
         post('cues', myNonce, {
           cues,
           trackKind: kind,
           trackLang: lang,
-          trackId: normTrackKey(src, location.href),
+          trackId: pinned.trackKey,
         });
       } catch (err) {
         if (stale()) return;
         tracker.producedForUrl = ''; // 允许下次捕获时重试
-        if (prefer) {
-          pendingPrefer = null;
-          post('nocues', myNonce, { reason: 'prefer-fetch-failed' });
-          return;
-        }
         post('nocues', myNonce, { reason: (err as Error)?.name === 'TimeoutError' ? 'fetch-timeout' : 'fetch-failed' });
       }
     }
@@ -248,28 +216,27 @@ export default defineContentScript({
       return primary;
     }
 
-    async function produceChinese(requestId: string, trackId: string, nonce: number, targetTag = 'zh-Hans'): Promise<void> {
-      chineseController?.abort();
+    async function produceTranslation(requestId: string, trackId: string, nonce: number, targetTag = 'zh-Hans'): Promise<void> {
+      translationController?.abort();
       const controller = new AbortController();
-      chineseController = controller;
-      const source = englishSource;
+      translationController = controller;
+      const source = subtitleSource;
       if (!source || source.videoId !== videoIdFromLocation() || source.trackId !== trackId) return;
+      const currentSourceUrl = captionUrlFor({ id: trackOfUrl(source.trackId)!.id,
+        url: tracker.sourceKey === source.trackId ? tracker.sourceUrl : source.src }, tracker.tokenSourceUrl, location.href)!;
       const targetPrimary = tlangCode(targetTag).split('-')[0]!.toLowerCase();
       let normalized = source.kind === 'asr' ? normalizeAsrCues(source.cues) : source.cues.map(c => ({ ...c }));
       try {
-        const tracks = captionTracksOf(activePlayer()) ?? [];
-        const target = tracks.filter(t => t.languageCode?.toLowerCase().split('-')[0] === targetPrimary).sort((a, b) => Number(a.kind === 'asr') - Number(b.kind === 'asr'))[0];
+        const tracks = captionTracksOf(activePlayer());
+        const target = tracks.filter(t => t.lang.split('-')[0] === targetPrimary).sort((a, b) => Number(a.kind === 'asr') - Number(b.kind === 'asr'))[0];
         if (target) {
           // 上游捕获 URL 的有效 pot 保留；独立轨道自身签名优先。
-          const url = new URL(target.baseUrl || buildVariantUrl(source.src, { lang: target.languageCode, kind: target.kind === 'asr' ? 'asr' : 'manual' }));
-          const pot = new URL(source.src).searchParams.get('pot');
-          if (pot && !url.searchParams.has('pot')) url.searchParams.set('pot', pot);
-          url.searchParams.delete('tlang'); url.searchParams.set('fmt', 'json3');
-          try { normalized = alignTranslatedCues(normalized, parseJson3(await fetchJson3(url.toString(), controller.signal))); } catch { /* 缺失部分继续平台翻译 */ }
+          const url = captionUrlFor(target, tracker.tokenSourceUrl, location.href);
+          if (url) try { normalized = alignTranslatedCues(normalized, parseJson3(await fetchJson3(url, controller.signal))); } catch { /* 缺失部分继续平台翻译 */ }
         }
         if (normalized.some(c => !c.zh) && !controller.signal.aborted) {
           // yt-dual-subs inject.js buildUrl：保留签名及 pot，仅设置 fmt/tlang。
-          const url = new URL(source.src); url.searchParams.set('fmt', 'json3'); url.searchParams.set('tlang', tlangCode(targetTag));
+          const url = new URL(currentSourceUrl); url.searchParams.set('tlang', tlangCode(targetTag));
           try {
             const translated = parseJson3(await fetchJson3(url.toString(), controller.signal));
             const byStart = new Map(translated.map(c => [c.start, c.text]));
@@ -280,7 +247,7 @@ export default defineContentScript({
           } catch { /* 通用翻译在隔离世界接手缺失项 */ }
         }
       } finally {
-        if (!controller.signal.aborted && source === englishSource && source.videoId === videoIdFromLocation()) {
+        if (!controller.signal.aborted && source === subtitleSource && source.videoId === videoIdFromLocation()) {
           post('translation', nonce, { videoId: source.videoId, trackId, requestId, cues: normalized });
         }
       }
@@ -288,24 +255,94 @@ export default defineContentScript({
 
     // ---- 捕获 ---------------------------------------------------------------
 
-    function onSourceCaptured(): void {
-      if (!cfg) return; // 等配置就绪再拉取
-      void produceCues(false);
+    function acquireCurrentTrack(): void {
+      if (!cfg) return;
+      if (tracker.hasCurrentSource()) void produceCues();
+      else armNocuesTimer();
+    }
+
+    function resetVideo(): void {
+      if (!tracker.resetForVideo(videoIdFromLocation())) return;
+      cancelAcquisition();
+      initialSelectionPending = true;
+    }
+
+    function stopRequests(): void {
+      sourceController?.abort();
+      translationController?.abort();
+      subtitleSource = null;
+    }
+
+    function cancelAcquisition(): void {
+      cfg = false;
+      stopRequests();
+      clearNocuesTimer();
+    }
+
+    function beginAcquisition(nonce: number, initialize = false): void {
+      resetVideo();
+      if (!initialize) initialSelectionPending = false;
+      cancelAcquisition();
+      cfg = true;
+      reqNonce = nonce;
+      tracker.producedForUrl = '';
+      postTracklist(nonce);
+    }
+
+    function currentPlayerTrack(): PlayerCaptionTrack | null {
+      try { return captionTrackOf((activePlayer() as any)?.getOption?.('captions', 'track')); }
+      catch { return null; } // captions 模块未加载时 API 可能拒绝读取。
+    }
+
+    /** 唯一选轨落点：来源匹配目标，捕获 URL 只补请求凭据。 */
+    function useTrack(track: PlayerCaptionTrack): void {
+      const tokenSource = tracker.tokenSourceUrl;
+      if (tracker.selectTrack(track)) {
+        stopRequests();
+        if (cfg) post('track-selected', reqNonce, { track: tracker.selectedTrack });
+      }
+      const target = track.url ? track : captionTracksOf(activePlayer()).find(t => t.id === track.id) ?? track;
+      const url = captionUrlFor(target, tokenSource, location.href);
+      // 无凭据时等播放器自己的请求；不猜签名，也不请求必然为空的轨道表 URL。
+      if (!tracker.hasCurrentSource() && url && new URL(url).searchParams.has('pot')) tracker.noteTimedtext(url, location.href);
+      acquireCurrentTrack();
+    }
+
+    function observePlayerTrack(): void {
+      const current = currentPlayerTrack();
+      const changed = tracker.observePlayer(current);
+      if (cfg && initialSelectionPending && current) {
+        const tracks = captionTracksOf(activePlayer());
+        if (tracks.length) {
+          initialSelectionPending = false;
+          const manual = current.kind === 'asr' ? tracks.find(t => t.lang === current.lang && t.kind === 'manual') : null;
+          if (manual && typeof (activePlayer() as any)?.setOption === 'function') { chooseTrack(manual); return; }
+        }
+      }
+      if (changed && current) useTrack(current);
+    }
+
+    function chooseTrack(track: PlayerCaptionTrack): void {
+      initialSelectionPending = false;
+      // 记住操作前的确认值，播放器异步反映 setOption 时不会把旧读数当新操作。
+      tracker.observePlayer(currentPlayerTrack());
+      useTrack(track);
+      const p = activePlayer() as any;
+      p.setOption('captions', 'track', track.native);
+      if (!tracker.hasCurrentSource()) nudgeCaptions();
     }
 
     // 记录在途看到的 timedtext URL。
-    function noteTimedtext(url: unknown): void {
+    function noteTimedtext(url: unknown, startedAt = performance.now()): void {
       try {
         if (!isTimedtextUrl(url)) return;
         if (selfUrls.has(url as string)) return; // 这是我方自己的请求
+        resetVideo();
+        observePlayerTrack();
         seenTimedtext++;
-        const previousVideo = tracker.currentVideoId;
-        const result = tracker.noteTimedtext(url as string, location.href);
-        if (previousVideo !== tracker.currentVideoId) {
-          sourceController?.abort(); chineseController?.abort(); englishSource = null; pendingPrefer = null;
-        }
+        const result = tracker.noteTimedtext(url as string, location.href, startedAt);
         // 同轨道从无 pot 到有效 pot 是来源修复；不能只存 URL 却继续等旧请求。
-        if (result === 'new' || (result === 'refresh' && englishSource?.trackId !== tracker.sourceKey)) onSourceCaptured();
+        if (result === 'new' || (result === 'refresh' && subtitleSource?.trackId !== tracker.sourceKey)) acquireCurrentTrack();
       } catch {
         /* never throw */
       }
@@ -339,73 +376,63 @@ export default defineContentScript({
       return null;
     }
 
-    function captionTracksOf(p: any): any[] | null {
+    function captionTracksOf(p: any): PlayerCaptionTrack[] {
+      let tracks: any[] = [];
       try {
-        const list = p.getOption('captions', 'tracklist');
-        if (Array.isArray(list) && list.length) return list;
+        const list = p?.getOption?.('captions', 'tracklist');
+        if (Array.isArray(list)) tracks = list;
       } catch {
         /* ignore */
       }
-      try {
+      if (!tracks.length) {
         const pr = playerResponseFor(tracker.currentVideoId);
-        const r = pr && pr.captions && pr.captions.playerCaptionsTracklistRenderer;
-        if (r && Array.isArray(r.captionTracks) && r.captionTracks.length) {
-          return r.captionTracks;
-        }
-      } catch {
-        /* ignore */
+        const list = pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (Array.isArray(list)) tracks = list;
       }
-      return null;
+      return tracks.map(captionTrackOf).filter((t): t is PlayerCaptionTrack => t !== null);
     }
 
-    function nudgeCaptions(): boolean {
-      try {
-        const p = activePlayer() as any;
-        if (!p) return false;
-        let acted = false;
-        if (typeof p.loadModule === 'function') {
-          p.loadModule('captions');
-          acted = true;
-        }
-        const vidAtNudge = tracker.currentVideoId;
-        setTimeout(() => {
-          try {
-            if (tracker.sourceUrl) return; // 模块加载本身已触发请求
-            if (vidAtNudge !== tracker.currentVideoId) return;
-            const p2 = activePlayer() as any;
-            if (!p2 || typeof p2.getOption !== 'function' || typeof p2.setOption !== 'function') {
+    function defaultCaptionTrack(): PlayerCaptionTrack | null {
+      const r = playerResponseFor(tracker.currentVideoId)?.captions?.playerCaptionsTracklistRenderer;
+      const audio = r?.audioTracks?.[r.defaultAudioTrackIndex ?? 0];
+      const target = captionTrackOf(r?.captionTracks?.[audio?.defaultCaptionTrackIndex]);
+      if (!target) return null;
+      return captionTracksOf(activePlayer()).find(t => t.lang === target.lang && t.kind === 'manual') ?? target;
+    }
+
+    function nudgeCaptions(): void {
+      const vid = tracker.currentVideoId, nonce = reqNonce, version = tracker.selectionVersion;
+      const live = () => cfg && vid === videoIdFromLocation() && nonce === reqNonce && version === tracker.selectionVersion && !subtitleSource;
+      const p = activePlayer() as any;
+      p?.loadModule?.('captions');
+      setTimeout(() => {
+        try {
+          if (!live()) return;
+          const player = activePlayer() as any;
+          const current = currentPlayerTrack();
+          if (typeof player?.setOption === 'function') {
+            if (!current) {
+              const target = defaultCaptionTrack();
+              if (target) chooseTrack(target);
               return;
             }
-            // 已选中轨道时不重复选择 —— 那只会重启下载
-            const cur = p2.getOption('captions', 'track');
-            if (cur && cur.languageCode) {
-              // 已有选择但没有请求：关掉再开同一轨道，促使播放器去取
-              const lang = cur.languageCode;
-              p2.setOption('captions', 'track', {});
-              setTimeout(() => {
-                try {
-                  if (vidAtNudge !== tracker.currentVideoId || tracker.sourceUrl) return;
-                  const p3 = activePlayer() as any;
-                  if (p3 && typeof p3.setOption === 'function') {
-                    p3.setOption('captions', 'track', { languageCode: lang });
-                  }
-                } catch {
-                  /* never throw */
-                }
-              }, 300);
-              return;
-            }
-            const list = captionTracksOf(p2);
-            if (!list) return; // 两个来源都没有轨道 —— 真无字幕
-            p2.setOption('captions', 'track', { languageCode: list[0].languageCode });
-          } catch {
-            /* never throw */
+            player.setOption('captions', 'track', {});
+            setTimeout(() => {
+              try {
+                if (live() && !currentPlayerTrack()) (activePlayer() as any)?.setOption?.('captions', 'track', current.native);
+              } catch { /* 页面播放器调用不能影响播放。 */ }
+            }, 300);
+          } else {
+            // 播放器 API 不可用时，CC 唤醒也在同一代次内执行。
+            const cc = player?.querySelector('.ytp-subtitles-button') as HTMLElement | null;
+            if (!cc || cc.getAttribute('aria-disabled') === 'true') return;
+            if (cc.getAttribute('aria-pressed') === 'true') cc.click();
+            setTimeout(() => {
+              if (live() && cc.isConnected && cc.getAttribute('aria-pressed') !== 'true') cc.click();
+            }, 300);
           }
-        }, 400);
-        return acted;
-      } catch {
-        return false;
-      }
+        } catch { /* 页面播放器调用不能影响播放。 */ }
+      }, 400);
     }
 
     // ---- 轨道表上报（config 后尽快；playerResponse 未就绪时短暂重试） ----------
@@ -414,16 +441,12 @@ export default defineContentScript({
       try {
         if (!cfg || nonceAtConfig !== reqNonce) return;
         const p = activePlayer() as any;
-        const list = p ? captionTracksOf(p) : null;
-        if (!list && attempt < 3) {
+        const list = captionTracksOf(p);
+        if (!list.length && attempt < 3) {
           setTimeout(() => postTracklist(nonceAtConfig, attempt + 1), 1000);
           return;
         }
-        const tracks = (list ?? []).map((t: any) => ({
-          lang: String(t?.languageCode ?? ''),
-          kind: t?.kind === 'asr' ? ('asr' as const) : ('manual' as const),
-          name: typeof t?.name?.simpleText === 'string' ? t.name.simpleText : undefined,
-        }));
+        const tracks = list.map(({ url, native, ...track }) => track);
         post('tracklist', nonceAtConfig, { tracks });
       } catch {
         /* never throw */
@@ -434,10 +457,8 @@ export default defineContentScript({
 
     setInterval(() => {
       try {
-        const v = videoIdFromLocation();
-        if (tracker.resetForVideo(v)) {
-          sourceController?.abort(); chineseController?.abort(); englishSource = null; pendingPrefer = null;
-        }
+        resetVideo();
+        observePlayerTrack(); // 原生字幕命中缓存不发网络请求时仍能改轨。
       } catch {
         /* never throw */
       }
@@ -453,56 +474,49 @@ export default defineContentScript({
 
         if (d.type === 'source-cancel') {
           if (d.nonce !== reqNonce) return;
-          sourceController?.abort();
-          clearNocuesTimer();
+          cancelAcquisition();
+          tracker.clearSource();
           return;
         }
 
-        if (d.type === 'translation-cancel') { chineseController?.abort(); return; }
+        if (d.type === 'translation-cancel') { translationController?.abort(); return; }
         if (d.type === 'translation-request') {
-          if (d.videoId === videoIdFromLocation() && typeof d.requestId === 'string' && typeof d.trackId === 'string') void produceChinese(d.requestId, d.trackId, reqNonce, typeof d.targetLang === 'string' ? d.targetLang : 'zh-Hans');
+          if (cfg && d.videoId === videoIdFromLocation() && typeof d.requestId === 'string' && typeof d.trackId === 'string') void produceTranslation(d.requestId, d.trackId, reqNonce, typeof d.targetLang === 'string' ? d.targetLang : 'zh-Hans');
           return;
         }
         if (d.type === 'bye') {
-          sourceController?.abort();
-          clearNocuesTimer();
-          chineseController?.abort();
+          cancelAcquisition();
           // 扩展已重载/移除：不再为一个已经不在的监听者拉取字幕。
-          cfg = false;
           return;
         }
         if (d.type === 'nudge') {
           // CC 按钮路径未产生 timedtext：用播放器 API 强制选轨。
-          tracker.syncVideo(location.href);
-          nudgeCaptions();
+          resetVideo();
+          if (cfg) nudgeCaptions();
           return;
         }
-        if (d.type === 'prefer') {
-          // 轨道偏好：记录后，捕获一就绪（或已就绪时立即）产出偏好变体。
-          if (typeof d.nonce === 'number' && d.nonce !== reqNonce) return;
-          if (typeof d.lang !== 'string' || !d.lang) return;
-          pendingPrefer = {
-            lang: d.lang,
-            kind: d.kind === 'asr' ? 'asr' : 'manual',
-          };
-          if (tracker.hasCurrentSource()) void produceCues(true);
+        if (d.type === 'select-track') {
+          if (typeof d.nonce !== 'number' || d.nonce < reqNonce || d.videoId !== videoIdFromLocation()) return;
+          beginAcquisition(d.nonce);
+          const target = captionTracksOf(activePlayer()).find(t => t.id === d.trackId);
+          const p = activePlayer() as any;
+          if (!target || typeof p?.setOption !== 'function') {
+            post('nocues', reqNonce, { reason: 'track-selection-unavailable' });
+            return;
+          }
+          chooseTrack(target);
           return;
         }
         if (d.type === 'config') {
           // config 是权威的导航信号：resetForVideo 保留已属于当前视频的来源
           //（时序 A），不靠 nudge 重抓。
-          tracker.resetForVideo(videoIdFromLocation());
-          sourceController?.abort();
-          pendingPrefer = null;
-          cfg = true;
-          if (typeof d.nonce === 'number') reqNonce = d.nonce;
-          tracker.producedForUrl = ''; // 新配置下重新产出
-          postTracklist(reqNonce);
-          if (tracker.hasCurrentSource()) {
-            void produceCues(true); // 本视频已有捕获（或刚被保留）
-          } else {
-            armNocuesTimer(); // 等播放器发出 timedtext 请求
-          }
+          if (typeof d.nonce !== 'number' || d.nonce < reqNonce) return;
+          beginAcquisition(d.nonce, true);
+          observePlayerTrack();
+          const selected = tracker.selectedTrack;
+          const target = selected ? captionTracksOf(activePlayer()).find(t => t.id === selected.id) : null;
+          if (target) useTrack(target);
+          acquireCurrentTrack();
         }
       } catch {
         /* never throw */
@@ -569,7 +583,7 @@ export default defineContentScript({
       const scan = (entries: PerformanceEntry[]) => {
         for (const e of entries) {
           if (e && typeof e.name === 'string' && isTimedtextUrl(e.name)) {
-            noteTimedtext(e.name);
+            noteTimedtext(e.name, e.startTime);
           }
         }
       };

@@ -1,5 +1,6 @@
 import type { DictionaryEntry } from '@/lib/onlineDictionary';
 import { entryKeyOf, normalizeExpressionInLanguage, type LanguageTag } from './languages';
+import { normTrackKey } from './subtitleTracker';
 
 // 词汇与上下文的纯逻辑：类型、规范化、去重判定、词形关联。
 // background 的 IndexedDB 写入与 tools/regress.ts 共用，保证事务里执行的
@@ -93,7 +94,7 @@ export interface SavedSentence {
 }
 
 export function sentenceId(video: VideoRef, text: string): string {
-  return JSON.stringify([video.videoId, video.trackId, video.startMs, collapseWhitespace(text)]);
+  return JSON.stringify([video.videoId, normTrackKey(video.trackId, ''), video.startMs, collapseWhitespace(text)]);
 }
 
 /** IndexedDB entries 记录（key 为规范化键）。forms 为关联词形（规范化后）。 */
@@ -177,9 +178,7 @@ export function isDuplicateVideoContext(
   if (existing.entryKey !== entryKey) return false;
   const ev = existing.video;
   if (!ev) return false;
-  if (ev.videoId !== video.videoId || ev.trackId !== video.trackId) return false;
-  if (ev.startMs !== video.startMs) return false;
-  return collapseWhitespace(existing.sentence) === collapseWhitespace(sentence);
+  return sentenceId(ev, existing.sentence) === sentenceId(video, sentence);
 }
 
 // ---- 保存 / 删除 / 补释义的决策（纯），background 在单一事务中执行 ----------

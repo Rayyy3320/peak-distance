@@ -4,6 +4,7 @@
 
 export const CONTENT_SOURCE = 'blc-content';
 export const INJECT_SOURCE = 'blc-inject';
+import type { SubtitleTrack } from './subtitleTracker';
 
 /** 一条字幕：毫秒时间轴 + 文本。lastOff 是最后一个非空白词的绝对时间（ASR 专有）。 */
 export interface Cue {
@@ -36,16 +37,15 @@ export interface SourceCancelMessage {
   nonce: number;
 }
 
-/** content → MAIN：优先取某语言的轨道（manual 优先于 asr）。 */
-export interface PreferMessage {
+export interface SelectTrackMessage {
   source: typeof CONTENT_SOURCE;
-  type: 'prefer';
+  type: 'select-track';
+  videoId: string;
   nonce: number;
-  lang: string;
-  kind: 'manual' | 'asr';
+  trackId: string;
 }
 
-export type ContentMessage = ConfigMessage | NudgeMessage | ByeMessage | PreferMessage | SourceCancelMessage;
+export type ContentMessage = ConfigMessage | NudgeMessage | ByeMessage | SelectTrackMessage | SourceCancelMessage;
 
 export interface CuesMessage {
   source: typeof INJECT_SOURCE;
@@ -56,7 +56,7 @@ export interface CuesMessage {
   trackKind: 'manual' | 'asr';
   /** 字幕轨道语言，如 en */
   trackLang: string;
-  /** 稳定轨道标识（去除 pot/fmt/tlang 后的 URL） */
+  /** 内容身份 URL；请求凭据和展示格式不参与。 */
   trackId: string;
   /** 嗅探器至今见过的 timedtext 请求数（诊断用，不受过滤影响） */
   seen: number;
@@ -73,13 +73,13 @@ export interface NoCuesMessage {
   seen: number;
 }
 
-/** MAIN → content：播放器自报的字幕轨道表（语言 + 类型）。 */
+/** MAIN → content：完整轨道描述，id 用于选择，label 用于区分具名轨道。 */
 export interface TracklistMessage {
   source: typeof INJECT_SOURCE;
   type: 'tracklist';
   videoId: string;
   nonce: number;
-  tracks: { lang: string; kind: 'manual' | 'asr'; name?: string }[];
+  tracks: SubtitleTrack[];
 }
 
 export interface TranslationCuesMessage {
@@ -92,7 +92,15 @@ export interface TranslationCuesMessage {
   cues: Cue[];
 }
 
-export type InjectMessage = CuesMessage | NoCuesMessage | TracklistMessage | TranslationCuesMessage;
+export interface TrackSelectedMessage {
+  source: typeof INJECT_SOURCE;
+  type: 'track-selected';
+  videoId: string;
+  nonce: number;
+  track: SubtitleTrack;
+}
+
+export type InjectMessage = CuesMessage | NoCuesMessage | TracklistMessage | TranslationCuesMessage | TrackSelectedMessage;
 
 export function formatCue(c: Cue): string {
   const s = (ms: number) => `${(ms / 1000).toFixed(2)}s`;
