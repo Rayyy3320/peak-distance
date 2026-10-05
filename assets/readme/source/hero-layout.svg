@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
-  <title id="title">Peak Distance — 把英文读懂，把语境留下</title>
+  <title id="title">Peak Distance — 读懂新的语言，把语境留下</title>
   <desc id="desc">米白纸感与项目原有山海插画，配合网页、X、YouTube 的遇见、理解、保存、复习流程。此图为品牌与学习流程展示，不是界面截图。</desc>
   <defs>
     <linearGradient id="coast-fade"><stop offset="0" stop-color="white" stop-opacity="0"/><stop offset="0.34" stop-color="white"/></linearGradient>
@@ -11,11 +11,11 @@
     <image href="../../../public/brand/mountain-coast.png" x="640" y="-250" width="560" height="840"/>
   </g>
   <g id="title-block" fill="#2f3a40">
-    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">ENGLISH IN CONTEXT</text>
+    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">LANGUAGE IN CONTEXT</text>
     <text x="60" y="166" font-family="Georgia,'Times New Roman',serif" font-size="86">Peak Distance</text>
     <path d="M64 200H120" stroke="#d4a950" stroke-width="3"/>
     <g font-family="'Noto Serif SC',SimSun,serif" font-size="42">
-      <text x="64" y="267">把英文读懂，</text>
+      <text x="64" y="267">读懂新的语言，</text>
       <text x="64" y="327">把语境留下。</text>
     </g>
   </g>
