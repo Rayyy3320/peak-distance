@@ -29,6 +29,7 @@
 | `lib/lookupService.ts` | M11 查询路由表唯一实现：词典语言对门控 → 免费译文 → 主动 AI 兜底（悬停零 LLM） |
 | `lib/vault/format.ts`、`lib/vault/chatFormat.ts`、`lib/vault/fs.ts`、`lib/vault/sync.ts` | M11 学习库：Markdown 往返与三方合并、会话/材料序列化、目录访问、同步编排（写前检查 + 冲突保留） |
 | `shared/messages.ts`、`shared/protocol.ts` | 扩展内部消息；YouTube 页面桥协议 |
+| `shared/subtitleTracker.ts` | YouTube 轨道描述、内容身份、请求 URL 与凭据、明确选轨与播放器确认、捕获归属 |
 
 ## 持续约束
 
@@ -48,6 +49,7 @@
 - 活动 AI 配置变化广播无凭据事件；YouTube AI 模式取消旧请求并清理内存译文／失败状态，利用原有 epoch 丢弃迟到结果。历史 AI 解释保留原来源，新结果记录服务商与模型。
 - `lib/onlineCache.ts` 使用现有 `storage.session` 保存成功结果并共享在途请求，最后一个消费者取消时 abort；容量由 `shared/settings.ts` 与设置页控制。
 - YouTube MAIN world 复用携带有效签名的 timedtext 请求，读取中文轨道与平台翻译；隔离世界负责时间对齐后的显示、缺失句回退、模式与取消。成功字幕缓存不随显示开关清空。MAIN↔隔离世界的 `postMessage` 用 `*` 目标广播：载荷（字幕文本等）对页面脚本可见，这是嗅探架构的固有代价，两世界各自校验来源标记与 videoId/nonce。
+- MAIN 统一管理字幕选轨与获取，明确目标与播放器确认值职责分开，缓存命中的原生选轨通过播放器观察同步；网络捕获只更新匹配轨道的 URL／凭据。内容身份不随签名续期变化，原文、译文及学习记录复用同一身份规则。获取的开始、取消与换视频收口；旧代次的捕获不能恢复已取消获取。
 - 本视频方式与 AP 通过 `storage.session` 按标签页保存；翻译消息显式携带方式，后台没有全局默认兜底。句子收藏使用独立 `sentences` store，与词汇状态和上下文互不删除。
 - 独立会话使用 `conversations`；数据库版本升级时将旧 `chats` 一条迁成一个确定 ID 的会话，保留原 store 作兼容备份。窗口活动会话存在 `storage.session`，来源与草稿不再决定会话主键。
 - 材料来源固定在每个快照上；每轮消息关联原快照。无材料请求只携带普通历史，附加材料时另允许该快照对应的历史。
