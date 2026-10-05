@@ -3,6 +3,7 @@
   "description": "个人自用的英语学习扩展：网页 / X 与 YouTube 共用词汇与上下文",
   "private": true,
   "version": "0.5.2",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "wxt",
