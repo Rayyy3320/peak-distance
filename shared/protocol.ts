@@ -30,6 +30,12 @@ export interface ByeMessage {
   type: 'bye';
 }
 
+export interface SourceCancelMessage {
+  source: typeof CONTENT_SOURCE;
+  type: 'source-cancel';
+  nonce: number;
+}
+
 /** content → MAIN：优先取某语言的轨道（manual 优先于 asr）。 */
 export interface PreferMessage {
   source: typeof CONTENT_SOURCE;
@@ -39,7 +45,7 @@ export interface PreferMessage {
   kind: 'manual' | 'asr';
 }
 
-export type ContentMessage = ConfigMessage | NudgeMessage | ByeMessage | PreferMessage;
+export type ContentMessage = ConfigMessage | NudgeMessage | ByeMessage | PreferMessage | SourceCancelMessage;
 
 export interface CuesMessage {
   source: typeof INJECT_SOURCE;

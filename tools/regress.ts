@@ -140,6 +140,11 @@ console.log('M0 基线：正常取字幕与跨视频旧响应');
   check('切视频后旧结果判过期', t.staleAfterFetch(pinA.trackKey));
   const r2 = t.noteTimedtext(TT('A', 'en'), WATCH('B')); // 旧视频的迟到请求
   check('旧视频迟到请求不进入来源', r2 === 'other-video' && !t.hasCurrentSource());
+  t.noteTimedtext(TT('B', 'en'), WATCH('B'));
+  t.syncVideo(WATCH('C'));
+  check('地址先变化且新来源未到时清除旧来源', t.sourceUrl === '' && !t.hasCurrentSource());
+  t.resetForVideo('');
+  check('离开视频页清除视频身份', t.currentVideoId === '' && !t.hasCurrentSource());
 }
 
 console.log('M1 词汇：规范化与去重');
