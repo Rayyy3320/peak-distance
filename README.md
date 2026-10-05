@@ -109,4 +109,4 @@ npm run build
 
 ## 许可
 
-Peak Distance 以 [MIT](LICENSE) 许可发布。第三方组件沿用各自许可，详见 [第三方许可声明](public/THIRD_PARTY_NOTICES.txt)。
+[MIT](LICENSE)
