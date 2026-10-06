@@ -2,7 +2,7 @@
   "name": "browser-language-companion",
   "description": "个人自用的英语学习扩展：网页 / X 与 YouTube 共用词汇与上下文",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.6.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
