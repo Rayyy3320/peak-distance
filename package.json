@@ -2,7 +2,7 @@
   "name": "peak-distance",
   "description": "Chrome 英语学习扩展：网页、X 与 YouTube 的查词、双语字幕、原句复习与 AI 问答",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
     "dev": "wxt",

@@ -1,14 +1,16 @@
 // M11 学习库目录访问层：唯一接触磁盘文件的地方。
-// 由 background（读写）与扩展页面（授权/选目录）调用；句子／词条／偏好的
+// 由 background（内容读写）与扩展页面（授权/选目录）调用；句子／词条／偏好的
 // Markdown 往返在 ./format.ts，合并决策在 mergeVocabRecord。
 //
 // 探针实证（tools/m11-vault-probe.mjs）：
 // - 句柄可存 IndexedDB，SW 重启 / 浏览器重启后仍可读写；
 // - 并发替换写会使先前 FileHandle 失效 → 本层每次操作都重新获取句柄；
-// - 结构：词汇/<lang>/*.md、句子/、对话/、材料/、偏好.md、.peak-distance/。
+// - 生词本.md / 句子.md are collections; chats and immutable materials retain separate files.
 
 import {
   applyVocabToDocument,
+  applySentenceToDocument,
+  contextIdentity,
   parseVocabDocument,
   serializePreferenceRecord,
   parsePreferenceDocument,
@@ -24,7 +26,7 @@ import {
   serializeMaterialSnapshot,
 } from './chatFormat';
 import type { MaterialSnapshotRecord } from '@/shared/chat';
-import { DB_NAME, DB_VERSION } from '@/lib/db';
+import { DB_NAME, DB_VERSION, getVaultHandle } from '@/lib/db';
 import {
   VAULT_FORMAT_VERSION,
   type VaultIdentity,
@@ -32,13 +34,14 @@ import {
   type VaultSentenceRecord,
   type VaultVocabRecord,
 } from '@/shared/vault';
-import { primaryOfLang } from '@/shared/languages';
+import { COLLECTION_FILES, emptyCollection, parseCollection, serializeCollection, type CollectionKind, type CollectionDocument } from './collectionFormat';
 
 /** 目录内学习库身份文件（JSON；vaultId 是换库判定依据）。 */
 const META_DIR = '.peak-distance';
 const IDENTITY_FILE = 'identity.json';
 const INDEX_FILE = 'index.json'; // recordId → 相对路径（两浏览器共享的路径索引）
 const README_FILE = '使用说明.md';
+const RECORDS_FILE = 'records.json';
 
 type DirHandle = FileSystemDirectoryHandle & {
   queryPermission?: (d: { mode: 'read' | 'readwrite' }) => Promise<PermissionState>;
@@ -63,19 +66,27 @@ async function readTextFile(dir: DirHandle, path: string[]): Promise<VaultReadTe
   }
 }
 
-/** 宽松读取：缺失与读取失败都当无内容（仅身份/索引这类可安全重建的数据使用）。 */
+/** 路径索引可重建；记录和库身份使用区分缺失／错误的严格读取。 */
 async function readTextIfAny(dir: DirHandle, path: string[]): Promise<string | null> {
   const r = await readTextFile(dir, path);
   return 'text' in r ? r.text : null;
 }
 
-async function writeTextFile(dir: DirHandle, path: string[], text: string): Promise<void> {
+async function writeTextFile(dir: DirHandle, path: string[], text: string, expected?: string | null): Promise<void> {
   let d = dir;
   for (const seg of path.slice(0, -1)) d = await d.getDirectoryHandle(seg, { create: true });
   const fh = await d.getFileHandle(path.at(-1)!, { create: true });
-  const w = await fh.createWritable();
-  await w.write(text);
-  await w.close();
+  const w = await fh.createWritable({ mode: 'exclusive' } as FileSystemCreateWritableOptions & { mode: 'exclusive' });
+  try {
+    if (expected !== undefined && await (await fh.getFile()).text() !== (expected ?? '')) throw new Error(`conflict: file changed ${path.join('/')}`);
+    await w.write(text);
+    if (expected !== undefined && await (await fh.getFile()).text() !== (expected ?? '')) throw new Error(`conflict: file changed ${path.join('/')}`);
+    await w.close();
+  } catch (error) {
+    await w.abort();
+    throw error;
+  }
+  if (await (await fh.getFile()).text() !== text) throw new Error(`io: write verification ${path.join('/')}`);
 }
 
 async function listFilesRecursive(
@@ -87,8 +98,8 @@ async function listFilesRecursive(
     if (name.startsWith('.')) continue; // .peak-distance / Obsidian 配置不当作记录
     if (handle.kind === 'file') out.push([...prefix, name].join('/'));
     else if (handle.kind === 'directory') {
-      // 只深入受管目录：词汇 / 句子 / 对话；材料由记录引用，不整库扫描
-      if (prefix.length === 0 && !['词汇', '句子', '对话'].includes(name)) continue;
+      // Legacy collections and chat/material directories; auxiliary backups stay outside the scan.
+      if (prefix.length === 0 && !['词汇', '句子', '对话', '材料'].includes(name)) continue;
       out.push(...(await listFilesRecursive(handle as DirHandle, [...prefix, name])));
     }
   }
@@ -98,22 +109,14 @@ async function listFilesRecursive(
 // ---- 身份与索引 -------------------------------------------------------------------
 
 export async function ensureVault(dir: DirHandle): Promise<VaultIdentity> {
-  const raw = await readTextIfAny(dir, [META_DIR, IDENTITY_FILE]);
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw) as VaultIdentity;
-      if (parsed?.vaultId && typeof parsed.vaultId === 'string') {
-        return { ...parsed, formatVersion: VAULT_FORMAT_VERSION };
-      }
-    } catch {
-      /* 坏身份文件按新库初始化（不覆盖正文，身份文件重建） */
-    }
-  }
-  const identity: VaultIdentity = {
-    vaultId: crypto.randomUUID(),
-    formatVersion: VAULT_FORMAT_VERSION,
-    createdAt: Date.now(),
-  };
+  const read = await readTextFile(dir, [META_DIR, IDENTITY_FILE]);
+  if ('failed' in read) throw new Error('io: identity.json');
+  const previous = 'text' in read ? JSON.parse(read.text) as VaultIdentity : null;
+  if (previous && (!previous.vaultId || previous.formatVersion > VAULT_FORMAT_VERSION)) throw new Error('format: identity.json');
+  if (previous?.formatVersion === VAULT_FORMAT_VERSION) return previous;
+  const identity: VaultIdentity = previous
+    ? { ...previous, formatVersion: VAULT_FORMAT_VERSION }
+    : { vaultId: crypto.randomUUID(), formatVersion: VAULT_FORMAT_VERSION, createdAt: Date.now() };
   await writeTextFile(dir, [META_DIR, IDENTITY_FILE], JSON.stringify(identity, null, 2));
   await writeTextFile(
     dir,
@@ -121,17 +124,17 @@ export async function ensureVault(dir: DirHandle): Promise<VaultIdentity> {
     [
       '# 学习库',
       '',
-      '- 词汇 / 句子 / 对话 下的 Markdown 由扩展管理：frontmatter 的 id、language、expression、status 与“原句”块是受管字段，其余内容可自由编辑。',
+      '- 生词本.md 与句子.md 按记录分节；对话/ 下每个会话一份 Markdown。记录的 id、language、expression 与原句由扩展管理。',
       '- 状态取值：saved = 已收藏，learning = 在学，known = 已掌握。',
       '- 修改“我的笔记”或状态会被扩展读回；改语言/表达等身份请通过扩展入口。',
-      '- `.peak-distance` 是扩展的辅助数据（身份、路径索引），请勿手改。',
+      '- `.peak-distance` 保存恢复数据、身份、路径索引及旧散文件备份；整个文件夹一起保留，请勿手改辅助数据。',
     ].join('\n'),
   );
   return identity;
 }
 
 interface VaultIndex {
-  [recordId: string]: string; // 相对路径（词汇/ja/xxx.md）
+  [recordId: string]: string; // Chat/material relative paths; collections do not need per-record paths.
 }
 
 async function readIndex(dir: DirHandle): Promise<VaultIndex> {
@@ -160,75 +163,99 @@ export function vaultFileName(title: string, recordId: string): string {
   return `${base}-${shortId || Date.now().toString(36)}.md`;
 }
 
-function vocabDirOf(recordId: string): string {
-  // 键形如 ja::学ぶ / und::pain；旧裸键（无 ::）按 und 归档
-  const idx = recordId.indexOf('::');
-  const lang = idx > 0 ? primaryOfLang(recordId.slice(0, idx)) : 'und';
-  return `词汇/${lang}`;
+// ---- Collection records and recovery metadata ----------------------------------
+
+type RecordData = { vocab: Record<string, VaultVocabRecord>; sentence: Record<string, VaultSentenceRecord> };
+
+async function readRecordData(dir: DirHandle): Promise<{ records: RecordData; source: string | null }> {
+  const read = await readTextFile(dir, [META_DIR, RECORDS_FILE]);
+  if ('missing' in read) return { records: { vocab: {}, sentence: {} }, source: null };
+  if ('failed' in read) throw new Error('io: records.json');
+  const parsed = JSON.parse(read.text) as RecordData;
+  if (!parsed.vocab || !parsed.sentence) throw new Error('format: records.json');
+  return { records: parsed, source: read.text };
 }
 
-// ---- 写入（受管字段；保留用户内容） -------------------------------------------------
+async function readCollection(dir: DirHandle, kind: CollectionKind): Promise<CollectionDocument & { source: string | null }> {
+  const read = await readTextFile(dir, [COLLECTION_FILES[kind]]);
+  if ('failed' in read) throw new Error(`io: ${COLLECTION_FILES[kind]}`);
+  const collection = 'text' in read ? parseCollection(read.text, kind) : emptyCollection(kind);
+  const ids = collection.documents.map(text => documentId(text, kind));
+  if (new Set(ids).size !== ids.length) throw new Error(`format: duplicate ID in ${COLLECTION_FILES[kind]}`);
+  return { ...collection, source: 'text' in read ? read.text : null };
+}
 
-export async function writeVocabToVault(
-  dir: DirHandle,
-  record: VaultVocabRecord,
-): Promise<{ path: string }> {
-  const index = await readIndex(dir);
-  const known = index[record.id];
-  const targetDir = vocabDirOf(record.id);
-  let path = known && known.startsWith(`${targetDir}/`) ? known : null;
+function vocabRecord(text: string, data: RecordData): VaultVocabRecord {
+  const parsed = parseVocabDocument(text);
+  if ('error' in parsed || !parsed.id || !parsed.expression || !parsed.language || !parsed.status) throw new Error('format: vocab');
+  const stored = data.vocab[parsed.id];
+  const contexts = new Map(stored?.contexts.map(context => [contextIdentity(context), context]) ?? []);
+  return {
+    id: parsed.id, expression: parsed.expression, language: parsed.language, status: parsed.status,
+    note: parsed.note, forms: stored?.forms ?? [], createdAt: stored?.createdAt ?? 0, updatedAt: stored?.updatedAt ?? 0,
+    contexts: parsed.managed.contexts.map(context => {
+      const original = contexts.get(contextIdentity(context));
+      return original ? { ...context, result: original.result ?? context.result, explanation: original.explanation ?? context.explanation } : context;
+    }),
+  };
+}
 
-  // 索引缺失时在同语言目录内按文件名前缀找一次（改名/移动恢复；不整库扫）
-  if (!path) {
-    for (const f of await listFilesRecursive(dir)) {
-      if (!f.startsWith(`${targetDir}/`)) continue;
-      const read = await readTextFile(dir, f.split('/'));
-      // 读取失败≠不存在：无法确认记录是否已有文件，中止写入让待办重试（避免落重复文件）
-      if ('failed' in read) throw new Error(`vault read failed: ${f}`);
-      if ('missing' in read) continue;
-      const parsed = parseVocabDocument(read.text);
-      if (!('error' in parsed) && parsed.id === record.id) {
-        path = f;
-        break;
-      }
-    }
+function sentenceRecord(text: string, data: RecordData): VaultSentenceRecord {
+  const parsed = parseSentenceDocument(text);
+  if ('error' in parsed || !parsed.id || !parsed.text || !parsed.language) throw new Error('format: sentence');
+  let stored = data.sentence[parsed.id];
+  // Old sentence files omitted the video fields. Their stable ID still contains the source and seek position.
+  if (!stored) {
+    const [videoId, trackId, startMs] = JSON.parse(parsed.id) as [string, string, number];
+    if (typeof videoId !== 'string' || typeof trackId !== 'string' || !Number.isFinite(startMs)) throw new Error('format: sentence source');
+    const kind = /[?&]kind=asr(?:&|$)/.test(trackId) ? 'asr' : 'manual';
+    stored = { id: parsed.id, language: parsed.language, text: parsed.text,
+      video: { videoId, trackId, trackKind: kind, trackLang: parsed.language, startMs }, endMs: startMs, title: '', createdAt: 0 };
   }
+  if (!stored.video || !Number.isFinite(stored.endMs)) throw new Error('format: sentence source');
+  return { ...stored, id: parsed.id, language: parsed.language, text: parsed.text,
+    translation: parsed.translation ?? undefined, translationSource: parsed.translationSource ?? undefined };
+}
 
-  if (path) {
-    const read = await readTextFile(dir, path.split('/'));
-    // 读取失败不得当“文件不存在”整体重写（会丢用户在 Obsidian 自由编辑的内容）
-    if ('failed' in read) throw new Error(`vault read failed: ${path}`);
-    const existing = 'text' in read ? read.text : null;
-    const next =
-      existing !== null && !('error' in parseVocabDocument(existing))
-        ? applyVocabToDocument(record, existing)
-        : serializeVocabRecord(record);
-    if (typeof next !== 'string') {
-      // 受管写回失败（文件损坏）：保留原文件，另存修复副本，不覆盖
-      path = `${targetDir}/${vaultFileName(record.expression, record.id)}`;
-      await writeTextFile(dir, path.split('/'), serializeVocabRecord(record));
-    } else {
-      await writeTextFile(dir, path.split('/'), next);
-    }
+function documentId(text: string, kind: CollectionKind): string {
+  const parsed = kind === 'vocab' ? parseVocabDocument(text) : parseSentenceDocument(text);
+  if ('error' in parsed || !parsed.id) throw new Error(`format: ${kind}`);
+  return parsed.id;
+}
+
+async function writeCollectionRecord(dir: DirHandle, kind: CollectionKind, record: VaultVocabRecord | VaultSentenceRecord): Promise<{ path: string }> {
+  const collection = await readCollection(dir, kind);
+  const { records: data, source } = await readRecordData(dir);
+  const at = collection.documents.findIndex(text => documentId(text, kind) === record.id);
+  let next: string | { error: 'format' };
+  if (kind === 'vocab') {
+    const vocab = record as VaultVocabRecord;
+    next = at < 0 ? serializeVocabRecord(vocab) : applyVocabToDocument(vocab, collection.documents[at]!);
+    data.vocab[record.id] = vocab;
   } else {
-    path = `${targetDir}/${vaultFileName(record.expression, record.id)}`;
-    await writeTextFile(dir, path.split('/'), serializeVocabRecord(record));
+    const sentence = record as VaultSentenceRecord;
+    next = at < 0 ? serializeSentenceRecord(sentence) : applySentenceToDocument(sentence, collection.documents[at]!);
+    data.sentence[record.id] = record as VaultSentenceRecord;
   }
-  index[record.id] = path;
-  await writeIndex(dir, index);
+  if (typeof next !== 'string') throw new Error(`format: ${record.id}`);
+  if (at < 0) collection.documents.push(next); else collection.documents[at] = next;
+  // Publish recovery metadata before the visible record. Missing metadata never produces an invalid local sentence.
+  await writeTextFile(dir, [META_DIR, RECORDS_FILE], JSON.stringify(data), source);
+  const path = COLLECTION_FILES[kind];
+  await writeTextFile(dir, [path], serializeCollection(collection, kind), collection.source);
   return { path };
 }
 
-export async function writeSentenceToVault(
-  dir: DirHandle,
-  record: VaultSentenceRecord,
-): Promise<{ path: string }> {
-  const path = `句子/${vaultFileName(record.text, record.id)}`;
-  await writeTextFile(dir, path.split('/'), serializeSentenceRecord(record));
-  const index = await readIndex(dir);
-  index[record.id] = path;
-  await writeIndex(dir, index);
-  return { path };
+export const writeVocabToVault = (dir: DirHandle, record: VaultVocabRecord) => writeCollectionRecord(dir, 'vocab', record);
+export const writeSentenceToVault = (dir: DirHandle, record: VaultSentenceRecord) => writeCollectionRecord(dir, 'sentence', record);
+
+export async function deleteCollectionRecord(dir: DirHandle, kind: CollectionKind, id: string): Promise<void> {
+  const collection = await readCollection(dir, kind);
+  collection.documents = collection.documents.filter(text => documentId(text, kind) !== id);
+  await writeTextFile(dir, [COLLECTION_FILES[kind]], serializeCollection(collection, kind), collection.source);
+  const { records: data, source } = await readRecordData(dir);
+  delete data[kind][id];
+  await writeTextFile(dir, [META_DIR, RECORDS_FILE], JSON.stringify(data), source);
 }
 
 /** 会话写入：完整历史一份（受管内容整体替换；个人笔记不在此文件）。 */
@@ -289,97 +316,77 @@ export interface VaultFileScan {
 
 export async function scanVault(dir: DirHandle): Promise<VaultFileScan> {
   const scan: VaultFileScan = { vocab: [], sentences: [], chats: [], materials: [], preference: null, broken: [], readFailures: 0, paths: [] };
+  const { records: data } = await readRecordData(dir);
   const files = await listFilesRecursive(dir);
   scan.paths = files;
-  for (const f of files) {
-    const read = await readTextFile(dir, f.split('/'));
+  for (const path of files) {
+    if (!path.endsWith('.md')) continue;
+    const read = await readTextFile(dir, path.split('/'));
     if ('failed' in read) { scan.readFailures++; continue; }
-    if ('missing' in read) continue; // 扫描间隙被外部删除：合法缺失
-    const text = read.text;
-    if (f.startsWith('对话/')) {
-      scan.chats.push({ path: f, text });
-      continue;
-    }
-    if (f.startsWith('材料/')) {
-      scan.materials.push({ path: f, text });
-      continue;
-    }
-    if (f === '偏好.md') {
-      const parsed = parsePreferenceDocument(text);
-      if (!('error' in parsed)) {
-        scan.preference = {
-          defaultComprehensionLang: parsed.defaultComprehensionLang,
-          comprehensionOverrides: parsed.comprehensionOverrides,
-        };
-      }
-      continue;
-    }
-    if (f.startsWith('词汇/')) {
-      const parsed = parseVocabDocument(text);
-      if ('error' in parsed) { scan.broken.push({ path: f, reason: parsed.error }); continue; }
-      if (!parsed.id || !parsed.expression) { scan.broken.push({ path: f, reason: 'missing-identity' }); continue; }
-      scan.vocab.push({
-        path: f,
-        note: parsed.note,
-        record: {
-          id: parsed.id,
-          language: parsed.language ?? 'und',
-          expression: parsed.expression,
-          status: parsed.status ?? 'saved',
-          forms: [],
-          createdAt: 0,
-          updatedAt: 0,
-          contexts: parsed.managed.contexts,
-        },
-      });
-    }
-    if (f.startsWith('句子/')) {
-      const parsed = parseSentenceDocument(text);
-      if ('error' in parsed) { scan.broken.push({ path: f, reason: parsed.error }); continue; }
-      if (!parsed.id) { scan.broken.push({ path: f, reason: 'missing-identity' }); continue; }
-      scan.sentences.push({ path: f, record: parsed as unknown as VaultSentenceRecord });
+    if ('missing' in read) continue;
+    try {
+      if (path === COLLECTION_FILES.vocab || path.startsWith('词汇/')) {
+        const documents = path === COLLECTION_FILES.vocab ? parseCollection(read.text, 'vocab').documents : [read.text];
+        for (const text of documents) {
+          const record = vocabRecord(text, data);
+          scan.vocab.push({ path, record, note: record.note ?? '' });
+        }
+      } else if (path === COLLECTION_FILES.sentence || path.startsWith('句子/')) {
+        const documents = path === COLLECTION_FILES.sentence ? parseCollection(read.text, 'sentence').documents : [read.text];
+        for (const text of documents) scan.sentences.push({ path, record: sentenceRecord(text, data) });
+      } else if (path.startsWith('对话/')) scan.chats.push({ path, text: read.text });
+      else if (path.startsWith('材料/')) scan.materials.push({ path, text: read.text });
+      else if (path === '偏好.md') scan.preference = parsePreferenceDocument(read.text);
+    } catch (error) {
+      scan.broken.push({ path, reason: String(error) });
     }
   }
   return scan;
 }
 
-/** 按 ID 读取库中现有词条（写前检查用）：索引命中或受管目录内扫描。 */
-export async function readVocabRecordById(
-  dir: DirHandle,
-  recordId: string,
-): Promise<{ record: VaultVocabRecord; note: string; text: string } | null> {
-  const index = await readIndex(dir);
-  let paths: string[] = [];
-  if (index[recordId]) paths.push(index[recordId]);
-  else {
-    const targetDir = vocabDirOf(recordId);
-    paths = (await listFilesRecursive(dir)).filter((f) => f.startsWith(`${targetDir}/`));
+/** Consolidate only recognized legacy records, keeping a recoverable copy of every source file. */
+export async function migrateVaultCollections(dir: DirHandle): Promise<void> {
+  for (const kind of ['vocab', 'sentence'] as const) {
+    const legacyDir = kind === 'vocab' ? '词汇/' : '句子/';
+    const paths = (await listFilesRecursive(dir)).filter(path => path.startsWith(legacyDir) && path.endsWith('.md'));
+    if (!paths.length) continue;
+    const collection = await readCollection(dir, kind);
+    const ids = new Set(collection.documents.map(text => documentId(text, kind)));
+    const originals: { path: string; text: string }[] = [];
+    for (const path of paths) {
+      const read = await readTextFile(dir, path.split('/'));
+      if (!('text' in read)) throw new Error(`io: ${path}`);
+      const parsed = kind === 'vocab' ? parseVocabDocument(read.text) : parseSentenceDocument(read.text);
+      if ('error' in parsed || !parsed.id) continue; // Unrelated or broken notes stay in their original directory.
+      if (!ids.has(parsed.id)) { collection.documents.push(read.text); ids.add(parsed.id); }
+      else if (collection.documents.find(text => documentId(text, kind) === parsed.id)!.trim() !== read.text.trim()) {
+        throw new Error(`conflict: duplicate legacy record ${parsed.id}`);
+      }
+      originals.push({ path, text: read.text });
+    }
+    if (!originals.length) continue;
+    const markdown = serializeCollection(collection, kind);
+    await writeTextFile(dir, [COLLECTION_FILES[kind]], markdown, collection.source);
+    const verified = await readTextFile(dir, [COLLECTION_FILES[kind]]);
+    if (!('text' in verified) || verified.text !== markdown) throw new Error('io: migration verification');
+    for (const original of originals) {
+      await writeTextFile(dir, [META_DIR, 'legacy', ...original.path.split('/')], original.text);
+      const parts = original.path.split('/');
+      let parent = dir;
+      for (const part of parts.slice(0, -1)) parent = await parent.getDirectoryHandle(part);
+      const current = await readTextFile(dir, parts);
+      if (!('text' in current) || current.text !== original.text) throw new Error(`conflict: legacy file changed ${original.path}`);
+      await parent.removeEntry(parts.at(-1)!);
+    }
   }
-  for (const p of paths) {
-    const read = await readTextFile(dir, p.split('/'));
-    if ('missing' in read) continue;
-    // 读取失败≠不存在：抛错让调用方（flush）走 catch 保留待办，不当新文件覆盖丢三方合并 base
-    if ('failed' in read) throw new Error(`vault read failed: ${p}`);
-    const text = read.text;
-    const parsed = parseVocabDocument(text);
-    if ('error' in parsed) continue;
-    if (parsed.id !== recordId) continue;
-    return {
-      text,
-      note: parsed.note,
-      record: {
-        id: parsed.id!,
-        language: parsed.language ?? 'und',
-        expression: parsed.expression!,
-        status: parsed.status ?? 'saved',
-        forms: [],
-        createdAt: 0,
-        updatedAt: 0,
-        contexts: parsed.managed.contexts,
-      },
-    };
-  }
-  return null;
+}
+
+export async function readVocabRecordById(dir: DirHandle, id: string): Promise<{ record: VaultVocabRecord; note: string; text: string } | null> {
+  const collection = await readCollection(dir, 'vocab');
+  const text = collection.documents.find(text => documentId(text, 'vocab') === id);
+  if (!text) return null;
+  const record = vocabRecord(text, (await readRecordData(dir)).records);
+  return { text, record, note: record.note ?? '' };
 }
 
 // ---- 权限与页面侧选目录 -----------------------------------------------------------
@@ -388,15 +395,15 @@ export async function ensurePermission(
   dir: DirHandle,
   mode: 'read' | 'readwrite' = 'readwrite',
 ): Promise<'granted' | 'prompt' | 'denied'> {
-  const q = dir.queryPermission ? await dir.queryPermission({ mode }) : 'granted';
-  if (q === 'granted') return 'granted';
-  // requestPermission 需要用户激活；无激活时返回当前状态（调用方提示重授权）
-  try {
-    const r = dir.requestPermission ? await dir.requestPermission({ mode }) : q;
-    return r;
-  } catch {
-    return q === 'denied' ? 'denied' : 'prompt';
-  }
+  return dir.queryPermission ? dir.queryPermission({ mode }) : 'granted';
+}
+
+/** Only a page click can renew directory access; the worker checks permissions without prompting. */
+export async function authorizeVaultInPage(): Promise<PermissionState> {
+  const dir = await getVaultHandle() as DirHandle | null;
+  if (!dir) throw new Error('not-connected');
+  const permission = await ensurePermission(dir);
+  return permission === 'granted' || !dir.requestPermission ? permission : dir.requestPermission({ mode: 'readwrite' });
 }
 
 /**

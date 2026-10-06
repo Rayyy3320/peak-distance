@@ -19,9 +19,7 @@
 //   层的辅助元数据（.peak-distance/）负责。
 // - forms / createdAt / updatedAt 不写入词条正文（spec 格式无此字段），往返
 //   不承诺恢复，由本机记录承载。
-// - VaultVocabRecord 无 note 字段（笔记只存在于文件）。三方合并需要比较
-//   笔记，因此接受 `VaultVocabRecord & { note? }`（普通 VaultVocabRecord
-//   可直接传入，方向兼容）。
+// - note 与本机笔记同源；文件中的笔记小节用于外部编辑与三方合并。
 
 import { DEFAULT_COMPREHENSION_LANG, isLanguageTag, type LanguageTag } from '@/shared/languages';
 import {
@@ -108,26 +106,33 @@ function splitDoc(text: string): { fmLines: string[] | null; bodyLines: string[]
 
 /** 渲染词条 frontmatter：已有条目原位更新受管键，缺失的受管键补在末尾。 */
 function renderVocabFm(existing: FmEntry[] | null, record: VaultVocabRecord): string[] {
-  const values: Record<VocabFmKey, string> = {
+  return renderFm(existing, {
     id: record.id,
     language: record.language,
     expression: record.expression,
     status: record.status,
-  };
+  });
+}
+
+function renderFm(existing: FmEntry[] | null, values: Record<string, string>): string[] {
   const lines: string[] = [];
   const written = new Set<string>();
   for (const e of existing ?? []) {
-    if (e.vocabKey && !written.has(e.vocabKey)) {
-      lines.push(`${e.vocabKey}: ${escapeFmValue(values[e.vocabKey])}`);
-      written.add(e.vocabKey);
+    if (Object.hasOwn(values, e.key) && !written.has(e.key)) {
+      lines.push(`${e.key}: ${escapeFmValue(values[e.key]!)}`);
+      written.add(e.key);
     } else {
       lines.push(e.rawLine); // 未知键 / 重复键逐字保留
     }
   }
-  for (const key of VOCAB_FM_KEYS) {
-    if (!written.has(key)) lines.push(`${key}: ${escapeFmValue(values[key])}`);
+  for (const key of Object.keys(values)) {
+    if (!written.has(key)) lines.push(`${key}: ${escapeFmValue(values[key]!)}`);
   }
   return lines;
+}
+
+function fmEntries(lines: string[]): FmEntry[] {
+  return lines.map(line => parseFmLine(line) ?? { key: '', value: '', rawLine: line, vocabKey: null });
 }
 
 // ===== 正文分节 ===================================================================
@@ -513,7 +518,7 @@ function renderDefinitionSection(contexts: VaultVocabContext[]): Section | null 
 // ===== 词条：序列化 / 解析 / 受管写入 =============================================
 
 export function serializeVocabRecord(record: VaultVocabRecord): string {
-  const sections: Section[] = [makeSection(NOTE_HEADING, [])]; // 笔记占位：内容由用户 / 笔记入口写入
+  const sections: Section[] = [makeSection(NOTE_HEADING, record.note ? record.note.split('\n') : [])];
   const def = renderDefinitionSection(record.contexts);
   if (def) sections.push(def);
   sections.push(makeSection(CONTEXTS_HEADING, renderContexts(record.contexts)));
@@ -600,16 +605,13 @@ export function applyVocabToDocument(
   const { fmLines, bodyLines } = splitDoc(fileText);
   if (!fmLines) return { error: 'format' };
 
-  const entries: FmEntry[] = [];
-  for (const line of fmLines) {
-    const e = parseFmLine(line);
-    if (e) entries.push(e);
-  }
+  const entries = fmEntries(fmLines);
 
   const { prefixLines, sections } = splitSections(bodyLines);
   const ctxLines = renderContexts(record.contexts);
   const out: Section[] = sections.map((s) =>
-    s.name === CONTEXTS_HEADING ? { ...s, contentLines: ctxLines } : { ...s },
+    s.name === CONTEXTS_HEADING ? { ...s, contentLines: ctxLines }
+      : s.name === NOTE_HEADING && record.note !== undefined ? { ...s, contentLines: record.note.split('\n') } : { ...s },
   );
 
   const hasContexts = out.some((s) => s.name === CONTEXTS_HEADING);
@@ -647,6 +649,10 @@ export function applyVocabToDocument(
     ensureGapBeforeAppend();
     out.push(makeSection(CONTEXTS_HEADING, ctxLines));
   }
+  if (record.note !== undefined && !out.some(s => s.name === NOTE_HEADING)) {
+    ensureGapBeforeAppend();
+    out.push(makeSection(NOTE_HEADING, record.note.split('\n')));
+  }
 
   return buildDoc(renderVocabFm(entries, record), { prefixLines, sections: out });
 }
@@ -665,6 +671,21 @@ export function serializeSentenceRecord(record: VaultSentenceRecord): string {
     if (record.translationSource) lines.push('', `来源：${record.translationSource}`);
   }
   return lines.join('\n') + '\n';
+}
+
+/** Update the source/translation while retaining personal notes and custom fields/sections. */
+export function applySentenceToDocument(record: VaultSentenceRecord, fileText: string): string | { error: 'format' } {
+  const existing = splitDoc(fileText);
+  if (!existing.fmLines) return { error: 'format' };
+  const next = splitDoc(serializeSentenceRecord(record));
+  const managed = splitSections(next.bodyLines);
+  const { sections } = splitSections(existing.bodyLines);
+  const translation = managed.sections.find(section => section.name === TRANSLATION_HEADING);
+  const out = sections.map(section => section.name === TRANSLATION_HEADING
+    ? { ...section, contentLines: translation?.contentLines ?? [] } : section);
+  if (translation && !out.some(section => section.name === TRANSLATION_HEADING)) out.unshift(translation);
+  const fields = renderFm(fmEntries(existing.fmLines), { id: record.id, language: record.language });
+  return buildDoc(fields, { prefixLines: managed.prefixLines, sections: out });
 }
 
 export interface ParsedSentenceDocument {
@@ -764,13 +785,12 @@ export type MergeOutcome<T> =
   | { kind: 'conflict'; fields: { field: string; local: unknown; file: unknown }[] };
 
 /**
- * 词条三方合并。VaultVocabRecord 本身没有 note 字段（笔记只在文件里），
- * FS 层把待比较的笔记挂在 note 上传入；普通 VaultVocabRecord 可直接使用。
+ * 词条三方合并，笔记缺失按空串处理。
  */
 export type VocabRecordWithNote = VaultVocabRecord & { note?: string | null };
 
 /** 语境身份：视频按 videoId+轨道+起始时间+原文，网页按 URL+原文（与保存去重判定一致）。 */
-function contextIdentity(c: VaultVocabContext): string {
+export function contextIdentity(c: VaultVocabContext): string {
   const sentence = collapseWhitespace(c.sentence);
   if (c.sourceType === 'video' && c.video) {
     return `video:${sentenceId(c.video, sentence)}`;
