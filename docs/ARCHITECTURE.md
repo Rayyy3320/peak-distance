@@ -27,7 +27,7 @@
 | `shared/vocab.ts`、`shared/cues.ts`、`shared/review.ts`、`shared/chat.ts` | 词汇、时间轴、复习、材料与对话纯逻辑 |
 | `shared/languages.ts`、`shared/tokenize.ts` | M11 语言身份（标签、稳定键、按语言规范化）与统一分词边界（点击 / 标记 / 词次共用） |
 | `lib/lookupService.ts` | M11 查询路由表唯一实现：词典语言对门控 → 免费译文 → 主动 AI 兜底（悬停零 LLM） |
-| `lib/vault/format.ts`、`lib/vault/chatFormat.ts`、`lib/vault/fs.ts`、`lib/vault/sync.ts` | M11 学习库：Markdown 往返与三方合并、会话/材料序列化、目录访问、同步编排（写前检查 + 冲突保留） |
+| `lib/vault/records.ts`、`lib/vault/format.ts`、`lib/vault/collectionFormat.ts`、`lib/vault/chatFormat.ts`、`lib/vault/fs.ts`、`lib/vault/sync.ts` | 学习库：共享记录映射、记录／集合 Markdown 往返与三方合并、会话/材料序列化、目录访问、同步编排 |
 | `shared/messages.ts`、`shared/protocol.ts` | 扩展内部消息；YouTube 页面桥协议 |
 | `shared/subtitleTracker.ts` | YouTube 轨道描述、内容身份、请求 URL 与凭据、明确选轨与播放器确认、捕获归属 |
 
@@ -37,6 +37,8 @@
 - 普通联网调用由 background 发起；YouTube 已有页面上下文字幕链路保留在 MAIN world。在线词典返回内容解析后只展示所需字段，不执行远端 HTML / 脚本。
 - key 限受信任扩展上下文读取。content script 经消息取得不含凭据的设置。
 - 学习数据写入扩展自身 IndexedDB，事务保证词条与上下文一致；旧数据、ID 和已有 key 不因升级丢失。
+- 生词本、句子各维护一份集合 Markdown；可读记录与完整恢复数据分开，`.peak-distance/records.json` 保留释义细节和视频关联。同步操作在当前 worker 串行执行，写前检查文件版本、写后重新读取核对；这不等同于跨浏览器／外部编辑器的文件互斥。
+- 待办入队与读回在 IndexedDB 事务中验证当前记录和待办版本；本机删除与删除待办同事务提交，远端读回／删除不能覆盖并发本机保存。手动同步先补缺失待办并提交，再读回共享文件；按实际结果广播词语与句子变化，文件夹重新授权由扩展页面的用户点击完成。
 - 页面 UI 用 Shadow DOM 隔离；视频全屏时挂在可见全屏节点。视频控制绑定 tabId + videoId，过期动作不控制其它页面。
 - 材料快照不可变，历史引用绑定原快照和来源。模型材料与系统指令分开；只把有效材料 ID 转为来源链接。
 - 网络请求绑定操作身份，取消、切来源或清空后迟到结果不能重新写回。持久化生成状态与活请求区分，worker 重启可恢复记录。
