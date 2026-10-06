@@ -31,7 +31,9 @@ import {
 import type { EntryView, SaveResult } from '@/shared/messages';
 import { effectiveEntryLanguage, normalizeLangTag, entryKeyOf, parseEntryKey, LANG_UNDETERMINED } from '@/shared/languages';
 import { planLegacyLanguage } from '@/shared/vocab';
-import type { VaultIdentity, VaultPendingWrite, VaultStatus } from '@/shared/vault';
+import { vaultRecordJson, type VaultIdentity, type VaultPendingWrite, type VaultStatus } from '@/shared/vault';
+import { entryViewToVaultRecord, sentenceToVaultRecord } from './vault/records';
+import type { VaultVocabRecord } from '@/shared/vault';
 
 export const DB_NAME = 'blc-learning';
 export const DB_VERSION = 5;
@@ -315,9 +317,9 @@ export async function setStatus(key: string, status: VocabStatus): Promise<boole
 }
 
 /** 删除词条连同其全部上下文（单一事务）。词条删除后其词形关联一并消失。 */
-export async function deleteEntry(key: string): Promise<boolean> {
+export async function deleteEntry(key: string, enqueueDeletion = true, expected?: VaultVocabRecord | null): Promise<boolean> {
   return withDb(async (db) => {
-    const tx = db.transaction([ENTRIES, CONTEXTS], 'readwrite');
+    const tx = db.transaction([ENTRIES, CONTEXTS, VAULT, VAULT_QUEUE], 'readwrite');
     const entries = tx.objectStore(ENTRIES);
     const contexts = tx.objectStore(CONTEXTS);
     const existing = (await px(entries.get(key))) as VocabEntryRecord | undefined;
@@ -326,8 +328,18 @@ export async function deleteEntry(key: string): Promise<boolean> {
       return false;
     }
     const ids = (await px(contexts.index('entryKey').getAllKeys(key))) as IDBValidKey[];
+    if (!enqueueDeletion) {
+      const pending = await px(tx.objectStore(VAULT_QUEUE).get(`vocab:${key}`));
+      const currentContexts = await px(contexts.index('entryKey').getAll(key)) as ContextRecord[];
+      const current = entryViewToVaultRecord(toEntryView(existing, currentContexts));
+      if (pending || (expected !== undefined && vaultRecordJson(current) !== vaultRecordJson(expected))) {
+        await txDone(tx);
+        return false;
+      }
+    }
     for (const id of ids) contexts.delete(id);
     entries.delete(key);
+    if (enqueueDeletion) await queueDeletedRecord(tx, 'vocab', key);
     await txDone(tx);
     return true;
   });
@@ -652,11 +664,21 @@ export async function listSentences(): Promise<SavedSentence[]> {
   });
 }
 
-export async function deleteSentence(id: string): Promise<void> {
+export async function deleteSentence(id: string, enqueueDeletion = true, expected?: SavedSentence | null): Promise<boolean> {
   return withDb(async db => {
-    const tx = db.transaction('sentences', 'readwrite');
+    const tx = db.transaction(['sentences', VAULT, VAULT_QUEUE], 'readwrite');
+    if (!enqueueDeletion) {
+      const pending = await px(tx.objectStore(VAULT_QUEUE).get(`sentence:${id}`));
+      const current = await px(tx.objectStore('sentences').get(id)) as SavedSentence | undefined;
+      if (pending || (expected !== undefined && vaultRecordJson(current ?? null) !== vaultRecordJson(expected))) {
+        await txDone(tx);
+        return false;
+      }
+    }
     tx.objectStore('sentences').delete(id);
+    if (enqueueDeletion) await queueDeletedRecord(tx, 'sentence', id);
     await txDone(tx);
+    return true;
   });
 }
 
@@ -712,10 +734,39 @@ export async function setVaultHandle(handle: unknown): Promise<void> {
 }
 
 /** 本机事务提交成功后入队（幂等：同 id 覆盖，重试不重复导入）。 */
-export async function enqueueVaultWrite(write: VaultPendingWrite): Promise<void> {
+export const enqueueVaultWrite = (write: VaultPendingWrite): Promise<void> => queueVaultRecord(write, false);
+/** Recovery fills missing work without replacing a newer pending edit/deletion. */
+export const enqueueRecoveredVaultWrite = (write: VaultPendingWrite): Promise<void> => queueVaultRecord(write, true);
+
+async function queueDeletedRecord(tx: IDBTransaction, kind: 'vocab' | 'sentence', recordId: string): Promise<void> {
+  if (!await px(tx.objectStore(VAULT).get('identity'))) return;
+  tx.objectStore(VAULT_QUEUE).put({ id: `${kind}:${recordId}`, kind, recordId, payload: null, queuedAt: Date.now(), revision: crypto.randomUUID() });
+}
+
+async function vaultWriteStillCurrent(tx: IDBTransaction, write: VaultPendingWrite): Promise<boolean> {
+  if (write.kind === 'vocab') {
+    const entry = await px(tx.objectStore(ENTRIES).get(write.recordId)) as VocabEntryRecord | undefined;
+    if (write.payload === null) return !entry;
+    if (!entry) return false;
+    const contexts = await px(tx.objectStore(CONTEXTS).index('entryKey').getAll(entry.key)) as ContextRecord[];
+    return vaultRecordJson(entryViewToVaultRecord(toEntryView(entry, contexts))) === vaultRecordJson(write.payload);
+  }
+  if (write.kind === 'sentence') {
+    const sentence = await px(tx.objectStore('sentences').get(write.recordId)) as SavedSentence | undefined;
+    if (write.payload === null) return !sentence;
+    return !!sentence && vaultRecordJson(sentenceToVaultRecord(sentence)) === vaultRecordJson(write.payload);
+  }
+  return true;
+}
+
+async function queueVaultRecord(write: VaultPendingWrite, onlyMissing: boolean): Promise<void> {
   return withDb(async db => {
-    const tx = db.transaction(VAULT_QUEUE, 'readwrite');
-    tx.objectStore(VAULT_QUEUE).put(write);
+    const tx = db.transaction([VAULT_QUEUE, ENTRIES, CONTEXTS, 'sentences'], 'readwrite');
+    if ((onlyMissing && await px(tx.objectStore(VAULT_QUEUE).get(write.id))) || !await vaultWriteStillCurrent(tx, write)) {
+      await txDone(tx);
+      return;
+    }
+    tx.objectStore(VAULT_QUEUE).put({ ...write, revision: crypto.randomUUID() });
     await txDone(tx);
   });
 }
@@ -730,20 +781,22 @@ export async function listVaultQueue(): Promise<VaultPendingWrite[]> {
 }
 
 /** 写入成功后出队。 */
-export async function removeVaultWrite(id: string): Promise<void> {
+export async function removeVaultWrite(write: VaultPendingWrite): Promise<void> {
   return withDb(async db => {
     const tx = db.transaction(VAULT_QUEUE, 'readwrite');
-    tx.objectStore(VAULT_QUEUE).delete(id);
+    const store = tx.objectStore(VAULT_QUEUE);
+    const current = await px(store.get(write.id)) as VaultPendingWrite | undefined;
+    if (current?.revision === write.revision) store.delete(write.id);
     await txDone(tx);
   });
 }
 
-export async function markVaultWriteAttempt(id: string, error?: string): Promise<void> {
+export async function markVaultWriteAttempt(attempt: VaultPendingWrite, error?: string): Promise<void> {
   return withDb(async db => {
     const tx = db.transaction([VAULT_QUEUE, VAULT], 'readwrite');
     const store = tx.objectStore(VAULT_QUEUE);
-    const write = (await px(store.get(id))) as VaultPendingWrite | undefined;
-    if (write) {
+    const write = (await px(store.get(attempt.id))) as VaultPendingWrite | undefined;
+    if (write && write.revision === attempt.revision) {
       write.attempts = (write.attempts ?? 0) + 1;
       write.lastError = error;
       store.put(write);
@@ -788,24 +841,49 @@ export async function getVaultStatus(): Promise<VaultStatus> {
 export async function importVaultEntry(
   entry: VocabEntryRecord,
   contexts: Omit<ContextRecord, 'id'>[],
-): Promise<void> {
+  expected?: VaultVocabRecord | null,
+  committing?: VaultPendingWrite,
+): Promise<boolean> {
   return withDb(async db => {
-    const tx = db.transaction([ENTRIES, CONTEXTS], 'readwrite');
+    const tx = db.transaction([ENTRIES, CONTEXTS, VAULT_QUEUE], 'readwrite');
     const entries = tx.objectStore(ENTRIES);
     const contextStore = tx.objectStore(CONTEXTS);
+    const pending = await px(tx.objectStore(VAULT_QUEUE).get(`vocab:${entry.key}`)) as VaultPendingWrite | undefined;
+    if (pending && pending.revision !== committing?.revision) {
+      await txDone(tx);
+      return false;
+    }
+    const current = await px(entries.get(entry.key)) as VocabEntryRecord | undefined;
+    const oldContexts = await px(contextStore.index('entryKey').getAll(entry.key)) as ContextRecord[];
+    const currentRecord = current ? entryViewToVaultRecord(toEntryView(current, oldContexts)) : null;
+    if (expected !== undefined && vaultRecordJson(currentRecord) !== vaultRecordJson(expected)) {
+      await txDone(tx);
+      return false;
+    }
     entries.put(entry);
-    const ids = (await px(contextStore.index('entryKey').getAllKeys(entry.key))) as IDBValidKey[];
-    for (const id of ids) contextStore.delete(id);
+    for (const context of oldContexts) contextStore.delete(context.id!);
     for (const c of contexts) contextStore.add({ ...c, entryKey: entry.key });
     await txDone(tx);
+    return true;
   });
 }
 
-export async function upsertVaultSentence(sentence: SavedSentence): Promise<void> {
+export async function upsertVaultSentence(sentence: SavedSentence, expected?: SavedSentence | null): Promise<boolean> {
   return withDb(async db => {
-    const tx = db.transaction('sentences', 'readwrite');
-    tx.objectStore('sentences').put(sentence);
+    const tx = db.transaction(['sentences', VAULT_QUEUE], 'readwrite');
+    const store = tx.objectStore('sentences');
+    if (await px(tx.objectStore(VAULT_QUEUE).get(`sentence:${sentence.id}`))) {
+      await txDone(tx);
+      return false;
+    }
+    const current = await px(store.get(sentence.id)) as SavedSentence | undefined;
+    if (expected !== undefined && vaultRecordJson(current ?? null) !== vaultRecordJson(expected)) {
+      await txDone(tx);
+      return false;
+    }
+    store.put(sentence);
     await txDone(tx);
+    return true;
   });
 }
 

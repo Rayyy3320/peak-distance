@@ -10,7 +10,7 @@
 import { chromium } from 'playwright-core';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import assert from 'node:assert/strict';
 
 const profile = mkdtempSync(join(tmpdir(), 'pd-m11-e2e-'));
@@ -94,41 +94,71 @@ try {
   check('保存自动写入学习库（队列清空）', committed);
 
   const READ_VOCAB_FILE = `async () => {
-    const db = await new Promise((res, rej) => { const r = indexedDB.open('blc-learning', 5); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-    const dir = await new Promise((res, rej) => { const tx = db.transaction('vault', 'readonly'); const q = tx.objectStore('vault').get('handle'); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); db.close();
-    const langDir = await dir.getDirectoryHandle('词汇').then(d => d.getDirectoryHandle('ja')).catch(() => null);
-    if (!langDir) return null;
-    for await (const [name, h] of langDir) {
-      if (h.kind !== 'file') continue;
-      const text = await (await h.getFile()).text();
-      if (text.includes('ja::学ぶ')) return { name, text };
-    }
-    return null;
+    const dir = await navigator.storage.getDirectory();
+    const handle = await dir.getFileHandle('生词本.md');
+    return { name: '生词本.md', text: await (await handle.getFile()).text() };
   }`;
   const file1 = await page.evaluate(call(READ_VOCAB_FILE));
-  check('库文件生成于 词汇/ja/ 并含受管字段', !!file1 && file1.text.includes('language: ja') && file1.text.includes('expression: 学ぶ') && file1.text.includes('原句'), file1?.name);
+  check('词汇追加到 生词本.md 并含受管字段', !!file1 && file1.text.includes('language: ja') && file1.text.includes('expression: 学ぶ') && file1.text.includes('原句'), file1?.name);
   writeFileSync(join(output, 'e2e-file-after-save.md'), file1?.text ?? '');
+
+  const video = { videoId: 'abcdefghijk', trackId: 'en-track', trackKind: 'manual', trackLang: 'en', startMs: 1000 };
+  const sentenceSave = await send({ type: 'saveSentence', sentence: { video, language: 'en', text: 'A senior engineer.', zh: '资深工程师。', endMs: 3500, title: 'Video fixture' } });
+  check('视频句子保存成功', sentenceSave?.ok);
+  await send({ type: 'vaultFlush' });
+  await page.evaluate(async () => {
+    const request = indexedDB.open('blc-learning', 5);
+    const db = await new Promise((done, fail) => { request.onsuccess = () => done(request.result); request.onerror = () => fail(request.error); });
+    await new Promise((done, fail) => { const tx = db.transaction('sentences', 'readwrite'); tx.objectStore('sentences').clear(); tx.oncomplete = done; tx.onerror = () => fail(tx.error); });
+    db.close();
+  });
+  await page.locator('#vault-flush').click();
+  await page.waitForFunction(() => document.querySelector('#vault-state').textContent.includes('同步完成'));
+  const restored = await send({ type: 'listSentences' });
+  check('设置页立即同步读回句子与完整视频位置', restored?.sentences?.[0]?.video?.startMs === 1000 && restored.sentences[0].endMs === 3500 && restored.sentences[0].zh === '资深工程师。', JSON.stringify(restored));
+  for (const width of [320, 1200]) {
+    await page.setViewportSize({ width, height: 900 });
+    check(`学习库设置 ${width}px 无横向溢出`, await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await page.locator('#vault-flush').scrollIntoViewIfNeeded();
+    await page.screenshot({ path: join(output, `vault-settings-${width}.png`) });
+  }
+  await page.evaluate(() => {
+    window.__queryPermission = FileSystemDirectoryHandle.prototype.queryPermission;
+    window.__requestPermission = FileSystemDirectoryHandle.prototype.requestPermission;
+    FileSystemDirectoryHandle.prototype.queryPermission = async () => 'denied';
+    FileSystemDirectoryHandle.prototype.requestPermission = async () => 'denied';
+  });
+  await page.locator('#vault-flush').click();
+  await page.waitForFunction(() => document.querySelector('#vault-state').textContent.includes('未获得文件夹读写权限'));
+  check('权限未获得时设置页明确提示，按钮恢复可重试', await page.locator('#vault-flush').isEnabled());
+  await page.evaluate(() => {
+    FileSystemDirectoryHandle.prototype.queryPermission = window.__queryPermission;
+    FileSystemDirectoryHandle.prototype.requestPermission = window.__requestPermission;
+  });
+  const intactBook = await page.evaluate(async () => {
+    const handle = await (await navigator.storage.getDirectory()).getFileHandle('生词本.md');
+    const text = await (await handle.getFile()).text();
+    const writable = await handle.createWritable(); await writable.write(text.replaceAll('<!-- peak-distance:vocab -->', '')); await writable.close();
+    return text;
+  });
+  await page.locator('#vault-flush').click();
+  await page.waitForFunction(() => document.querySelector('#vault-state').textContent.includes('学习文档格式有误'));
+  check('格式损坏如实报错且本机词条不被清空', !!(await send({ type: 'getEntry', key: 'ja::学ぶ' }))?.entry);
+  await page.evaluate(async text => {
+    const handle = await (await navigator.storage.getDirectory()).getFileHandle('生词本.md');
+    const writable = await handle.createWritable(); await writable.write(text); await writable.close();
+  }, intactBook);
 
   // 3. 外部编辑：status → learning + 我的笔记（不同字段，应自动合并）
   const EDIT_EXTERNAL = `async (mode) => {
-    const db = await new Promise((res, rej) => { const r = indexedDB.open('blc-learning', 5); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-    const dir = await new Promise((res, rej) => { const tx = db.transaction('vault', 'readonly'); const q = tx.objectStore('vault').get('handle'); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); db.close();
-    const langDir = await dir.getDirectoryHandle('词汇').then(d => d.getDirectoryHandle('ja'));
-    for await (const [name, h] of langDir) {
-      if (h.kind !== 'file') continue;
-      const text = await (await h.getFile()).text();
-      if (!text.includes('ja::学ぶ')) continue;
-      let next = text;
-      if (mode === 'note-learning') {
-        next = text.replace('status: saved', 'status: learning')
-                   .replace('## 我的笔记', '## 我的笔记\\n复习时结合原句记忆。');
-      } else if (mode === 'saved') {
-        next = text.replace('status: learning', 'status: saved');
-      }
-      const w = await h.createWritable(); await w.write(next); await w.close();
-      return next;
-    }
-    return null;
+    const dir = await navigator.storage.getDirectory();
+    const handle = await dir.getFileHandle('生词本.md');
+    const text = await (await handle.getFile()).text();
+    const next = mode === 'note-learning'
+      ? text.replace('status: saved', 'status: learning').replace('### 我的笔记', '### 我的笔记\\n复习时结合原句记忆。')
+      : text.replace('status: learning', 'status: saved');
+    const writable = await handle.createWritable(); await writable.write(next); await writable.close();
+    return next;
   }`;
   const external1 = await page.evaluate(call(EDIT_EXTERNAL, 'note-learning'));
   check('外部编辑写入文件（Obsidian 模拟）', !!external1 && external1.includes('status: learning') && external1.includes('复习时结合原句记忆'), String(external1).slice(0, 80));
@@ -151,7 +181,7 @@ try {
   }
   check('写前检查发现外部改动且未覆盖（待办保留）', conflictQueued);
   const sync2 = await send({ type: 'vaultSync' });
-  check('同步报告冲突且不丢本地', sync2?.ok && sync2.conflicts >= 1, JSON.stringify(sync2));
+  check('同步报告冲突且不丢本地', sync2?.ok === false && sync2.error === 'conflict' && sync2.conflicts >= 1, JSON.stringify(sync2));
   const entry2 = await send({ type: 'getEntry', key: 'ja::学ぶ' });
   check('冲突时本地版本保留（known 不被覆盖）', entry2?.entry?.status === 'known', entry2?.entry?.status);
   const conflictRaw = await page.evaluate(`(async () => {
@@ -166,10 +196,7 @@ try {
   const st1 = await send({ type: 'vaultStatus' });
   const FILE_STILL_THERE = `(async () => {
     const dir = await navigator.storage.getDirectory();
-    const langDir = await dir.getDirectoryHandle('词汇').then(d => d.getDirectoryHandle('ja')).catch(() => null);
-    if (!langDir) return false;
-    for await (const [, h] of langDir) if (h.kind === 'file' && (await (await h.getFile()).text()).includes('ja::学ぶ')) return true;
-    return false;
+    return (await (await dir.getFileHandle('生词本.md')).getFile()).text().then(text => text.includes('ja::学ぶ'));
   })()`;
   check('断开后状态未连接且文件仍在磁盘', dis?.ok && st1?.ok && st1.status.connected === false && !!(await page.evaluate(FILE_STILL_THERE)));
   // 重连：模拟页面再次选择同一目录（句柄重新写入）
@@ -183,5 +210,6 @@ try {
   assert.ok(failed.length === 0);
 } finally {
   await ctx.close().catch(() => {});
+  assert.ok(resolve(profile).startsWith(resolve(tmpdir()) + sep) && profile.includes('pd-m11-e2e-'));
   rmSync(profile, { recursive: true, force: true });
 }

@@ -2,13 +2,15 @@
 // 被 entrypoints/background.ts 调用（唯一入口）；文件操作在 ./fs.ts，
 // 三方合并在 ./format.ts 的 mergeVocabRecord，队列与快照在 lib/db.ts。
 //
-// 合并语义（spec 4.4）：base = 上次同步快照；无 base 时本地即 base
-//（首次见到该记录的外部版本按“一方修改”处理）。冲突不丢数据：保留本地，
+// 合并语义（spec 4.4）：base = 上次确认的共享文件；无 base 时不猜共同祖先。
+// 冲突不丢数据：保留本地，
 // 冲突详情存 vault store（conflict:<id>），由 UI 呈现处理选项。
 
 import {
   ensurePermission,
   ensureVault,
+  migrateVaultCollections,
+  deleteCollectionRecord,
   parseChatDocument,
   readVocabRecordById,
   scanVault,
@@ -21,14 +23,17 @@ import {
 } from './fs';
 import { serializeChatRecord } from './chatFormat';
 import type { VaultChatRecord } from '@/shared/vault';
+import { vaultRecordJson, vaultErrorCode, type VaultError } from '@/shared/vault';
 import type { ChatRecord, MaterialSnapshotRecord } from '@/shared/chat';
 import { mergeVocabRecord } from './format';
 import {
   clearSyncSnapshots,
   clearVault,
   deleteEntry,
+  deleteSentence,
   deleteSyncSnapshot,
   enqueueVaultWrite,
+  enqueueRecoveredVaultWrite,
   getSyncSnapshot,
   getVaultHandle,
   getVaultIdentity,
@@ -54,11 +59,18 @@ import type {
   VaultStatus,
   VaultVocabRecord,
 } from '@/shared/vault';
-import type { EntryView } from '@/shared/messages';
-import type { ContextRecord, SavedSentence, VocabEntryRecord } from '@/shared/vocab';
+import { entryViewToVaultRecord, sentenceToVaultRecord, vaultRecordToEntry } from './records';
 import { DEFAULT_SETTINGS, validSetting } from '@/shared/settings';
 
 type DirHandle = Parameters<typeof ensureVault>[0];
+
+// One worker must not read/replace the same collection in overlapping save and sync operations.
+let vaultOperation: Promise<unknown> = Promise.resolve();
+function runVaultOperation<T>(task: () => Promise<T>): Promise<T> {
+  const operation = vaultOperation.then(task);
+  vaultOperation = operation.catch(() => {});
+  return operation;
+}
 
 function storageLocal(): {
   get: (keys: string[]) => Promise<Record<string, unknown>>;
@@ -67,101 +79,37 @@ function storageLocal(): {
   return browser.storage.local as unknown as ReturnType<typeof storageLocal>;
 }
 
-// ---- 本地记录 ↔ 库记录映射 ---------------------------------------------------------
-
-export function entryViewToVaultRecord(e: EntryView): VaultVocabRecord & { note?: string } {
-  return {
-    id: e.key,
-    language: e.language ?? 'und',
-    expression: e.expression,
-    status: e.status,
-    forms: e.forms,
-    ...(e.note !== undefined && e.note !== '' ? { note: e.note } : {}),
-    createdAt: e.createdAt,
-    updatedAt: e.updatedAt,
-    contexts: e.contexts.map((c) => ({
-      sentence: c.sentence,
-      url: c.url,
-      title: c.title,
-      sourceType: c.sourceType,
-      video: c.video ?? null,
-      createdAt: c.createdAt,
-      definition: c.definition,
-      ...(c.result ? { result: c.result } : {}),
-      ...(c.explanation ? { explanation: c.explanation } : {}),
-    })),
-  };
-}
-
-function vaultRecordToEntry(record: VaultVocabRecord, note: string): {
-  entry: VocabEntryRecord;
-  contexts: Omit<ContextRecord, 'id'>[];
-} {
-  return {
-    entry: {
-      key: record.id,
-      language: record.language,
-      expression: record.expression,
-      kind: /\s/.test(record.expression.trim()) ? 'phrase' : 'word',
-      status: record.status,
-      ...(note ? { note } : {}),
-      createdAt: record.createdAt || Date.now(),
-      updatedAt: record.updatedAt || Date.now(),
-      forms: record.forms?.length ? record.forms : undefined,
-    },
-    contexts: record.contexts.map((c) => ({
-      entryKey: record.id,
-      sentence: c.sentence,
-      definition: c.definition ?? null,
-      ...(c.result ? { result: c.result } : {}),
-      ...(c.explanation ? { explanation: c.explanation } : {}),
-      sourceType: c.sourceType,
-      url: c.url,
-      title: c.title,
-      video: c.video ?? null,
-      createdAt: c.createdAt || Date.now(),
-    })),
-  };
-}
-
-export function sentenceToVaultRecord(s: SavedSentence): VaultSentenceRecord {
-  return {
-    id: s.id,
-    language: s.language ?? s.video.trackLang ?? 'und',
-    text: s.text,
-    ...(s.zh ? { translation: s.zh } : {}),
-    ...(s.translationSource ? { translationSource: s.translationSource } : {}),
-    video: s.video,
-    endMs: s.endMs,
-    title: s.title,
-    createdAt: s.createdAt,
-  };
-}
-
 // ---- 待写入提交 -------------------------------------------------------------------
 
 export interface FlushResult {
   committed: number;
   failed: number;
   skipped: number;
-  error?: 'not-connected' | 'no-permission';
+  error?: VaultError;
 }
 
-export async function flushVaultWrites(): Promise<FlushResult> {
+export const flushVaultWrites = (): Promise<FlushResult> => runVaultOperation(flushPendingWrites);
+
+async function flushPendingWrites(): Promise<FlushResult> {
   const handle = (await getVaultHandle()) as DirHandle | null;
   if (!handle) return { committed: 0, failed: 0, skipped: 0, error: 'not-connected' };
   const perm = await ensurePermission(handle);
   const queue = await listVaultQueue();
   if (perm !== 'granted') {
-    for (const w of queue) await markVaultWriteAttempt(w.id, 'no-permission');
+    for (const w of queue) await markVaultWriteAttempt(w, 'no-permission');
     return { committed: 0, failed: queue.length, skipped: 0, error: 'no-permission' };
   }
+  await migrateVaultCollections(handle);
   let committed = 0;
   let failed = 0;
   let skipped = 0;
+  let error: FlushResult['error'];
   for (const w of queue) {
     try {
-      if (w.kind === 'vocab') {
+      if (w.payload === null && (w.kind === 'vocab' || w.kind === 'sentence')) {
+        await deleteCollectionRecord(handle, w.kind, w.recordId);
+        await deleteSyncSnapshot(w.kind === 'sentence' ? `sentence:${w.recordId}` : w.recordId);
+      } else if (w.kind === 'vocab') {
         const record = w.payload as VaultVocabRecord;
         // 提交前检查文件变化（spec 4.4）：库中版本相对上次同步快照有外部改动时
         // 先做三方合并；同字段双方修改判冲突 → 不覆盖文件，记录详情并保留待办。
@@ -170,7 +118,7 @@ export async function flushVaultWrites(): Promise<FlushResult> {
         if (prev) {
           const baseRaw = await getSyncSnapshot(record.id);
           const base = baseRaw ? (JSON.parse(baseRaw) as VaultVocabRecord) : null;
-          const outcome = mergeVocabRecord(base ?? prev.record, record, {
+          const outcome = mergeVocabRecord(base, record, {
             ...prev.record,
             note: prev.note,
           });
@@ -183,17 +131,22 @@ export async function flushVaultWrites(): Promise<FlushResult> {
               remote: prev.record,
             };
             await putVaultRaw(`conflict:${record.id}`, conflict);
-            await markVaultWriteAttempt(w.id, 'conflict');
+            await markVaultWriteAttempt(w, 'conflict');
             failed++;
+            error = 'conflict';
             continue; // 待办保留；解决后下次提交
           }
           toWrite = outcome.value;
         }
         await writeVocabToVault(handle, toWrite);
+        const { entry, contexts } = vaultRecordToEntry(toWrite, toWrite.note ?? '');
+        await importVaultEntry(entry, contexts, record, w);
         // 我们刚写的内容即“上次共同内容”（下次读回的三方合并 base）
-        await setSyncSnapshot(record.id, JSON.stringify(toWrite));
+        await setSyncSnapshot(record.id, vaultRecordJson(toWrite));
       } else if (w.kind === 'sentence') {
-        await writeSentenceToVault(handle, w.payload as VaultSentenceRecord);
+        const record = w.payload as VaultSentenceRecord;
+        await writeSentenceToVault(handle, record);
+        await setSyncSnapshot(`sentence:${record.id}`, vaultRecordJson(record));
       } else if (w.kind === 'preference') {
         const p = w.payload as { defaultComprehensionLang: string; comprehensionOverrides: Record<string, string> };
         await writePreferenceToVault(handle, p);
@@ -208,15 +161,17 @@ export async function flushVaultWrites(): Promise<FlushResult> {
         skipped++;
         continue;
       }
-      await removeVaultWrite(w.id);
-      await markVaultWriteAttempt(w.id);
+      await removeVaultWrite(w);
+      await markVaultWriteAttempt(w);
       committed++;
     } catch (e) {
-      await markVaultWriteAttempt(w.id, String((e as Error)?.message ?? e));
+      const message = String((e as Error)?.message ?? e);
+      await markVaultWriteAttempt(w, message);
+      error = vaultErrorCode(e);
       failed++;
     }
   }
-  return { committed, failed, skipped };
+  return { committed, failed, skipped, ...(error ? { error } : {}) };
 }
 
 /** 本机保存成功后的入队（幂等键 = kind:recordId，后写覆盖先写）。 */
@@ -261,36 +216,43 @@ export interface SyncResult {
   broken: number;
 }
 
-export async function syncFromVault(): Promise<SyncResult & { error?: 'not-connected' | 'no-permission' }> {
+type VaultSyncResult = SyncResult & { error?: FlushResult['error'] };
+export const syncFromVault = (): Promise<VaultSyncResult> => runVaultOperation(readVaultChanges);
+
+async function readVaultChanges(): Promise<VaultSyncResult> {
   const handle = (await getVaultHandle()) as DirHandle | null;
   if (!handle) return { updated: 0, deleted: 0, conflicts: 0, broken: 0, error: 'not-connected' };
   const perm = await ensurePermission(handle);
   if (perm !== 'granted') return { updated: 0, deleted: 0, conflicts: 0, broken: 0, error: 'no-permission' };
 
+  await migrateVaultCollections(handle);
   const scan: VaultFileScan = await scanVault(handle);
   const local = await listEntries();
   const localByKey = new Map(local.map((e) => [e.key, e]));
+  const pending = await listVaultQueue();
+  const pendingKeys = new Set(pending.map(write => `${write.kind}:${write.recordId}`));
   const seen = new Set<string>();
   let updated = 0;
-  let conflicts = 0;
+  let conflicts = pending.filter(write => write.lastError === 'conflict' || write.lastError?.startsWith('conflict:')).length;
 
   for (const { record, note } of scan.vocab) {
     seen.add(record.id);
+    if (pendingKeys.has(`vocab:${record.id}`)) continue;
     const localEntry = localByKey.get(record.id);
     const baseRaw = await getSyncSnapshot(record.id);
     const base = baseRaw ? (JSON.parse(baseRaw) as VaultVocabRecord & { note?: string }) : null;
     if (!localEntry) {
       // 其它浏览器 / Obsidian 新增：导入本地
       const { entry, contexts } = vaultRecordToEntry(record, note);
-      await importVaultEntry(entry, contexts);
-      await setSyncSnapshot(record.id, JSON.stringify({ ...record, note }));
+      if (!await importVaultEntry(entry, contexts, null)) continue;
+      await setSyncSnapshot(record.id, vaultRecordJson({ ...record, note }));
       updated++;
       continue;
     }
     const localRecord = entryViewToVaultRecord(localEntry);
     const fileRecord: VaultVocabRecord & { note?: string } = { ...record, note };
-    // 无快照（旧数据/首次）时本地即上次共同内容：外部-only 修改直接采纳
-    const outcome = mergeVocabRecord(base ?? localRecord, localRecord, fileRecord);
+    // 未确认共同文件时保留标量差异为冲突，不能把另一浏览器的选择当成覆盖依据。
+    const outcome = mergeVocabRecord(base, localRecord, fileRecord);
     if (outcome.kind === 'conflict') {
       const conflict: VaultConflictRecord = {
         kind: 'vocab',
@@ -309,19 +271,23 @@ export async function syncFromVault(): Promise<SyncResult & { error?: 'not-conne
     }
     const mergedNote = (outcome.value as { note?: string }).note ?? '';
     const { entry, contexts } = vaultRecordToEntry(outcome.value, mergedNote);
-    await importVaultEntry(entry, contexts);
-    await setSyncSnapshot(record.id, JSON.stringify({ ...outcome.value, note: mergedNote }));
-    updated++;
+    if (vaultRecordJson(localRecord) !== vaultRecordJson(outcome.value)) {
+      if (!await importVaultEntry(entry, contexts, localRecord)) continue;
+      updated++;
+    }
+    await setSyncSnapshot(record.id, vaultRecordJson(fileRecord));
   }
 
   // 删除检测：有同步快照但库中不再存在该 ID（移动保留同 ID，不会误判）。
   // 本轮有文件读取失败（权限瞬断 / IO）时扫描不完整，跳过删除检测（下次 vaultSync 重试），
   // 避免读取失败的词条被当成“文件已删”而误删本地词条与全部上下文。
   let deleted = 0;
-  if (scan.readFailures === 0) {
+  const pendingIds = new Set(pending.map(write => write.recordId));
+  if (scan.readFailures === 0 && scan.broken.length === 0) {
     for (const id of await listSyncSnapshotIds()) {
-      if (!seen.has(id)) {
-        await deleteEntry(id).catch(() => {});
+      if (!id.startsWith('sentence:') && !seen.has(id) && !pendingIds.has(id)) {
+        const current = localByKey.get(id);
+        if (!await deleteEntry(id, false, current ? entryViewToVaultRecord(current) : null)) continue;
         await deleteSyncSnapshot(id);
         await putVaultRaw(`conflict:${id}`, null).catch(() => {});
         deleted++;
@@ -330,8 +296,12 @@ export async function syncFromVault(): Promise<SyncResult & { error?: 'not-conne
   }
 
   // 句子收藏：按稳定 ID 覆盖本地（外部只补笔记/改状态，不重建历史）
+  const localSentences = new Map((await listSentences()).map(sentence => [sentence.id, sentence]));
   for (const { record } of scan.sentences) {
-    await upsertVaultSentence({
+    if (pendingKeys.has(`sentence:${record.id}`)) continue;
+    const current = localSentences.get(record.id);
+    if (current && vaultRecordJson(sentenceToVaultRecord(current)) === vaultRecordJson(record)) continue;
+    const applied = await upsertVaultSentence({
       id: record.id,
       video: record.video,
       text: record.text,
@@ -341,7 +311,22 @@ export async function syncFromVault(): Promise<SyncResult & { error?: 'not-conne
       title: record.title,
       createdAt: record.createdAt,
       ...(record.language ? { language: record.language } : {}),
-    });
+    }, current ?? null);
+    if (!applied) continue;
+    await setSyncSnapshot(`sentence:${record.id}`, vaultRecordJson(record));
+    updated++;
+  }
+  if (scan.readFailures === 0 && scan.broken.length === 0) {
+    const sentenceIds = new Set(scan.sentences.map(item => item.record.id));
+    for (const key of await listSyncSnapshotIds()) {
+      if (!key.startsWith('sentence:')) continue;
+      const id = key.slice('sentence:'.length);
+      if (!sentenceIds.has(id) && !pendingIds.has(id)) {
+        if (!await deleteSentence(id, false, localSentences.get(id) ?? null)) continue;
+        await deleteSyncSnapshot(key);
+        deleted++;
+      }
+    }
   }
 
   // 会话读回：新会话插入；文件较新替换（本地 streaming 生成不被动）
@@ -380,13 +365,35 @@ export async function syncFromVault(): Promise<SyncResult & { error?: 'not-conne
     if (Object.keys(patch).length) await storageLocal().set(patch);
   }
 
-  return { updated, deleted, conflicts, broken: scan.broken.length };
+  return { updated, deleted, conflicts, broken: scan.broken.length,
+    ...(scan.readFailures ? { error: 'io' as const } : scan.broken.length ? { error: 'format' as const } : {}) };
 }
+
+/** Manual sync publishes local pending changes and then refreshes the running copy from the shared files. */
+export const synchronizeVault = () => runVaultOperation(async () => {
+  // The local database is the durable save boundary, including saves made before connecting or before a worker restart.
+  const deletions = new Set((await listVaultQueue()).filter(write => write.payload === null).map(write => `${write.kind}:${write.recordId}`));
+  for (const entry of await listEntries()) {
+    if (deletions.has(`vocab:${entry.key}`)) continue;
+    const record = entryViewToVaultRecord(entry);
+    const base = await getSyncSnapshot(record.id);
+    if (!base || vaultRecordJson(record) !== vaultRecordJson(JSON.parse(base))) await enqueueRecoveredVaultWrite({ id: `vocab:${record.id}`, kind: 'vocab', recordId: record.id, payload: record, queuedAt: Date.now() });
+  }
+  for (const sentence of await listSentences()) {
+    if (deletions.has(`sentence:${sentence.id}`)) continue;
+    const record = sentenceToVaultRecord(sentence);
+    const base = await getSyncSnapshot(`sentence:${record.id}`);
+    if (!base || vaultRecordJson(record) !== vaultRecordJson(JSON.parse(base))) await enqueueRecoveredVaultWrite({ id: `sentence:${record.id}`, kind: 'sentence', recordId: record.id, payload: record, queuedAt: Date.now() });
+  }
+  const flush = await flushPendingWrites();
+  const sync = await readVaultChanges();
+  return { ...flush, ...sync, error: flush.error ?? sync.error ?? (sync.conflicts ? 'conflict' as const : undefined) };
+});
 
 // ---- 连接 / 断开 -------------------------------------------------------------------
 
 export async function adoptVault(): Promise<
-  { ok: true; imported: boolean; status: VaultStatus } | { ok: false; error: string }
+  { ok: true; imported: boolean; status: VaultStatus; syncError?: FlushResult['error'] } | { ok: false; error: string }
 > {
   const handle = (await getVaultHandle()) as DirHandle | null;
   if (!handle) return { ok: false, error: 'no-handle' };
@@ -407,10 +414,10 @@ export async function adoptVault(): Promise<
     await storageLocal().set({ [marker]: true });
     imported = true;
   }
-  const flush = await flushVaultWrites();
-  await syncFromVault();
+  const result = await synchronizeVault();
+  if (result.error && result.error !== 'conflict') return { ok: false, error: result.error };
   const status = await getVaultStatus();
-  return { ok: true, imported, status, ...(flush.error ? {} : {}) };
+  return { ok: true, imported, status, syncError: result.error };
 }
 
 export async function disconnectVault(): Promise<void> {

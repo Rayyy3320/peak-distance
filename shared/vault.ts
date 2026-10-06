@@ -9,7 +9,24 @@ import type { ChatRecord } from './chat';
 import type { VideoRef, VocabStatus, LearningResult, ContextExplanation } from './vocab';
 import type { LanguageTag } from './languages';
 
-export const VAULT_FORMAT_VERSION = 1;
+export const VAULT_FORMAT_VERSION = 2;
+export type VaultError = 'not-connected' | 'no-permission' | 'io' | 'conflict' | 'format';
+
+export function vaultErrorCode(error: unknown): VaultError {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith('conflict:')) return 'conflict';
+  if (message.startsWith('format:') || (error as Error)?.name === 'SyntaxError') return 'format';
+  if (['NotAllowedError', 'SecurityError'].includes((error as Error)?.name)) return 'no-permission';
+  return 'io';
+}
+
+/** Snapshots compare values, independently of object property insertion order. */
+export function vaultRecordJson(record: unknown): string {
+  return JSON.stringify(record, (_key, value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]));
+  });
+}
 
 /** 库身份：.peak-distance/ 中的格式版本与稳定标识；换库不混数据。 */
 export interface VaultIdentity {
@@ -28,8 +45,11 @@ export interface VaultPendingWrite {
   kind: VaultRecordKind;
   /** 稳定记录标识：词条 = 语言作用域键、句子 = sentenceId、会话 = chatId */
   recordId: string;
-  payload: VaultVocabRecord | VaultSentenceRecord | VaultChatRecord | VaultPreferenceRecord;
+  /** null removes a vocabulary/sentence record from its collection. */
+  payload: VaultVocabRecord | VaultSentenceRecord | VaultChatRecord | VaultPreferenceRecord | null;
   queuedAt: number;
+  /** Distinguishes an in-flight write from a newer edit of the same record. */
+  revision?: string;
   attempts?: number;
   lastError?: string;
 }
@@ -44,6 +64,7 @@ export interface VaultVocabRecord {
   createdAt: number;
   updatedAt: number;
   contexts: VaultVocabContext[];
+  note?: string;
 }
 
 export interface VaultVocabContext {

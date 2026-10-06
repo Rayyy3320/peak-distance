@@ -37,11 +37,12 @@ import {
   enqueuePreferenceWrite,
   enqueueSentenceWrite,
   enqueueVocabWrite,
-  entryViewToVaultRecord,
   flushVaultWrites,
-  sentenceToVaultRecord,
   syncFromVault,
+  synchronizeVault,
 } from '@/lib/vault/sync';
+import { entryViewToVaultRecord, sentenceToVaultRecord } from '@/lib/vault/records';
+import { vaultErrorCode } from '@/shared/vault';
 import { isLanguageTag, normalizeLangTag } from '@/shared/languages';
 import {
   sentenceId,
@@ -81,17 +82,25 @@ function parseLangField(v: unknown): string | undefined | null {
 }
 
 /** 本机保存成功后（已连接库时）排队写入学库并尝试提交；结果经 vault-changed 广播。 */
-function queueVaultWriteAfterSave(task: () => Promise<void>): void {
+function queueVaultWriteAfterSave(task?: () => Promise<void>): void {
   void (async () => {
     try {
       if (!(await getVaultIdentity())) return;
-      await task();
+      await task?.();
       await flushVaultWrites();
-      broadcast({ type: 'vault-changed' });
+      broadcastVaultChanges();
     } catch {
       /* 写库失败保留待办（队列持久化），下次活动补写 */
     }
   })();
+}
+
+function broadcastVaultChanges(changed = true): void {
+  broadcast({ type: 'vault-changed' });
+  if (changed) {
+    broadcast({ type: 'vocab-changed' });
+    broadcast({ type: 'sentences-changed' });
+  }
 }
 
 function parseVideoRef(v: unknown): VideoRef | null {
@@ -259,26 +268,14 @@ async function handle(
         createdAt: Date.now() };
       await saveSentence(savedSentence);
       broadcast({ type: 'sentences-changed' });
-      if (language) {
-        queueVaultWriteAfterSave(async () => {
-          await enqueueSentenceWrite({
-            id: savedSentence.id,
-            language: savedSentence.language ?? video.trackLang ?? 'und',
-            text: savedSentence.text,
-            ...(savedSentence.zh ? { translation: savedSentence.zh } : {}),
-            ...(savedSentence.translationSource ? { translationSource: savedSentence.translationSource } : {}),
-            video,
-            endMs: savedSentence.endMs,
-            title: savedSentence.title,
-            createdAt: savedSentence.createdAt,
-          });
-        });
-      }
+      queueVaultWriteAfterSave(() => enqueueSentenceWrite(sentenceToVaultRecord(savedSentence)));
       return { ok: true };
     }
     case 'deleteSentence': {
       if (typeof m.id !== 'string') return bad('bad-payload');
-      await deleteSentence(m.id);
+      const id = m.id;
+      await deleteSentence(id);
+      queueVaultWriteAfterSave();
       broadcast({ type: 'sentences-changed' });
       return { ok: true };
     }
@@ -366,13 +363,10 @@ async function handle(
       if (!r) return bad('bad-payload', 'empty-expression');
       const out: SaveResult = r;
       broadcast({ type: 'vocab-changed' });
-      if (snapshot.lang || r.key.includes('::')) {
-        // M11 语言作用域词条：连接学习库时排队写入（旧键词条待语言迁移批次）
-        queueVaultWriteAfterSave(async () => {
-          const entry = await getEntry(r.key);
-          if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
-        });
-      }
+      queueVaultWriteAfterSave(async () => {
+        const entry = await getEntry(r.key);
+        if (entry) await enqueueVocabWrite(entryViewToVaultRecord(entry));
+      });
       return out;
     }
     case 'backfillResult': {
@@ -431,6 +425,7 @@ async function handle(
       const ok = await deleteEntry(target);
       if (!ok) return bad('not-found');
       broadcast({ type: 'vocab-changed' });
+      queueVaultWriteAfterSave();
       return { ok: true };
     }
     case 'removeForm': {
@@ -543,9 +538,8 @@ async function handle(
       // 重新授权 = 页面再次选同一目录后重发本消息。
       const r = await adoptVault();
       if (!r.ok) return bad(r.error);
-      broadcast({ type: 'vault-changed' });
-      broadcast({ type: 'vocab-changed' });
-      return { ok: true, vault: (await getVaultIdentity()) ?? null, imported: r.imported };
+      broadcastVaultChanges();
+      return { ok: true, vault: (await getVaultIdentity()) ?? null, imported: r.imported, syncError: r.syncError };
     }
     case 'vaultDisconnect': {
       await disconnectVault();
@@ -553,18 +547,14 @@ async function handle(
       return { ok: true };
     }
     case 'vaultFlush': {
-      const r = await flushVaultWrites();
-      await syncFromVault();
-      broadcast({ type: 'vault-changed' });
-      broadcast({ type: 'vocab-changed' });
-      return { ok: true, ...r };
+      const r = await synchronizeVault();
+      broadcastVaultChanges();
+      return { ...r, ok: !r.error };
     }
     case 'vaultSync': {
       const r = await syncFromVault();
-      if (r.error) return bad(r.error);
-      broadcast({ type: 'vault-changed' });
-      if (r.updated || r.deleted) broadcast({ type: 'vocab-changed' });
-      return { ok: true, ...r };
+      broadcastVaultChanges(!!(r.updated || r.deleted));
+      return { ...r, ok: !r.error && !r.conflicts, error: r.error ?? (r.conflicts ? 'conflict' : undefined) };
     }
     case 'openSettings': {
       return handlePanelMessage({type:'panelOpen',view:'settings'},sender,nativeOpen);
@@ -641,7 +631,10 @@ export default defineBackground(() => {
     const nativeOpen=sender.id===browser.runtime.id?startNativePanel(msg,sender):undefined;
     handle(msg, sender,nativeOpen)
       .then(sendResponse)
-      .catch((e) => sendResponse(bad('internal', String((e as Error)?.message ?? e))));
+      .catch((e) => {
+        const type = (msg as { type?: unknown })?.type;
+        sendResponse(bad(typeof type === 'string' && type.startsWith('vault') ? vaultErrorCode(e) : 'internal', String((e as Error)?.message ?? e)));
+      });
     return true; // 异步响应
   });
 });

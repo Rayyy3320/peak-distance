@@ -1,7 +1,7 @@
 import { DEFAULT_SETTINGS, validSetting } from './settings';
 import { AI_PRESETS, defaultAiProfile, normalizeAiBaseUrl, readAiServices, validateAiProfile, type AiProfile, type AiProvider, type AiServices, type AiProtocol } from './aiConfig';
 import { TARGET_LANGUAGES, langDisplayName, primaryOfLang, type LanguageTag } from './languages';
-import { pickVaultDirectoryInPage } from '@/lib/vault/fs';
+import { authorizeVaultInPage, pickVaultDirectoryInPage } from '@/lib/vault/fs';
 import type { VaultStatus } from './vault';
 
 /** 理解语言候选：中文区分简繁，其余用主标签。 */
@@ -23,7 +23,7 @@ export function mountSettings(root: HTMLElement) {
     <label class="settings-field">无词典结果时自动使用 AI 查词<input id="aiLookupFallback" type="checkbox"></label>
     <p class="hint">仅主动点击查词、词典明确无结果且 AI 已配置时调用；悬停与预览不调用。开关只对本浏览器生效。</p><div id="lang-state" class="settings-status" role="status"></div></section>
     <section class="settings-section"><h2>学习库</h2>
-    <p class="hint">连接本地文件夹（可放在 Obsidian 仓库内）；Chrome 与 Edge 连接同一目录即共享词汇、句子与笔记。断开不删除文件。</p>
+    <p class="hint">Chrome 与 Edge 分别连接同一学习文件夹（可放在 Obsidian 仓库内）。生词本与句子各保存为一份 Markdown，对话按会话保存；同步会写入本机修改并读回共享内容。断开不删除文件。</p>
     <div class="settings-actions"><button id="vault-connect" class="primary">连接学习文件夹</button><button id="vault-disconnect">断开</button><button id="vault-flush">立即同步</button></div>
     <div id="vault-state" class="settings-status" role="status"></div></section>
     <section class="settings-section"><h2>翻译与显示</h2>
@@ -142,14 +142,17 @@ export function mountSettings(root: HTMLElement) {
   });
 
   // ---- 学习库：连接 / 断开 / 立即同步 ----------------------------------------------
+  let vaultBusy = false;
+  let vaultFeedback = '';
   async function refreshVault():Promise<void> {
+    if(vaultBusy)return;
     try{
       const r=await browser.runtime.sendMessage({type:'vaultStatus'}) as {ok?:boolean;status?:VaultStatus}|null;
       const s=r?.status;
       if(!s){get('vault-state').textContent='状态读取失败';return;}
       if(!s.connected){get('vault-state').textContent='未连接。';return;}
       const time=s.lastCommitAt?new Date(s.lastCommitAt).toLocaleTimeString():'—';
-      get('vault-state').textContent=`已连接 · 待写入 ${s.pendingCount} 项 · 上次写入 ${time}${s.lastError?` · 上次问题：${s.lastError}`:''}`;
+      get('vault-state').textContent=`已连接 · 待写入 ${s.pendingCount} 项 · 上次写入 ${time}${s.lastError?` · 上次问题：${s.lastError}`:''}${vaultFeedback?` · ${vaultFeedback}`:''}`;
     }catch{get('vault-state').textContent='状态读取失败，请重试';}
   }
   get('vault-connect').addEventListener('click',async()=>{
@@ -159,8 +162,8 @@ export function mountSettings(root: HTMLElement) {
     if(!picked){state.textContent='未选择目录（或当前页面不支持），未做更改。';return;}
     state.textContent='正在连接…';
     try{
-      const r=await browser.runtime.sendMessage({type:'vaultConnect'}) as {ok?:boolean;imported?:boolean;error?:string}|null;
-      if(r?.ok)state.textContent=`已连接${r.imported?'，本机记录已并入':''}。`;
+      const r=await browser.runtime.sendMessage({type:'vaultConnect'}) as {ok?:boolean;imported?:boolean;error?:string;syncError?:string}|null;
+      if(r?.ok)state.textContent=`已连接${r.imported?'，本机记录已加入同步队列':''}${r.syncError?`；同步未完成：${r.syncError}`:''}。`;
       else state.textContent=`连接失败：${r?.error??'未知错误'}；重新点击可重试授权。`;
     }catch{state.textContent='连接失败，请重试；重新点击可再次授权。';}
     await refreshVault();
@@ -170,14 +173,33 @@ export function mountSettings(root: HTMLElement) {
     await refreshVault();
   });
   get('vault-flush').addEventListener('click',async()=>{
+    if(vaultBusy)return;
+    vaultBusy=true;
+    get<HTMLButtonElement>('vault-flush').disabled=true;
     get('vault-state').textContent='正在同步…';
-    await browser.runtime.sendMessage({type:'vaultFlush'}).catch(()=>{});
-    await refreshVault();
+    const errors:Record<string,string>={'not-connected':'请先连接学习文件夹','no-permission':'未获得文件夹读写权限，请重新连接并允许访问','io':'文件读写失败，未完成的内容仍保留在本机，请重试','format':'学习文档格式有误，请检查文档后重试','conflict':'存在同一记录的修改冲突，双方内容已保留'};
+    try{
+      if(await authorizeVaultInPage()!=='granted')throw new Error('no-permission');
+      const r=await browser.runtime.sendMessage({type:'vaultFlush'}) as {ok?:boolean;committed?:number;updated?:number;deleted?:number;error?:string}|null;
+      if(!r?.ok)throw new Error(r?.error??'io');
+      vaultFeedback=`同步完成：写入 ${r.committed??0} 项，读回 ${r.updated??0} 项${r.deleted?`，移除 ${r.deleted} 项`:''}`;
+    }catch(error){const reason=error instanceof Error?error.message:'io';vaultFeedback=errors[reason]??`同步失败：${reason}`;}
+    finally{vaultBusy=false;get<HTMLButtonElement>('vault-flush').disabled=false;await refreshVault();}
   });
   browser.runtime.onMessage.addListener((msg:unknown)=>{
     if((msg as {type?:string})?.type==='vault-changed')void refreshVault();
   });
   void refreshVault();
+  let activitySync = false;
+  async function syncOnActivity():Promise<void> {
+    if(activitySync||document.visibilityState==='hidden')return;
+    activitySync=true;
+    try{await browser.runtime.sendMessage({type:'vaultSync'});}catch{ /* Manual sync reports actionable errors. */ }
+    finally{activitySync=false;}
+  }
+  window.addEventListener('focus',()=>void syncOnActivity());
+  document.addEventListener('visibilitychange',()=>void syncOnActivity());
+  void syncOnActivity();
   get('save').addEventListener('click',async()=>{
     const profile=draft(),error=validateAiProfile(profile);
     if(error){report('state',error,false);return;}
