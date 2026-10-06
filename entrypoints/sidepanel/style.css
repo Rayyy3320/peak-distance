@@ -152,11 +152,30 @@ main {min-height:0;min-width:0;overflow:auto;padding:20px 16px;flex:1;overscroll
 #chat-starters {display:flex;gap:6px;flex-wrap:wrap}
 #chat-starters:empty {display:none}
 #chat-starters .starter {background:var(--pd-paper);border:0;font-size:12px;padding:4px 8px}
-.chat-welcome {text-align:center;padding:24px 0 8px}
-.chat-welcome h1 {font-size:clamp(24px,4cqi,34px);line-height:1.5;font-weight:400;letter-spacing:0;margin:0 0 12px;text-wrap:balance}
+.chat-welcome {text-align:center}
+.chat-welcome h1 {font-size:clamp(24px,4cqi,34px);line-height:1.5;font-weight:400;letter-spacing:0;margin:0}
 .chat-welcome-title {display:flex;align-items:center;justify-content:center;gap:12px}
-.chat-welcome-title > span:last-child {min-width:0}
-.chat-welcome p {font-size:14px;line-height:1.7;color:var(--pd-muted);margin:0;text-wrap:balance}
+.chat-welcome-sentence {white-space:nowrap}
+.chat-welcome-copy {position:relative;display:inline-block}
+.chat-welcome-text {display:block}
+@media(prefers-reduced-motion:no-preference) {
+  /* 固定全文占位，仅「读懂更多。」五个全角字符逐字显隐；光标同步移动。 */
+  .chat-welcome-text {animation:chat-welcome-type 6s steps(5,end) infinite}
+  .chat-welcome-copy::after {content:'';position:absolute;inset:.25em 0;border-right:1px solid currentColor;animation:chat-welcome-caret 6s steps(5,end) infinite,chat-welcome-blink .8s step-end infinite}
+  #view-chat[data-document-hidden] .chat-welcome-text,#view-chat[data-document-hidden] .chat-welcome-copy::after {animation-play-state:paused}
+}
+@keyframes chat-welcome-type {
+  0%,5%,80%,100% {clip-path:inset(0 100% 0 0)}
+  25%,70% {clip-path:inset(0 0 0 0)}
+}
+@keyframes chat-welcome-caret {
+  0%,5%,80%,100% {transform:translateX(-100%)}
+  25%,70% {transform:translateX(0)}
+}
+@keyframes chat-welcome-blink {
+  0%,100% {opacity:1}
+  50% {opacity:0}
+}
 #view-chat.is-empty #chat-list {display:flex;flex-direction:column;justify-content:center;padding-block:24px}
 .chat-recent-list {display:flex;flex-direction:column;gap:4px;margin-top:12px;font-size:13px;color:var(--pd-muted)}
 .chat-recent-row {display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:4px 0;border-bottom:1px solid var(--pd-line)}
@@ -167,16 +186,13 @@ main {min-height:0;min-width:0;overflow:auto;padding:20px 16px;flex:1;overscroll
   #chat-head .chat-tool {padding:4px 8px}
   #chat-input-row {padding:8px 10px}
   #chat-list {padding-inline:2px}
-  .chat-welcome {padding-top:16px}
   .chat-welcome-title {gap:8px}
   .chat-welcome-title .brand-mark {width:36px}
   .chat-welcome h1 {font-size:22px}
-  .chat-welcome p {font-size:13px}
 }
 @media(max-height:700px) {
   #view-chat.is-empty #chat-list {padding-block:8px}
-  .chat-welcome {padding:8px 0}
-  .chat-welcome h1 {font-size:clamp(22px,4cqi,28px);margin-bottom:4px}
+  .chat-welcome h1 {font-size:clamp(22px,4cqi,28px)}
   #chat-input {min-height:64px;max-height:120px}
 }
 

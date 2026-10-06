@@ -866,8 +866,13 @@ function renderMessages(): void {
     const mark = el('span', 'brand-mark');
     const image = el('img'); image.src = '/brand/peak-mark-crop.png'; image.alt = '';
     mark.setAttribute('aria-hidden', 'true'); mark.appendChild(image);
-    title.append(mark, el('span', undefined, '从一句话，读懂更多。'));
-    welcome.append(title, el('p', undefined, '聊聊刚读到的内容，或从一个问题开始。'));
+    const sentence = el('span', 'chat-welcome-sentence');
+    const copy = el('span', 'chat-welcome-copy');
+    copy.appendChild(el('span', 'chat-welcome-text', '读懂更多。'));
+    sentence.append(el('span', 'chat-welcome-prefix', '从一句话，'), copy);
+    title.setAttribute('aria-label', sentence.textContent!);
+    title.append(mark, sentence);
+    welcome.appendChild(title);
     list.appendChild(welcome);
     return;
   }
@@ -1063,6 +1068,10 @@ async function refreshAttachMenu(): Promise<void> {
 
 export function initChatView(d: ChatViewDeps): void {
   deps = d;
+  const chatView = document.getElementById('view-chat')!;
+  const syncWelcomeVisibility = () => chatView.toggleAttribute('data-document-hidden', document.visibilityState === 'hidden');
+  document.addEventListener('visibilitychange', syncWelcomeVisibility);
+  syncWelcomeVisibility();
   const attachments = document.getElementById('chat-attachments') as HTMLDetailsElement;
   attachments.addEventListener('toggle', () => { if (attachments.open) void refreshAttachMenu(); });
   for (const kind of ['page', 'selection', 'video'] as const) document.getElementById(`chat-attach-${kind}`)?.addEventListener('click', () => { attachments.open = false; void attachMaterial(kind); });
