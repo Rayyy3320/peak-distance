@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/readme/hero.png" width="100%" alt="Peak Distance: understand a new language, keep the context. Look up words, save sentences and review them across the web, X and YouTube.">
+  <img src="assets/readme/hero-en.png" width="100%" alt="Peak Distance: understand a new language, keep the context. Look up words, save sentences and review them across the web, X and YouTube.">
 </p>
 
 # Peak Distance

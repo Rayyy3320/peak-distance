@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Peak Distance — Understand a new language, keep the context</title>
+  <desc id="desc">Off-white paper texture with the project's existing mountain-coast art, alongside the encounter, understand, save and review flow across web, X and YouTube. This image shows brand and learning flow, not a product screenshot.</desc>
+  <defs>
+    <linearGradient id="coast-fade"><stop offset="0" stop-color="white" stop-opacity="0"/><stop offset="0.34" stop-color="white"/></linearGradient>
+    <mask id="coast-mask"><rect x="640" width="560" height="520" fill="url(#coast-fade)"/></mask>
+  </defs>
+  <rect width="1200" height="520" fill="#f7f4ec"/>
+  <image href="../../../public/brand/paper-tile.png" width="1200" height="1200" opacity="0.2"/>
+  <g id="project-art" mask="url(#coast-mask)">
+    <image href="../../../public/brand/mountain-coast.png" x="640" y="-250" width="560" height="840"/>
+  </g>
+  <g id="title-block" fill="#2f3a40">
+    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">LANGUAGE IN CONTEXT</text>
+    <text x="60" y="166" font-family="Georgia,'Times New Roman',serif" font-size="86">Peak Distance</text>
+    <path d="M64 200H120" stroke="#d4a950" stroke-width="3"/>
+    <g font-family="Georgia,'Times New Roman',serif" font-size="38">
+      <text x="64" y="267">Understand a new language,</text>
+      <text x="64" y="327">keep the context.</text>
+    </g>
+  </g>
+  <g id="learning-route" font-family="'Segoe UI',sans-serif">
+    <text x="64" y="405" font-size="22" fill="#59636b">Web / X / YouTube</text>
+    <g font-size="24" fill="#2f3a40">
+      <text x="64" y="457">Encounter</text><text x="224" y="457">Understand</text><text x="396" y="457">Save</text><text x="494" y="457">Review</text>
+    </g>
+    <g stroke="#6b8db7" stroke-width="2" fill="none">
+      <path d="M186 447h28m-6-5 6 5-6 5"/><path d="M358 447h28m-6-5 6 5-6 5"/><path d="M456 447h28m-6-5 6 5-6 5"/>
+    </g>
+  </g>
+</svg>
