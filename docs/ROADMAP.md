@@ -114,3 +114,14 @@ M6 已复核真实网页标记、首次发送状态、引用面板清理；句�
 [选区查词与添加到对话](specs/selection-chat-actions.md) 已实施并通过本地验收（出口与剩余实机项见上文「选区查词与添加到对话 当前出口」）。
 
 Anki、X thread、Netflix。学习数据文件夹共享与恢复已纳入 M11。
+
+## 发布习惯
+
+每次发布（含不发版的普通提交）按此清单执行：
+
+1. 发布前 `npm run verify-local` 通过；发布树不含私有路径（内部检查脚本、本机绝对路径）。
+2. 版本号：新规格进 minor 位，修复批次进 patch 位；`package.json` 与 `package-lock.json` 同步提交。
+3. README：中英两份（`README.md` / `README.en.md`）的「当前发布版」行随每次发版更新；hero 文案变更后运行 `node assets/readme/source/render.mjs` 重导出中英两图并目检。
+4. 发布树：源码全量，排除 `docs/`、`design*`、`AGENTS.md`、`UI意向图.PNG`、内部检查工具与未跟踪设计稿；`package.json` 用发布形态（name=peak-distance、精简 scripts、license 字段）。
+5. 产物三件套：`wxt zip` 产物改名 chrome.zip、`git archive --prefix=peak-distance/` 源码包、两空格格式 SHA256SUMS；Release 说明含「本版更新」。
+6. 不发版的内容改动走 main 普通提交（先例：品牌图、许可、README）；有用户可感知的修复时发补丁版让安装包跟上。
