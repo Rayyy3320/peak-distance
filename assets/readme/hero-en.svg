@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Peak Distance — learn a word inside its sentence</title>
+  <desc id="desc">Pure vector learning-flow sketch. Uses “She is comfortable with people” to show an original sentence with its meaning, keeping the sentence, source and learning state together. Not a product screenshot.</desc>
+  <rect width="1200" height="520" fill="#f7f4ec"/>
+  <g id="title-block" fill="#2f3a40">
+    <text x="64" y="62" font-family="'Segoe UI',sans-serif" font-size="20" letter-spacing="3" fill="#59636b">LANGUAGE IN CONTEXT</text>
+    <text x="60" y="166" font-family="Georgia,'Times New Roman',serif" font-size="86">Peak Distance</text>
+    <path d="M64 200H120" stroke="#d4a950" stroke-width="3"/>
+    <g font-family="Georgia,'Times New Roman',serif" font-size="38">
+      <text x="64" y="267">Understand a new language,</text>
+      <text x="64" y="327">keep the context.</text>
+    </g>
+  </g>
+  <g id="context-specimen" transform="translate(716 98)">
+    <path d="M-44 0v284" stroke="#ddd9cf"/>
+    <text y="17" font-family="'Segoe UI',sans-serif" font-size="20" fill="#59636b">ORIGINAL / CONTEXT</text>
+    <rect x="-5" y="110" width="78" height="44" rx="4" fill="#e4eef6"/>
+    <g font-family="Georgia,'Times New Roman',serif" font-size="36" fill="#2f3a40">
+      <text y="87">She is comfortable</text>
+      <text y="143">with people.</text>
+    </g>
+    <path d="M4 167v29h26" fill="none" stroke="#6b8db7" stroke-width="2"/>
+    <text x="42" y="204" font-family="Georgia,'Times New Roman',serif" font-size="24" fill="#2f3a40">together with; along with</text>
+    <text y="273" font-family="'Segoe UI',sans-serif" font-size="21" fill="#59636b">Keep the sentence · Remember the source · Review again</text>
+  </g>
+  <g id="learning-route" font-family="'Segoe UI',sans-serif">
+    <text x="64" y="405" font-size="22" fill="#59636b">Web / X / YouTube</text>
+    <g font-size="24" fill="#2f3a40">
+      <text x="64" y="457">Encounter</text><text x="224" y="457">Understand</text><text x="396" y="457">Save</text><text x="494" y="457">Review</text>
+    </g>
+    <g stroke="#6b8db7" stroke-width="2" fill="none">
+      <path d="M186 447h28m-6-5 6 5-6 5"/><path d="M358 447h28m-6-5 6 5-6 5"/><path d="M456 447h28m-6-5 6 5-6 5"/>
+    </g>
+  </g>
+</svg>

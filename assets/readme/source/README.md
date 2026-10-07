@@ -4,10 +4,13 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| [hero.png](../hero.png) | README 默认首图；混合排版的静态导出 |
+| [hero.png](../hero.png) | 中文 README 默认首图；混合排版的静态导出 |
 | [hero-layout.svg](hero-layout.svg) | 混合版可编辑排版源；通过相对路径引用项目已有品牌图 |
 | [hero.svg](../hero.svg) | 独立纯 SVG 版本，无外部图片、字体或脚本依赖 |
-| [render.mjs](render.mjs) | 使用项目已有 Playwright 与本机浏览器重新导出混合版 |
+| [hero-en.png](../hero-en.png) | 英文 README（README.en.md）首图；同一混合排版管线的英文导出 |
+| [hero-en-layout.svg](hero-en-layout.svg) | 英文混合版可编辑排版源；学习路线为 Encounter → Understand → Save → Review |
+| [hero-en.svg](../hero-en.svg) | 英文独立纯 SVG 版本 |
+| [render.mjs](render.mjs) | 使用项目已有 Playwright 与本机浏览器重新导出中英两个混合版 |
 
 ## 内容与视觉依据
 
@@ -27,7 +30,7 @@
 node assets/readme/source/render.mjs
 ```
 
-默认使用本机 Windows Edge；可通过 `BLC_CHROME` 指定其它 Chromium 浏览器。导出 `hero.png` 为 2400 × 1040，以保留高像素密度屏幕上的清晰度。字体由导出机器的系统字体决定。
+默认使用本机 Windows Edge；可通过 `BLC_CHROME` 指定其它 Chromium 浏览器。导出 `hero.png` 与 `hero-en.png` 为 2400 × 1040，以保留高像素密度屏幕上的清晰度。字体由导出机器的系统字体决定。
 
 README 发布 PNG；排版源中的相对图片引用仅用于本地编辑与导出。纯 SVG 可以直接嵌入 GitHub，修改后无需导出。两版精确文案分别在源文件中维护。
 
