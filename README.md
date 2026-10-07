@@ -10,11 +10,11 @@ Peak Distance 是一款浏览器语言学习扩展。读网页、刷 X 或看 Yo
 
 它支持英语之外的多种语言。你可以选择译文和解释使用的语言，再按语言筛选生词本。
 
-[下载安装包](https://github.com/Rayyy3320/peak-distance/releases/latest) · [安装方法](#安装) · [使用](#使用) · [隐私与服务](#隐私与服务) · [许可](#许可)
+[English](README.en.md) · [下载安装包](https://github.com/Rayyy3320/peak-distance/releases/latest) · [安装方法](#安装) · [使用](#使用) · [隐私与服务](#隐私与服务) · [许可](#许可)
 
 ## 安装
 
-需要桌面 **Chrome 142 或更新版本**。当前发布版为 [v0.5.2](https://github.com/Rayyy3320/peak-distance/releases/tag/v0.5.2)。
+需要桌面 **Chrome 142 或更新版本**。当前发布版为 [v0.6.0](https://github.com/Rayyy3320/peak-distance/releases/tag/v0.6.0)。
 
 1. 从 [Releases](https://github.com/Rayyy3320/peak-distance/releases/latest) 下载名称以 `-chrome.zip` 结尾的安装包，解压到一个固定文件夹。
 2. 在 Chrome 地址栏输入 `chrome://extensions`，开启右上角的「开发者模式」。
